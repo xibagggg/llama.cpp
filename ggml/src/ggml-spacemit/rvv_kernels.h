@@ -66,6 +66,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
                                                     int                       ir1);
+void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op);
 
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 

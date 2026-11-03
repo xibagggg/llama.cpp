@@ -4,6 +4,7 @@
 #include "ime.h"
 #include "ocr-ime2-fp16-v35.h"
 #include "ocr-down-diagnostic-v36.h"
+#include "ocr-fa-pack-v40.h"
 
 #include "common.h"
 #include "ggml-backend-impl.h"
@@ -1173,6 +1174,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     decode = MAX(decode, sizeof(float) * (n_q * neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV)));
 
                     size = MAX(prefill, decode);
+                    if(ocr_fa_pack_v40::eligible(op))size=MAX(size,ocr_fa_pack_v40::work_bytes(n_threads,op));
                 }
                 return true;
             case GGML_OP_ROPE:
@@ -1574,6 +1576,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
 
         static constexpr int64_t Q_TILE_SZ = ggml_fa_tile_config::Q;
         const bool               use_tiled = neq1 >= Q_TILE_SZ;
+        if(use_tiled)spacemit_kernels::rvv::prepare_ocr_fa_kv_v40(ctx,dst);
 
         // 4x chunks per thread
         // int     nth_scaled = nth * 4;

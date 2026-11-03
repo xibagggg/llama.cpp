@@ -1,6 +1,7 @@
 #include "rvv_kernels.h"
 #include "ocr-ime2-fp16-v35.h"
 #include "ocr-down-diagnostic-v36.h"
+#include "ocr-fa-pack-v40.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1547,6 +1548,24 @@ void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(ggml::spacemit::co
     }
 }
 
+void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
+    if(!ocr_fa_pack_v40::eligible(op))return;
+    GGML_ASSERT(ctx.workspace&&ctx.workspace_size>=ocr_fa_pack_v40::work_bytes(ctx.nth,op));
+    constexpr int D=72,KV=GGML_FA_TILE_KV;
+    const auto *k=op->src[1],*v=op->src[2];const int nt=int(ocr_fa_pack_v40::tiles(op));
+    auto *pk=ocr_fa_pack_v40::keys(ctx),*pv=ocr_fa_pack_v40::values(ctx,op);
+    for(int task=ctx.ith;task<16*nt;task+=ctx.nth){
+        const int head=task/nt,ic=(task%nt)*KV,count=std::min(KV,int(k->ne[1])-ic);
+        auto *dk=pk+size_t(task)*D*KV,*dv=pv+size_t(task)*D*KV;
+        std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*2);
+        rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
+        memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
+    }
+    GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+    static std::atomic<bool> announced{false};
+    if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-pack-v40: active N=%lld workspace=%zu transient per attention call\n",(long long)k->ne[1],ocr_fa_pack_v40::work_bytes(ctx.nth,op));
+}
+
 void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ctx,
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
@@ -1594,6 +1613,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
 
     GGML_ASSERT(k->type == v->type);
     const ggml_type kv_type = k->type;
+    const bool packed_kv=ocr_fa_pack_v40::eligible(dst);
 
     // broadcast factors
     const int64_t rk2 = neq2 / nek2;
@@ -1730,7 +1750,10 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             }
 
             if (kv_type == GGML_TYPE_F16) {
-                rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
+                if(packed_kv){
+                    const size_t tile=size_t(ik2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
+                    std::memcpy(K_f16,ocr_fa_pack_v40::keys(ctx)+tile*DK*KV_TILE_SZ,DK*KV_TILE_SZ*sizeof(_Float16));
+                }else rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
                                             (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1,
                                             max_active_kv,
                                             DK);
@@ -1818,7 +1841,10 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             // Pack V as contiguous [KV_TILE_SZ][DV].
             if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
+                if(packed_kv){
+                    const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
+                    std::memcpy(V_f16,ocr_fa_pack_v40::values(ctx,dst)+tile*DV*KV_TILE_SZ,max_active_kv*DV*sizeof(_Float16));
+                }else memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
 
                 int tq = 0;
                 if(ocr_fa_x8_enabled()&&DK==72&&DV==72){

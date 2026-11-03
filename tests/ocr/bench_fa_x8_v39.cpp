@@ -34,6 +34,7 @@ int main(int argc,char **argv){
   auto f=stream.launch(spert::Grid{T},[&](spert::Context *rt){
    int rank=rt->program_id(0);auto sh=rt->shared_buffer();ggml::spacemit::context ctx;ctx.reset(*rt,rank,T,workspace.data(),workspace.size()*4,sh);
    const int dr=(N*H+T-1)/T;
+   spacemit_kernels::rvv::prepare_ocr_fa_kv_v40(ctx,yt);
    spacemit_kernels::rvv::forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ctx,yt,dr*rank,std::min(dr*(rank+1),N*H));
   });if(f.sync()!=spert::Status::Ok)std::exit(4);
   return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();};
