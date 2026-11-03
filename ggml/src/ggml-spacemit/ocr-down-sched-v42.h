@@ -198,4 +198,27 @@ static __attribute__((noipa)) void paired_kernel(ggml::spacemit::context &ctx,gg
  }
  for(size_t i=0;i<64;++i)GGML_ASSERT(guard[i]==0xA7);
 }
+inline int schedule(){
+ static const int mode=[] {const char *p=std::getenv("GGML_SPACEMIT_OCR_DOWN_SCHEDULE");
+  if(!p)return 0;if(std::strcmp(p,"paired")==0)return 2;
+  return std::strcmp(p,"relaxed")==0?1:0;}();return mode;
+}
+inline bool forward(ggml::spacemit::context &ctx,ggml_tensor *op){
+ const int mode=schedule();
+ if(!mode||ocr_down_tcm_v41::tile()!=16||ocr_down_tcm_v41::phase_directory()||
+    !op||!op->src[0]||!op->src[1])return false;
+ const auto *w=op->src[0],*x=op->src[1];
+ constexpr size_t used=size_t(20)*4304*4+64;
+ if(w->type!=GGML_TYPE_F16||x->type!=GGML_TYPE_F32||op->type!=GGML_TYPE_F32||
+    w->ne[0]!=4304||w->ne[1]!=1152||x->ne[1]<988||
+    w->nb[0]!=2||x->nb[0]!=4||op->nb[0]!=4||
+    w->ne[2]!=1||w->ne[3]!=1||x->ne[2]!=1||x->ne[3]!=1||op->ne[2]!=1||op->ne[3]!=1||
+    !ctx.shared.data||reinterpret_cast<uintptr_t>(ctx.shared.data)%alignof(float)||ctx.shared.size<used)return false;
+ auto *cache=static_cast<float*>(ctx.shared.data);
+ if(mode==2)paired_kernel<16>(ctx,op,cache);else relaxed_kernel<16,false>(ctx,op,cache);
+ static std::atomic<bool> announced{false};
+ if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-down-sched-v42: active mode=%s tile=16 scratch=%zu bytes per worker\n",mode==2?"paired":"relaxed",used);
+ return true;
+}
+
 }
