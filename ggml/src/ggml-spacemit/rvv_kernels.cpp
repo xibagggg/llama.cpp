@@ -1,4 +1,5 @@
 #include "rvv_kernels.h"
+#include "ocr-ime2-fp16-v34.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -4646,6 +4647,7 @@ static __attribute__((noipa)) void forward_mul_mat_f16_f32_m4_cache(ggml::spacem
 }
 
 void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    if (ocr_ime2_fp16_v34::forward(ctx, op)) return;
     static const bool m4_cache_enabled = [] {
         const char * value = std::getenv("GGML_SPACEMIT_F16_M4_CACHE");
         return value != nullptr && std::strcmp(value, "1") == 0;
@@ -4654,7 +4656,7 @@ void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * m4_x = op->src[1];
     if (m4_cache_enabled && m4_w->type == GGML_TYPE_F16 && m4_x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
         m4_w->nb[0] == sizeof(_Float16) && m4_x->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
-        m4_w->ne[0] == 4304 && m4_w->ne[1] == 1152 && m4_x->ne[1] >= 1056 &&
+        m4_w->ne[0] == 4304 && m4_w->ne[1] == 1152 && m4_x->ne[1] >= 988 &&
         m4_w->ne[2] == 1 && m4_w->ne[3] == 1 && m4_x->ne[2] == 1 && m4_x->ne[3] == 1 &&
         op->ne[2] == 1 && op->ne[3] == 1 && ctx.shared.data != nullptr &&
         reinterpret_cast<uintptr_t>(ctx.shared.data) % alignof(float) == 0 &&

@@ -2,6 +2,7 @@
 #define GGML_COMMON_DECL_CPP
 
 #include "ime.h"
+#include "ocr-ime2-fp16-v34.h"
 
 #include "common.h"
 #include "ggml-backend-impl.h"
@@ -2247,6 +2248,7 @@ int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data,
 }
 
 bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t * size) {
+    if (ocr_ime2_fp16_v34::eligible(op)) { *size = ocr_ime2_fp16_v34::work_bytes(op); return true; }
     const auto * traits = ggml_spacemit_get_tensor_traits(op);
     return traits != nullptr && traits->work_size(n_threads, op, *size);
 }

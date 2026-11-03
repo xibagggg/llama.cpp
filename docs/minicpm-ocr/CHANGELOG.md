@@ -14,3 +14,15 @@ for any individual patch. It excludes the later IME2 FP16 experiment.
 
 The original working tree and local runtime directories remain preserved.
 This source snapshot has to pass its own cross-build before publication.
+
+## 2026-11-03 — v34, direct FP16 experiment
+
+Opt-in `GGML_SPACEMIT_IME2_FP16_DOWN=1` runs vision FFN-down on IME2.
+Weights remain F16, activations convert from F32 to F16, accumulation is F32.
+Scope: A100, contiguous K4304/M1152, N divisible by eight. TCM: 337.5 KiB
+per worker. M4 fallback guard expands to N988, as tested in v30.
+
+Prior same-binary Q4-text/Q8-vision ABBA: E2E 37.2005 to 26.5480 s.
+That is not a Q4/Q4 formal speed result. Q4/Q4 seven-case single-run quality
+was text/token-identical in six cases; scanned-table text regressed.
+The candidate is experimental and disabled by default.
