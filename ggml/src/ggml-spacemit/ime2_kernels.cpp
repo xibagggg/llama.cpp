@@ -2437,12 +2437,15 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
                          size_t          k_blks,
                          size_t          ldc) {
     if (quant_b_zp == NULL) {
+        alignas(64) float tail_output[32];
         for (size_t n = 0; n < count_n; n += 32) {
-            size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
+            const size_t nb_real = std::min<size_t>(32, count_n - n);
+            const bool is_tail = nb_real < 32;
+            size_t    nblks         = 32;
             uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data +      //
                                       n * k_blks * blk_len / 2 +      // b data
                                       n * k_blks * sizeof(_Float16);  // scale
-            float * CPtr = c_ptr + n;
+            float * CPtr = is_tail ? tail_output : c_ptr + n;
             size_t  cnt  = k_blks;
 
             // A format Version_1 (FP32 SCALE FOR Normal VMADOTins of IME2)
@@ -2554,7 +2557,8 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
 
                 :
                 : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
-                : "cc", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+                : "cc", "memory", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6",
+                  "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
 #else
             __asm__ volatile(
 
@@ -2644,9 +2648,13 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
 
                 :
                 : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
-                : "cc", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+                : "cc", "memory", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6",
+                  "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
 
 #endif
+            if (is_tail) {
+                memcpy(c_ptr + n, tail_output, nb_real * sizeof(float));
+            }
         }
     } else {
         for (size_t n = 0; n < count_n; n += 32) {
@@ -2773,7 +2781,8 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
 
                 :
                 : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
-                : "cc", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+                : "cc", "memory", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6",
+                  "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
 #else
             __asm__ volatile(
 
@@ -2874,7 +2883,8 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
 
                 :
                 : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
-                : "cc", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+                : "cc", "memory", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6",
+                  "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
 #endif
         }
     }
@@ -3016,10 +3026,14 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
     int64_t b_data_stride =
         k_blks * (sizeof(ggml_fp16_t) + 16 * sizeof(int8_t) + (quant_b_zp != NULL ? sizeof(int8_t) : 0));
     if (quant_b_zp == NULL) {
+        alignas(64) float tail_output[4 * 32];
         for (size_t ni = 0; ni < count_n; ni += 32) {
+            const size_t nb_real = std::min<size_t>(32, count_n - ni);
+            const bool is_tail = nb_real < 32;
+            const size_t store_ldc = is_tail ? 32 : ldc;
             uint8_t * b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
             int8_t *  a_data = (int8_t *) quant_a_ptr;
-            float *   dst_c  = c_ptr + ni;
+            float *   dst_c  = is_tail ? tail_output : c_ptr + ni;
 #if 0
             asm volatile(
                 "li             t1,  8              \n\t"
@@ -3124,9 +3138,9 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
                 "add            t2, %[LDC], t3      \n\t"
                 "vse32.v        v30, (t3)           \n\t"
                 "vse32.v        v31, (t2)           \n\t"
-                : [A] "+r"(a_data), [B] "+r"(b_data)
-                : [DST] "r"(dst_c), [LDC] "r"(ldc*4), [BK] "r"(k_blks)
-                : "t0", "t1", "t2", "t3", "t4", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+                : [A] "+&r"(a_data), [B] "+&r"(b_data)
+                : [DST] "r"(dst_c), [LDC] "r"(store_ldc * sizeof(float)), [BK] "r"(k_blks)
+                : "memory", "t0", "t1", "t2", "t3", "t4", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
                   "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25",
                   "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3");
 #else
@@ -3222,12 +3236,17 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
                 "add            t2, %[LDC], t3          \n\t"
                 "vse32.v        v30, (t3)               \n\t"
                 "vse32.v        v31, (t2)               \n\t"
-                : [A] "+r"(a_data), [B] "+r"(b_data)
-                : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks)
-                : "t0", "t1", "t2", "t3", "t4", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                : [A] "+&r"(a_data), [B] "+&r"(b_data)
+                : [DST] "r"(dst_c), [LDC] "r"(store_ldc * sizeof(float)), [BK] "r"(k_blks)
+                : "memory", "t0", "t1", "t2", "t3", "t4", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
                   "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24",
                   "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3");
 #endif
+            if (is_tail) {
+                for (size_t mi = 0; mi < 4; ++mi) {
+                    memcpy(c_ptr + mi * ldc + ni, tail_output + mi * 32, nb_real * sizeof(float));
+                }
+            }
         }
     } else {
         for (size_t ni = 0; ni < count_n; ni += 32) {
@@ -3348,9 +3367,9 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
                 "add            t2, %[LDC], t3  \n\t"
                 "vse32.v        v30, (t3)       \n\t"
                 "vse32.v        v31, (t2)       \n\t"
-                : [A] "+r"(a_data), [B] "+r"(b_data)
+                : [A] "+&r"(a_data), [B] "+&r"(b_data)
                 : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks)
-                : "t0", "t1", "t2", "t3", "t4", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                : "memory", "t0", "t1", "t2", "t3", "t4", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
                   "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24",
                   "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "s1", "s2", "s3", "s4");
         }
@@ -4901,10 +4920,18 @@ void gemm_kernel_i8i8_m4(size_t          blk_len,
                          size_t          k_blks,
                          size_t          ldc) {
     int64_t b_data_stride = k_blks * sizeof(ggml_fp16_t) + k_blks * blk_len;
+    // Repacked weights always occupy a complete N32 tile. Keep the existing
+    // four-row arithmetic for a partial tile, but contain its full-width stores
+    // before copying only the logical columns into the destination tensor.
+    alignas(64) float tail_output[4 * 32];
     for (size_t ni = 0; ni < count_n; ni += 32) {
+        const size_t nb_real = std::min<size_t>(32, count_n - ni);
+        const bool is_tail = nb_real < 32;
+        const size_t store_ldc = is_tail ? 32 : ldc;
         uint8_t * b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
         int8_t *  a_data = (int8_t *) quant_a_ptr;
-        float *   dst_c  = c_ptr + ni;
+        float *   dst_c  = is_tail ? tail_output : c_ptr + ni;
+        size_t    cnt    = k_blks;
 
         asm volatile(
             "vsetvli        t0, x0, e32, m1       \n\t"
@@ -4995,11 +5022,16 @@ void gemm_kernel_i8i8_m4(size_t          blk_len,
             "add            t2, %[LDC], t3        \n\t"
             "vse32.v        v30, (t3)             \n\t"
             "vse32.v        v31, (t2)             \n\t"
-            : [A] "+r"(a_data), [B] "+r"(b_data)
-            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks)
+            : [A] "+&r"(a_data), [B] "+&r"(b_data), [BK] "+&r"(cnt)
+            : [DST] "r"(dst_c), [LDC] "r"(store_ldc * sizeof(float))
             : "t0", "t1", "t2", "t3", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
               "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
-              "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3");
+              "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "memory");
+        if (is_tail) {
+            for (size_t mi = 0; mi < 4; ++mi) {
+                memcpy(c_ptr + mi * ldc + ni, tail_output + mi * 32, nb_real * sizeof(float));
+            }
+        }
     }
 }
 

@@ -22,6 +22,7 @@ inline void spine_barrier_wait(spine_barrier_t * b) {
         while (cur_round == b->rounds_.load(std::memory_order_relaxed)) {
             __asm__ volatile("pause " ::: "memory");
         }
+        std::atomic_thread_fence(std::memory_order_acquire);
     }
 }
 

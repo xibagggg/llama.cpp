@@ -40,7 +40,7 @@ struct context {
         shared         = {};
     }
 
-    void sync() { runtime->sync(); }
+    spert::Status sync() { return runtime->sync(); }
 };
 
 class tensor_traits_base {

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "upstream": "https://github.com/spacemit-com/llama.cpp",
+  "upstream_commit": "855a53bedbc3fdb6f9409e91ca98c2f4f815a182",
+  "source_baseline_tag": "minicpm-ocr-k3-source-20261103",
+  "deployment_changed": false,
+  "default_flags": {
+    "GGML_SPACEMIT_F16_M4_CACHE": "unset",
+    "GGML_SPACEMIT_IME2_FP16_DOWN": "unset"
+  },
+  "model_precision": {"text": "Q4_0", "vision": "Q4_0", "vision_ffn_down": "F16"},
+  "historical_candidate": "runtime-barrier-acquire-v8",
+  "eight_worker_drift_resolved": false
+}

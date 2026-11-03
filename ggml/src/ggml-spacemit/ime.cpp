@@ -34,6 +34,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <atomic>
+#include <type_traits>
+#include <sched.h>
+#include <sys/types.h>
 // clang-format off
 #if defined(__riscv)
 
@@ -69,6 +73,157 @@
 #endif
 
 // clang-format on
+
+#if defined(GGML_SPACEMIT_Q8_SYNC_OBSERVER_DIAGNOSTIC)
+namespace {
+// Stage B diagnostic for the Q8 dense projection barrier.  The observer is
+// disabled unless GGML_SPACEMIT_Q8_SYNC_OBSERVER_DIR is set.  Workers only
+// sample immutable runtime metadata and write into a worker-local fixed ring;
+// JSON I/O is deferred until process exit, so the original barrier count and
+// scheduling are unchanged.
+constexpr size_t q8_sync_observer_max_workers = 8;
+// One fixed replay executes three Q8 dense barriers per logical repeat.
+// Capacity equals 4096 repeats; used counts attempts, dropped counts unstored records.
+constexpr size_t q8_sync_observer_records_per_worker = 12288;
+
+struct q8_sync_observer_record {
+    uint64_t ordinal = 0;
+    uint32_t ith = 0;
+    uint32_t nth = 0;
+    int cpu_before = -1;
+    int cpu_after = -1;
+    int sync_status = -1;
+    int64_t gemm_m = 0;
+    int64_t gemm_n = 0;
+    int64_t gemm_k = 0;
+    uintptr_t cached_before = 0;
+    size_t cached_before_size = 0;
+    uintptr_t fresh_before = 0;
+    size_t fresh_before_size = 0;
+    uintptr_t cached_after = 0;
+    size_t cached_after_size = 0;
+    uintptr_t fresh_after = 0;
+    size_t fresh_after_size = 0;
+};
+
+struct q8_sync_observer_lane {
+    std::atomic<uint32_t> used{0};
+    std::atomic<uint32_t> dropped{0};
+    q8_sync_observer_record records[q8_sync_observer_records_per_worker];
+};
+
+class q8_sync_observer {
+  public:
+    q8_sync_observer() {
+        const char * directory = std::getenv("GGML_SPACEMIT_Q8_SYNC_OBSERVER_DIR");
+        if (directory && *directory) {
+            enabled_ = true;
+            directory_ = directory;
+            std::atexit(&q8_sync_observer::dump_at_exit);
+        }
+    }
+
+    static q8_sync_observer & instance() {
+        // Intentionally process-lifetime storage: atexit invokes dump_at_exit after
+        // normal static destructors would otherwise destroy directory_ first.
+        static q8_sync_observer * observer = new q8_sync_observer();
+        return *observer;
+    }
+
+    spert::Status sync(ggml::spacemit::context & ctx, int64_t gemm_m, int64_t gemm_n, int64_t gemm_k) {
+        if (!enabled_ || ctx.ith >= q8_sync_observer_max_workers) {
+            return ctx.sync();
+        }
+
+        q8_sync_observer_record record;
+        record.ith = ctx.ith;
+        record.nth = ctx.nth;
+        record.gemm_m = gemm_m;
+        record.gemm_n = gemm_n;
+        record.gemm_k = gemm_k;
+        record.cpu_before = sched_getcpu();
+        record.cached_before = reinterpret_cast<uintptr_t>(ctx.shared.data);
+        record.cached_before_size = ctx.shared.size;
+        const auto fresh_before = ctx.runtime->shared_buffer();
+        record.fresh_before = reinterpret_cast<uintptr_t>(fresh_before.data);
+        record.fresh_before_size = fresh_before.size;
+
+        // Exactly the original one grid barrier.  The return value is captured
+        // for diagnostics; no extra barrier or retry is introduced.
+        const spert::Status status = ctx.sync();
+
+        record.cpu_after = sched_getcpu();
+        record.sync_status = static_cast<int>(status);
+        record.cached_after = reinterpret_cast<uintptr_t>(ctx.shared.data);
+        record.cached_after_size = ctx.shared.size;
+        const auto fresh_after = ctx.runtime->shared_buffer();
+        record.fresh_after = reinterpret_cast<uintptr_t>(fresh_after.data);
+        record.fresh_after_size = fresh_after.size;
+
+        auto & lane = lanes_[ctx.ith];
+        const uint32_t slot = lane.used.fetch_add(1, std::memory_order_relaxed);
+        record.ordinal = slot;
+        if (slot < q8_sync_observer_records_per_worker) {
+            lane.records[slot] = record;
+        } else {
+            lane.dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        return status;
+    }
+
+  private:
+    static void dump_at_exit() { instance().dump(); }
+
+    void dump() const {
+        if (!enabled_) {
+            return;
+        }
+        const std::string path = directory_ + "/q8-sync-stageb-p" + std::to_string(static_cast<long long>(getpid())) + ".jsonl";
+        FILE * file = std::fopen(path.c_str(), "w");
+        if (!file) {
+            return;
+        }
+        std::fprintf(file,
+                     "{\"kind\":\"header\",\"schema\":\"spacemit-q8-sync-observer-stage-b\","
+                     "\"pid\":%ld,\"max_workers\":%zu,\"records_per_worker\":%zu}\n",
+                     static_cast<long>(getpid()), q8_sync_observer_max_workers,
+                     q8_sync_observer_records_per_worker);
+        for (size_t ith = 0; ith < q8_sync_observer_max_workers; ++ith) {
+            const auto & lane = lanes_[ith];
+            const uint32_t count = lane.used.load(std::memory_order_relaxed);
+            const uint32_t limit = std::min<uint32_t>(count, q8_sync_observer_records_per_worker);
+            std::fprintf(file, "{\"kind\":\"lane\",\"ith\":%zu,\"used\":%u,\"dropped\":%u}\n",
+                         ith, count, lane.dropped.load(std::memory_order_relaxed));
+            for (uint32_t i = 0; i < limit; ++i) {
+                const auto & r = lane.records[i];
+                std::fprintf(file,
+                    "{\"kind\":\"sync\",\"ith\":%u,\"nth\":%u,\"ordinal\":%llu,"
+                    "\"cpu_before\":%d,\"cpu_after\":%d,\"sync_status\":%d,"
+                    "\"gemm_m\":%lld,\"gemm_n\":%lld,\"gemm_k\":%lld,"
+                    "\"cached_before\":%llu,\"cached_before_size\":%zu,"
+                    "\"fresh_before\":%llu,\"fresh_before_size\":%zu,"
+                    "\"cached_after\":%llu,\"cached_after_size\":%zu,"
+                    "\"fresh_after\":%llu,\"fresh_after_size\":%zu}\n",
+                    r.ith, r.nth, static_cast<unsigned long long>(r.ordinal),
+                    r.cpu_before, r.cpu_after, r.sync_status,
+                    static_cast<long long>(r.gemm_m), static_cast<long long>(r.gemm_n), static_cast<long long>(r.gemm_k),
+                    static_cast<unsigned long long>(r.cached_before), r.cached_before_size,
+                    static_cast<unsigned long long>(r.fresh_before), r.fresh_before_size,
+                    static_cast<unsigned long long>(r.cached_after), r.cached_after_size,
+                    static_cast<unsigned long long>(r.fresh_after), r.fresh_after_size);
+            }
+        }
+        std::fclose(file);
+    }
+
+    bool enabled_ = false;
+    std::string directory_;
+    q8_sync_observer_lane lanes_[q8_sync_observer_max_workers];
+};
+
+} // namespace
+
+#endif // GGML_SPACEMIT_Q8_SYNC_OBSERVER_DIAGNOSTIC
 
 namespace ggml::cpu::riscv64_spacemit {
 
@@ -336,6 +491,16 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const int64_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const int64_t per_mb_rows_wsize = row_align * row_stride_a;
         const int64_t per_nb_cols_wsize = NB_COLS * row_stride_b;
+        const auto staged_b_bytes = [&](int64_t logical_cols) -> size_t {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0> ||
+                          std::is_same_v<BLOC_TYPE, block_q6_K> ||
+                          (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 32)) {
+                // Q6_K is repacked into the same physical N32 Q8 layout.
+                // Partial logical N still needs every K block of that full tile.
+                return spacemit_kernels::div_round_up(logical_cols, NB_COLS) * NB_COLS * row_stride_b;
+            }
+            return logical_cols * row_stride_b;
+        };
 
         const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
 
@@ -375,7 +540,15 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             }
         }
 
+#if defined(GGML_SPACEMIT_Q8_SYNC_OBSERVER_DIAGNOSTIC)
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            q8_sync_observer::instance().sync(ctx, gemm_m, gemm_n, gemm_k);
+        } else {
+            ctx.sync();
+        }
+#else
         ctx.sync();
+#endif
 
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
         const int64_t gemm_m_blocked    = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
@@ -450,7 +623,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
             if (ith % 2 == 0 && active0) {
                 spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni0 * row_stride_b,
-                                                nb0 * row_stride_b);
+                                                staged_b_bytes(nb0));
                 if (a_row != quant_a_buffer) {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
                 }
@@ -465,7 +638,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
                 }
                 spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni0 * row_stride_b,
-                                                nb0 * row_stride_b);
+                                                staged_b_bytes(nb0));
             }
 
             const int64_t base_start = (int64_t) (ith & ~1) * NB_COLS;
@@ -503,7 +676,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 if (next_ni < gemm_n) {
                     const int64_t next_nb = std::min(gemm_n - next_ni, (int64_t) NB_COLS);
                     spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + next_ni * row_stride_b,
-                                                    next_nb * row_stride_b);
+                                                    staged_b_bytes(next_nb));
                 }
             }
         } else {
@@ -1515,6 +1688,14 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
                 if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q4_0_32x32_q8_0;
                 }
+
+                // Dense Q4_0 matrices may have a partial N32 tile (e.g. OCR N=4304).
+                // The 32-block repack pads only physical N; the logical tensor stays unchanged.
+                if (cur->ne[2] == 1 && cur->ne[3] == 1 && cur->ne[1] % 32 != 0 &&
+                    cur->ne[0] % QK4_0 == 0 &&
+                    ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2) {
+                    return &ggml::cpu::riscv64_spacemit::q4_0_32x32_q8_0;
+                }
 #endif
 
 #if defined(RISCV64_SPACEMIT_IME1)
@@ -1670,6 +1851,14 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
 
     size_t nbytes = row_nbytes;
     switch (tensor->type) {
+        case GGML_TYPE_Q4_0:
+            if (ggml_spacemit_get_optimal_repack_type(tensor) ==
+                &ggml::cpu::riscv64_spacemit::q4_0_32x32_q8_0) {
+                nbytes = remap_block_nbytes(sizeof(block_q4_0), sizeof(block_q4_0), 32);
+            } else {
+                nbytes = add_strided_nbytes(row_nbytes, 1, 1);
+            }
+            break;
         case GGML_TYPE_Q4_K:
             nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
             break;
@@ -1746,7 +1935,12 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
     const auto * common = &ggml::cpu::riscv64_spacemit::rvv_impl;
     switch (op->op) {
         case GGML_OP_MUL_MAT:
-            if (op->src[0] && op->src[1] && ggml_n_dims(op->src[0]) == 2 &&
+            if (op->src[0] && op->src[1] &&
+                // GGML collapses [K,1,1,1] to 1-D; packed Q4/Q8 weights
+                // still require their matrix trait. Do not widen higher-rank gates.
+                (ggml_n_dims(op->src[0]) == 2 ||
+                 ((op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                  op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1)) &&
                 op->src[1]->type == GGML_TYPE_F32) {
                 const auto * traits = static_cast<const ggml::spacemit::tensor_traits_base *>(op->src[0]->extra);
                 if (traits) return traits;

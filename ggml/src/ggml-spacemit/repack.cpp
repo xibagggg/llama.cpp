@@ -572,18 +572,23 @@ static int repack_q4_0_to_q4_0_32_bl_ref(ggml_tensor *              t,
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q4_0));
 
-    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK4_0 != 0) {
+    if (t->ne[0] % QK4_0 != 0) {
         return -1;
     }
 
     for (int b = 0; b < nrow; b += nrows_interleaved) {
+        const int nrows_real = std::min(nrow - b, nrows_interleaved);
         for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
+            int i = 0;
+            for (; i < nrows_real; i++) {
+                dst_tmp[i] = src[x + (b + i) * nblocks];
+            }
+            for (; i < nrows_interleaved; i++) {
+                // d=0 makes every padded weight zero, independently of its nibble.
+                memset(&dst_tmp[i], 0, sizeof(block_q4_0));
             }
             *dst++ = make_block_q4_0x32(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
     return 0;
 
@@ -1727,6 +1732,9 @@ template <> int repack<block_q3_K, 256, 32>(ggml_tensor * t, const void * data, 
 }
 
 template <> int repack<block_q4_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
+    if (t->ne[1] % 32 != 0) {
+        return repack_q4_0_to_q4_0_32_bl_ref(t, 32, data, data_size);
+    }
 #if 0
     return repack_q4_0_to_q4_0_32_bl_ref(t, 32, data, data_size);
 #else
