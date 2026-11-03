@@ -1,3 +1,5 @@
+> **MiniCPM-OCR on SpacemiT K3:** [build, versions and benchmark scope](docs/minicpm-ocr/README.md). Q4/Q4 experiments are on the minicpm-ocr/k3-q4q4 branch; acceleration flags remain off by default.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
