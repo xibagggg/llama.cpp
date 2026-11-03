@@ -1,0 +1,16 @@
+set -euo pipefail
+cd /home/bianbu/MiniCPM-OCR-1.0
+for mode in combined; do
+ opts=(--fa-x8 --fa-pack)
+ if test "$mode" = combined; then
+  opts+=(--ime2-fp16-down --ime2-fp16-compensate --ime2-normalize --ime2-down-layers "$(seq -s, 14 26)")
+ fi
+ taskset -c 0-7 python3 -u scripts/optimization_round.v40.py \
+  --label "20261104-q4q4-v40-quality-$mode" \
+  --runtime v40=ocr-adaptation/runtime-q4q4-fa-pack-v40 \
+  --precision q4 --text-precision q4 --f16-m4-cache "${opts[@]}" \
+  --spacemit-core-ids 8,9,10,11,13,14,15 \
+  --case-file images/optimization-v5/cases.json \
+  --cases 03_table_gb_standard v5_table_merge4 chinese chinese_skew3 01_text_putnam 02_formula_putnam 04_scanned_civil_trial \
+  --warmups 0 --repeats 1 --strict-quality-evidence --min-free-gib 4
+done
