@@ -18,6 +18,7 @@
 #    error "riscv v extension or v_intrinsic not enabled"
 #else
 #    include <riscv_vector.h>
+#    include "ocr-fa-x8-v39.h"
 #endif
 
 #if !defined(__riscv_zfh)
@@ -1735,6 +1736,10 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                                             DK);
 
                 int tq = 0;
+                if(ocr_fa_x8_enabled()&&DK==72&&DV==72&&!mask){
+                    for(;tq+7<tile_rows;tq+=8)
+                        ocr_qk_f16_x8(KQ+tq*KV_TILE_SZ,Q_f16+tq*DK,K_f16,DK,KV_TILE_SZ,max_active_kv);
+                }
                 for (; tq + 3 < tile_rows; tq += 4) {
                     const int group_active = std::max(std::max(active_kv[tq + 0], active_kv[tq + 1]),
                                                       std::max(active_kv[tq + 2], active_kv[tq + 3]));
@@ -1812,6 +1817,15 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
 
                 int tq = 0;
+                if(ocr_fa_x8_enabled()&&DK==72&&DV==72&&!mask){
+                    for(;tq+7<tile_rows;tq+=8){
+                        bool any_skip=false;for(int i=0;i<8;++i)any_skip|=skip[tq+i];
+                        if(any_skip){
+                            for(int i=0;i<8;++i)if(!skip[tq+i])
+                                rvv_pv_accumulate_f16_x1(VKQ32+(tq+i)*DV,KQ+(tq+i)*KV_TILE_SZ,V_f16,active_kv[tq+i],DV);
+                        }else ocr_pv_f16_x8(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,max_active_kv);
+                    }
+                }
                 for (; tq + 3 < tile_rows; tq += 4) {
                     if (skip[tq + 0] || skip[tq + 1] || skip[tq + 2] || skip[tq + 3]) {
                         for (int i = 0; i < 4; ++i) {
