@@ -53,3 +53,5 @@ establish that CPU12 is faulty or that eight-worker drift has been fixed.
 The running board service is a separate deployment decision. Pushing source
 does not replace its binary. See [CHANGELOG.md](CHANGELOG.md) and
 [versions.json](versions.json) for version lineage and validation scope.
+
+Current Q4/Q4 results and candidate limitations: [RESULTS-20261104.md](RESULTS-20261104.md).
