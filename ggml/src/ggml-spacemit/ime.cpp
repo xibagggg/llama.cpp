@@ -3,6 +3,7 @@
 
 #include "ime.h"
 #include "ocr-ime2-fp16-v35.h"
+#include "ocr-down-diagnostic-v36.h"
 
 #include "common.h"
 #include "ggml-backend-impl.h"
@@ -375,6 +376,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
     }
 
     bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) const {
+        ocr_down_diagnostic_v36::quant_scope capture(ctx,op);
         constexpr size_t a_blk_len = INTER_SIZE;
         constexpr size_t b_blk_len = INTER_SIZE;
 
@@ -551,6 +553,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         ctx.sync();
 #endif
 
+        capture.packed(quant_a_buffer,gemm_m*row_stride_a,a_blk_len,row_stride_a);
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
         const int64_t gemm_m_blocked    = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
         const int64_t max_gemm_n_stride = spacemit_kernels::div_round_up(gemm_n * gemm_m_blocked, nth);

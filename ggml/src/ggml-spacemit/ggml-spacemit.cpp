@@ -657,6 +657,9 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             }
 
             ctx.clear();
+#ifdef GGML_BUILD_PROFILE
+            ggml_profile_flush_tls();
+#endif
         }
     );
 

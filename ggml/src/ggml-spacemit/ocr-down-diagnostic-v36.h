@@ -64,4 +64,37 @@ struct scope {
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);
     }
 };
+struct quant_scope {
+    ggml::spacemit::context &ctx;ggml_tensor *op;std::string prefix;bool active=false;
+    quant_scope(ggml::spacemit::context &c,ggml_tensor *t):ctx(c),op(t){
+        static const char *dir=std::getenv("GGML_SPACEMIT_OCR_QUANT_CAPTURE");
+        if(!dir||!*dir||!op->src[0]||!op->src[1])return;
+        const char *w=op->src[0]->name;
+        if(std::strncmp(w,"v.blk.0.",8)&&std::strncmp(w,"v.blk.1.",8))return;
+        GGML_ASSERT(ggml_is_contiguous(op->src[1])&&op->src[1]->type==GGML_TYPE_F32&&ggml_is_contiguous(op));
+        active=true;GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+        if(ctx.ith==0){
+            static unsigned next=0;const unsigned seq=next++;
+            if(seq>=20)GGML_ABORT("quant capture limit reached");
+            prefix=std::string(dir)+"/"+std::to_string(seq)+"-"+w;
+            write_file(prefix+"-x.f32",op->src[1]->data,ggml_nbytes(op->src[1]));
+        }
+        GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+    }
+    void packed(const void *data,size_t bytes,size_t block,size_t stride){
+        if(!active)return;
+        if(ctx.ith==0){
+            write_file(prefix+"-a.q8",data,bytes);
+            const std::string meta="{\"weight\":\""+std::string(op->src[0]->name)+"\",\"K\":"+std::to_string(op->src[1]->ne[0])+",\"N\":"+std::to_string(op->src[1]->ne[1])+",\"M\":"+std::to_string(op->ne[0])+",\"block\":"+std::to_string(block)+",\"stride\":"+std::to_string(stride)+"}";
+            write_file(prefix+".json",meta.data(),meta.size());
+        }
+        GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+    }
+    ~quant_scope(){
+        if(!active)return;
+        GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+        if(ctx.ith==0)write_file(prefix+"-y.f32",op->data,ggml_nbytes(op));
+        GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+    }
+};
 }
