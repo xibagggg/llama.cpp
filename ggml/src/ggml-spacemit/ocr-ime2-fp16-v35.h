@@ -10,6 +10,10 @@
 namespace ocr_ime2_fp16_v35 {
 constexpr int K=4304,M=1152;
 constexpr size_t scratch_bytes=346624;
+inline bool normalized(){
+    static const bool value=[] {const char *v=std::getenv("GGML_SPACEMIT_IME2_FP16_NORMALIZE");return v&&std::strcmp(v,"1")==0;}();
+    return value;
+}
 // Explicit experimental per-layer selection. Unset retains the previous path.
 inline bool selected_layer(const ggml_tensor *w){
     static const uint32_t mask=[] {
@@ -73,8 +77,17 @@ __attribute__((noinline)) static void kernel32(const _Float16 *x,const _Float16 
       : "t0","v2","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","memory");
 }
 static void pack_w(const _Float16 *w,_Float16 *p,int group){
-    for(int k=0;k<K;k+=8)for(int r=0;r<8;++r)
-        std::memcpy(p+group*8*K+k*8+r*8,w+(group*8+r)*K+k,16);
+    for(int k=0;k<K;k+=8)for(int r=0;r<8;++r){
+        auto *dst=p+group*8*K+k*8+r*8;
+        const auto *src=w+(group*8+r)*K+k;
+        if(!normalized()){std::memcpy(dst,src,16);continue;}
+        auto a=__riscv_vfwcvt_f_f_v_f32m2(__riscv_vle16_v_f16m1(src,8),8);
+        // Every nonzero FP16 value becomes normal after multiplying by 2^10.
+        // This opt-in kernel is bounded to weights <= 63 to avoid overflow.
+        GGML_ASSERT(__riscv_vcpop_m_b16(__riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(a,8),63.0f,8),8)==0);
+        a=__riscv_vfmul_vf_f32m2(a,1024.0f,8);
+        __riscv_vse16_v_f16m1(dst,__riscv_vfncvt_f_f_w_f16m1(a,8),8);
+    }
 }
 // Packing pads only physical token storage. Logical dimensions stay intact.
 // high = fp16(x), low = fp16(x - fp32(high)); two independent FP32
@@ -88,7 +101,15 @@ static void pack_x(const float *x,_Float16 *hi,_Float16 *lo,int group,int N){
             continue;
         }
         const auto a=__riscv_vle32_v_f32m2(x+size_t(group*8+r)*K+k,8);
-        const auto h=__riscv_vfncvt_f_f_w_f16m1(a,8);
+        auto h=__riscv_vfncvt_f_f_w_f16m1(a,8);
+        if(normalized()){
+            auto h32=__riscv_vfwcvt_f_f_v_f32m2(h,8);
+            const auto small=__riscv_vmflt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(h32,8),0x1p-14f,8);
+            // Match the effective IME high input, then place the entire small
+            // value in the scaled residual rather than subtracting a lost high.
+            h32=__riscv_vfmerge_vfm_f32m2(h32,0.0f,small,8);
+            h=__riscv_vfncvt_f_f_w_f16m1(h32,8);
+        }
         __riscv_vse16_v_f16m1(hi+offset,h,8);
         if(lo){
             const auto h32=__riscv_vfwcvt_f_f_v_f32m2(h,8);
@@ -109,6 +130,7 @@ inline bool forward(ggml::spacemit::context &ctx,ggml_tensor *op){
     const int N=int(op->src[1]->ne[1]),rank=int(ctx.ith),workers=int(ctx.nth);
     const int groups=(N+7)/8;
     const bool split=compensated();
+    GGML_ASSERT(!normalized()||split);
     const auto *w=static_cast<const _Float16*>(op->src[0]->data);
     const auto *x=static_cast<const float*>(op->src[1]->data);
     auto *pw=static_cast<_Float16*>(ctx.workspace),*px=pw+M*K;
@@ -131,13 +153,14 @@ inline bool forward(ggml::spacemit::context &ctx,ggml_tensor *op){
                 std::memcpy(sx,pl+size_t(nb)*8*K,8*K*2);kernel32(sx,sw,low);
                 for(int i=0;i<256;++i)temp[i]+=low[i]*(1.0f/4096.0f);
             }
+            if(normalized())for(int i=0;i<256;++i)temp[i]*=(1.0f/1024.0f);
             for(int g=0;g<4;++g)for(int n=0;n<8&&nb*8+n<N;++n)
                 std::memcpy(out+(nb*8+n)*M+mb*32+g*8,temp+g*64+n*8,32);
         }
     }
     for(int i=0;i<128;++i)GGML_ASSERT(base[i]==0xa5&&reinterpret_cast<unsigned char*>(temp)[2048+i]==0xa5);
     static std::atomic<bool> announced{false};
-    if(rank==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-ime2-fp16-v35: active K=%d M=%d N=%d workers=%d scratch=%zu compensate=%d\n",K,M,N,workers,scratch_bytes,int(split));
+    if(rank==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-ime2-fp16-v35: active K=%d M=%d N=%d workers=%d scratch=%zu compensate=%d normalize=%d\n",K,M,N,workers,scratch_bytes,int(split),int(normalized()));
     return true;
 }
 } // namespace ocr_ime2_fp16_v35
