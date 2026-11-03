@@ -57,3 +57,7 @@ See RESULTS-20261104.md and benchmark-results-v40.json for failed all-layer qual
 ## 2026-11-03 — v41 activation TCM tiling
 
 Optional exact M4 activation tiles 8/16 with shape/scratch guards and diagnostic coarse phase probes. Real-input frozen-reference replay, seven OCR checks, same-binary incremental ABBA, operator profile and bounded numeric results. All new flags remain unset by default.
+
+## 2026-11-03 — v42 paired down scheduling
+
+Optional 2x2 weight reuse over v41 TCM16 with unchanged per-output arithmetic. Frozen-reference replay across nine sizes including odd tails, seven OCR quality cases, incremental same-binary ABBA and full operator profile. Added bounded timestamp recovery for one interleaved quality-request log, preserving original evidence. New scheduling flag remains unset by default.
