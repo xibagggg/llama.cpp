@@ -53,3 +53,7 @@ it does not establish the IME subnormal mode as the cause.
 Actual down tensor capture and selected-layer dispatch; normalized tiny FP16 weight/activation handling; actual dynamic-quantization boundary capture; complete operator profile flushing; exact D72 eight-query attention reuse with mask support; transient cooperative K/V packing. All new performance paths are opt-in.
 
 See RESULTS-20261104.md and benchmark-results-v40.json for failed all-layer quality experiments, seven-case gates and formal same-binary ABBA. No default deployment promotion and no eight-worker drift claim.
+
+## 2026-11-03 — v41 activation TCM tiling
+
+Optional exact M4 activation tiles 8/16 with shape/scratch guards and diagnostic coarse phase probes. Real-input frozen-reference replay, seven OCR checks, same-binary incremental ABBA, operator profile and bounded numeric results. All new flags remain unset by default.

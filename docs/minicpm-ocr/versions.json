@@ -10,7 +10,9 @@
     "GGML_SPACEMIT_IME2_FP16_COMPENSATE": "unset",
     "GGML_SPACEMIT_IME2_FP16_NORMALIZE": "unset",
     "GGML_SPACEMIT_OCR_FA_X8": "unset",
-    "GGML_SPACEMIT_OCR_FA_PACK": "unset"
+    "GGML_SPACEMIT_OCR_FA_PACK": "unset",
+    "GGML_SPACEMIT_OCR_DOWN_TCM_TILE": "unset",
+    "GGML_SPACEMIT_OCR_DOWN_PHASES": "unset"
   },
   "model_precision": {
     "text": "Q4_0",
@@ -20,10 +22,10 @@
   "historical_candidate": "runtime-barrier-acquire-v8",
   "eight_worker_drift_resolved": false,
   "experimental_branch": "minicpm-ocr/k3-q4q4",
-  "experimental_tag": "minicpm-ocr-k3-v40-experimental",
-  "tested_experimental_commit": "d84277ecaaa87cfbc22dcfb5d34109ae4bc37d8a",
+  "experimental_tag": "minicpm-ocr-k3-v41-experimental",
+  "tested_experimental_commit": "91570b05aa667bed593ac715158cc95b3820dd36",
   "candidate_promoted": false,
-  "benchmark_record": "benchmark-results-v40.json",
+  "benchmark_record": "benchmark-results-v41.json",
   "candidate_flags": {
     "GGML_SPACEMIT_F16_M4_CACHE": "1",
     "GGML_SPACEMIT_IME2_FP16_DOWN": "1",
@@ -31,6 +33,7 @@
     "GGML_SPACEMIT_IME2_FP16_NORMALIZE": "1",
     "GGML_SPACEMIT_IME2_FP16_DOWN_LAYERS": "14,15,16,17,18,19,20,21,22,23,24,25,26",
     "GGML_SPACEMIT_OCR_FA_X8": "1",
-    "GGML_SPACEMIT_OCR_FA_PACK": "1"
+    "GGML_SPACEMIT_OCR_FA_PACK": "1",
+    "GGML_SPACEMIT_OCR_DOWN_TCM_TILE": "16"
   }
 }
