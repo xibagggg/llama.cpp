@@ -39,3 +39,11 @@ TCM allocation is 346624 bytes per worker, including canaries.
 This is an experiment awaiting numerical, OCR-quality and ABBA checks.
 Both IME2 flags remain off by default. The date names the requested
 campaign, not an assertion that tests ran on November 4.
+
+### v35b — scale residual during FP16 packing
+
+The initial actual-forward microbenchmark at N1 was finite and tail-safe,
+but relative L2 versus M4 was 9.04e-6, above the preset 2e-6 threshold.
+Investigate by multiplying activation residual by 4096 before FP16 packing,
+then scale its product back. This is an exact power-of-two adjustment;
+it does not establish the IME subnormal mode as the cause.

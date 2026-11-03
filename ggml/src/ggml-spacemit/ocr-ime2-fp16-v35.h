@@ -71,7 +71,10 @@ static void pack_x(const float *x,_Float16 *hi,_Float16 *lo,int group,int N){
         if(lo){
             const auto h32=__riscv_vfwcvt_f_f_v_f32m2(h,8);
             const auto residual=__riscv_vfsub_vv_f32m2(a,h32,8);
-            const auto l=__riscv_vfncvt_f_f_w_f16m1(residual,8);
+            // Scale residuals before narrowing so IME FP16 subnormal handling
+            // cannot erase the correction. Undo the exact power-of-two later.
+            const auto scaled=__riscv_vfmul_vf_f32m2(residual,4096.0f,8);
+            const auto l=__riscv_vfncvt_f_f_w_f16m1(scaled,8);
             __riscv_vse16_v_f16m1(lo+offset,l,8);
         }
     }
@@ -104,7 +107,7 @@ inline bool forward(ggml::spacemit::context &ctx,ggml_tensor *op){
             std::memcpy(sx,px+size_t(nb)*8*K,8*K*2);kernel32(sx,sw,temp);
             if(split){
                 std::memcpy(sx,pl+size_t(nb)*8*K,8*K*2);kernel32(sx,sw,low);
-                for(int i=0;i<256;++i)temp[i]+=low[i];
+                for(int i=0;i<256;++i)temp[i]+=low[i]*(1.0f/4096.0f);
             }
             for(int g=0;g<4;++g)for(int n=0;n<8&&nb*8+n<N;++n)
                 std::memcpy(out+(nb*8+n)*M+mb*32+g*8,temp+g*64+n*8,32);
