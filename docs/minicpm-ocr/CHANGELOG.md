@@ -26,3 +26,16 @@ Prior same-binary Q4-text/Q8-vision ABBA: E2E 37.2005 to 26.5480 s.
 That is not a Q4/Q4 formal speed result. Q4/Q4 seven-case single-run quality
 was text/token-identical in six cases; scanned-table text regressed.
 The candidate is experimental and disabled by default.
+
+## 2026-11-04 campaign, started 2026-11-03 — v35
+
+Target: text Q4 / vision Q4. New flag
+`GGML_SPACEMIT_IME2_FP16_COMPENSATE=1`, together with the IME2-down flag,
+splits F32 activation into FP16 high and residual parts. Two independent
+F32 matrix products are added after reduction. The physical N storage is
+padded to eight tokens, and stores are bounded by logical N.
+TCM allocation is 346624 bytes per worker, including canaries.
+
+This is an experiment awaiting numerical, OCR-quality and ABBA checks.
+Both IME2 flags remain off by default. The date names the requested
+campaign, not an assertion that tests ran on November 4.
