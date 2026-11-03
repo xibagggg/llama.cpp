@@ -1,5 +1,6 @@
 #include "rvv_kernels.h"
 #include "ocr-ime2-fp16-v35.h"
+#include "ocr-down-diagnostic-v36.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -4647,6 +4648,7 @@ static __attribute__((noipa)) void forward_mul_mat_f16_f32_m4_cache(ggml::spacem
 }
 
 void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    ocr_down_diagnostic_v36::scope capture(ctx, op);
     if (ocr_ime2_fp16_v35::forward(ctx, op)) return;
     static const bool m4_cache_enabled = [] {
         const char * value = std::getenv("GGML_SPACEMIT_F16_M4_CACHE");

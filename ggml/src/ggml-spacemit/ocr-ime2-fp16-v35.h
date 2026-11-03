@@ -6,9 +6,31 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 namespace ocr_ime2_fp16_v35 {
 constexpr int K=4304,M=1152;
 constexpr size_t scratch_bytes=346624;
+// Explicit experimental per-layer selection. Unset retains the previous path.
+inline bool selected_layer(const ggml_tensor *w){
+    static const uint32_t mask=[] {
+        const char *text=std::getenv("GGML_SPACEMIT_IME2_FP16_DOWN_LAYERS");
+        if(!text)return (uint32_t(1)<<27)-1;
+        if(std::strcmp(text,"none")==0)return uint32_t(0);
+        uint32_t result=0;
+        for(const char *p=text;*p;){
+            char *end=nullptr;long layer=std::strtol(p,&end,10);
+            if(end==p||layer<0||layer>=27||(*end&&*end!=','))GGML_ABORT("Invalid OCR down layer list");
+            result|=uint32_t(1)<<layer;
+            if(*end==','&&!end[1])GGML_ABORT("Trailing comma in OCR down layer list");
+            p=*end?end+1:end;
+        }
+        if(!*text)GGML_ABORT("Empty OCR down layer list; use none");
+        return result;
+    }();
+    int layer=-1;char suffix=0;
+    return std::sscanf(w->name,"v.blk.%d.ffn_down.weight%c",&layer,&suffix)==1&&
+           layer>=0&&layer<27&&(mask&(uint32_t(1)<<layer));
+}
 inline bool eligible(const ggml_tensor *op) {
     static const bool enabled=[] {const char *v=std::getenv("GGML_SPACEMIT_IME2_FP16_DOWN");return v&&std::strcmp(v,"1")==0;}();
     if(!enabled||!op||op->op!=GGML_OP_MUL_MAT||!op->src[0]||!op->src[1])return false;
@@ -17,7 +39,7 @@ inline bool eligible(const ggml_tensor *op) {
        w->ne[0]!=K||w->ne[1]!=M||w->ne[2]!=1||w->ne[3]!=1||
        x->ne[0]!=K||x->ne[1]<1||x->ne[2]!=1||x->ne[3]!=1||
        !ggml_is_contiguous(w)||!ggml_is_contiguous(x)||!ggml_is_contiguous(op)||
-       std::strncmp(w->name,"v.blk.",6)!=0||std::strstr(w->name,".ffn_down.weight")==nullptr)return false;
+       std::strncmp(w->name,"v.blk.",6)!=0||std::strstr(w->name,".ffn_down.weight")==nullptr||!selected_layer(w))return false;
     static const auto info=spert::backend_info();
     return info.core_arch_id==0xa064&&info.vlen==128&&info.shared_mem_size>=scratch_bytes;
 }
