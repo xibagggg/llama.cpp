@@ -12,7 +12,6 @@ inline bool float_v_v51(){return compute_v51()&2;}
 inline int direct_v44(){
     static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_DIRECT");
         return p&&p[0]>='1'&&p[0]<='3'&&!p[1]?int(p[0]-'0'):0;}();return v;
-inline float *values32(ggml::spacemit::context &ctx,const ggml_tensor *op){return reinterpret_cast<float*>(values(ctx,op));}
 }
 inline bool lazy_init(){
     static const bool value=[] {const char *p=std::getenv("GGML_SPACEMIT_OCR_FA_LAZY_INIT");return p&&std::strcmp(p,"1")==0;}();return value;
@@ -36,4 +35,6 @@ inline size_t packed_elements(const ggml_tensor *op){return tiles(op)*16*72*GGML
 inline size_t work_bytes(int threads,const ggml_tensor *op){return scratch_offset(threads)+(float_v_v51()?3:2)*packed_elements(op)*sizeof(_Float16);}
 inline _Float16 *keys(ggml::spacemit::context &ctx){return reinterpret_cast<_Float16*>(static_cast<char*>(ctx.workspace)+scratch_offset(ctx.nth));}
 inline _Float16 *values(ggml::spacemit::context &ctx,const ggml_tensor *op){return keys(ctx)+packed_elements(op);}
+inline float *values32(ggml::spacemit::context &ctx,const ggml_tensor *op){return reinterpret_cast<float*>(values(ctx,op));}
+
 }
