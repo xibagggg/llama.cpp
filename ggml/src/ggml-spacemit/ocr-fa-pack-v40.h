@@ -5,10 +5,10 @@
 #include <cstdlib>
 #include <cstring>
 namespace ocr_fa_pack_v40 {
-inline int compute_v51(){static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_COMPUTE");return p&&p[0]>='1'&&p[0]<='3'&&!p[1]?p[0]-'0':0;}();return v;}
-inline bool wide_pv_v51(){return compute_v51()==1;}
-inline bool float_v_v51(){return compute_v51()==2;}
-
+inline bool ime_qk(const ggml_tensor*op){
+ static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_COMPUTE");return p&&std::strcmp(p,"3")==0;}();
+ return on&&op&&op->src[3]==nullptr&&op->src[0]->ne[1]>=988;
+}
 inline int direct_v44(){
     static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_DIRECT");
         return p&&p[0]>='1'&&p[0]<='3'&&!p[1]?int(p[0]-'0'):0;}();return v;
@@ -32,11 +32,9 @@ inline size_t scratch_offset(int threads){
 }
 inline size_t tiles(const ggml_tensor *op){return (size_t(op->src[1]->ne[1])+GGML_FA_TILE_KV-1)/GGML_FA_TILE_KV;}
 inline size_t packed_elements(const ggml_tensor *op){return tiles(op)*16*72*GGML_FA_TILE_KV;}
-inline size_t work_bytes(int threads,const ggml_tensor *op){return scratch_offset(threads)+((compute_v51()>=2?3:2)*packed_elements(op)+(compute_v51()==3?tiles(op)*16*32:0))*sizeof(_Float16);}
+inline size_t work_bytes(int threads,const ggml_tensor *op){return scratch_offset(threads)+((ime_qk(op)?3:2)*packed_elements(op)+(ime_qk(op)?tiles(op)*16*32:0))*sizeof(_Float16);}
 inline _Float16 *keys(ggml::spacemit::context &ctx){return reinterpret_cast<_Float16*>(static_cast<char*>(ctx.workspace)+scratch_offset(ctx.nth));}
 inline _Float16 *values(ggml::spacemit::context &ctx,const ggml_tensor *op){return keys(ctx)+packed_elements(op);}
-inline float *values32(ggml::spacemit::context &ctx,const ggml_tensor *op){return reinterpret_cast<float*>(values(ctx,op));}
-
 inline _Float16 *ime_key_tile(ggml::spacemit::context &ctx,const ggml_tensor*op,size_t tile){return keys(ctx)+2*packed_elements(op)+tile*(72*GGML_FA_TILE_KV+32);}
 
 }

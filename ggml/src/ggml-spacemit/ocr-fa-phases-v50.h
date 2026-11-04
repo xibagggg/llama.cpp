@@ -11,7 +11,7 @@ namespace ocr_fa_phases_v50 {
 inline const char* directory(){static const char *p=std::getenv("GGML_SPACEMIT_OCR_FA_PHASES");return p&&*p?p:nullptr;}
 inline bool enabled(){return directory()!=nullptr;}
 inline uint64_t now(){return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
-struct item{char name[64]{},stage[12]{};uint64_t start=0,end=0,ns[11]{};int64_t n=0;unsigned worker=0;};
+struct item{char name[64]{},stage[12]{};uint64_t start=0,end=0,ns[10]{};int64_t n=0;unsigned worker=0;};
 struct storage{
     static constexpr unsigned capacity=1024;
     unsigned used[8]{};item data[8][capacity]{};
@@ -20,12 +20,12 @@ struct storage{
     static void dump(){
         auto &s=get();char path[4096];std::snprintf(path,sizeof(path),"%s/attention-phases.jsonl",directory());
         FILE*f=std::fopen(path,"w");if(!f)return;
-        const char* names[]={"shared_pack","prepare_barrier_wait","query_init_pack","mask_bookkeeping","K_copy","QK_compute","softmax_rescale","V_copy","PV_compute","output_store","final_barrier_wait"};
+        const char* names[]={"shared_pack","prepare_barrier_wait","query_init_pack","mask_bookkeeping","K_copy","QK_compute","softmax_rescale","V_copy","PV_compute","output_store"};
         for(unsigned w=0;w<8;++w){
             std::fprintf(f,"{\"kind\":\"lane\",\"worker\":%u,\"used\":%u,\"dropped\":%u}\n",w,s.used[w],s.used[w]>capacity?s.used[w]-capacity:0);
             for(unsigned i=0;i<s.used[w]&&i<capacity;++i){const auto&r=s.data[w][i];
                 std::fprintf(f,"{\"kind\":\"phase\",\"name\":\"%s\",\"stage\":\"%s\",\"N\":%lld,\"worker\":%u,\"start_ns\":%llu,\"end_ns\":%llu",r.name,r.stage,(long long)r.n,w,(unsigned long long)r.start,(unsigned long long)r.end);
-                for(int j=0;j<11;++j)std::fprintf(f,",\"%s_ns\":%llu",names[j],(unsigned long long)r.ns[j]);
+                for(int j=0;j<10;++j)std::fprintf(f,",\"%s_ns\":%llu",names[j],(unsigned long long)r.ns[j]);
                 std::fprintf(f,"}\n");
             }
         }

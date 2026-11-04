@@ -1567,14 +1567,12 @@ static void prepare_ocr_fa_kv_v50_impl(ggml::spacemit::context &ctx,ggml_tensor 
     auto *pk=ocr_fa_pack_v40::keys(ctx),*pv=ocr_fa_pack_v40::values(ctx,op);
     for(int task=ctx.ith;task<16*nt;task+=ctx.nth){
         const int head=task/nt,ic=(task%nt)*KV,count=std::min(KV,int(k->ne[1])-ic);
-        auto *dk=pk+size_t(task)*D*KV;
-        const bool f32=ocr_fa_pack_v40::float_v_v51();
-        void *dv=f32?(void*)(ocr_fa_pack_v40::values32(ctx,op)+size_t(task)*D*KV):(void*)(pv+size_t(task)*D*KV);
-        if(!ocr_fa_pack_v40::lazy_init()||count<KV){std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*(f32?4:2));}
+        auto *dk=pk+size_t(task)*D*KV,*dv=pv+size_t(task)*D*KV;
+        // Full tiles are overwritten by the transpose/copy; tails still need zero padding.
+        if(!ocr_fa_pack_v40::lazy_init()||count<KV){std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*2);}
         rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
-        if(f32)rvv_pack_scaled_f16_as_f32((float*)dv,D*4,(const ggml_fp16_t*)((const char*)v->data+ic*v->nb[1]+head*v->nb[2]),v->nb[1],count,D,1.0f);
-        else memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
-        if(ocr_fa_pack_v40::compute_v51()==3){
+        memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
+        if(ocr_fa_pack_v40::ime_qk(op)){
             auto*ik=ocr_fa_pack_v40::ime_key_tile(ctx,op,task);
             const bool valid=ocr_qk_ime2_v53::pack_k(dk,ik,KV,count);
             ik[D*KV]=valid?(_Float16)1:(_Float16)0;
@@ -1592,7 +1590,7 @@ void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
     else prepare_ocr_fa_kv_v50_impl<false>(ctx,op);
 }
 
-template<bool PROFILE>
+template<bool PROFILE,bool IME=false>
 static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
@@ -1754,11 +1752,14 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
             memcpy2d(Q_f32, DK * sizeof(float), pq, nbq1, tile_rows, DK * sizeof(float));
         }
 
-        bool qk_ime=packed_kv&&ocr_fa_pack_v40::compute_v51()==3&&ctx.shared.data&&
-            ctx.shared.size>=base_size+ocr_qk_ime2_v53::scratch_bytes;
-        auto *qpacked=reinterpret_cast<_Float16*>(reinterpret_cast<char*>(base)+base_size);
-        auto *qk_scratch=qpacked+64*72;
-        if(qk_ime)qk_ime=ocr_qk_ime2_v53::pack_q(Q_f16,qpacked,tile_rows);
+        bool use_ime=false;
+        _Float16*qpacked=nullptr;void*qk_scratch=nullptr;
+        if constexpr(IME){
+            use_ime=packed_kv&&base==(float*)ctx.shared.data&&ctx.shared.size>=base_size+ocr_qk_ime2_v53::scratch_bytes;
+            qpacked=reinterpret_cast<_Float16*>(reinterpret_cast<char*>(base)+base_size);
+            qk_scratch=qpacked+64*72;
+            if(use_ime)use_ime=ocr_qk_ime2_v53::pack_q(Q_f16,qpacked,tile_rows);
+        }
         if constexpr(PROFILE)phase.tick(2); // query packing / output initialization
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
@@ -1810,10 +1811,12 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
                 if constexpr(PROFILE)phase.tick(4); // K copy or direct pointer
                 int tq = 0;
-                if(qk_ime){
-                    const size_t tile=size_t(ik2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
-                    const auto*ik=ocr_fa_pack_v40::ime_key_tile(ctx,dst,tile);
-                    if(ik[DK*KV_TILE_SZ]!=(_Float16)0&&ocr_qk_ime2_v53::qk(KQ,qpacked,ik,KV_TILE_SZ,tile_rows,max_active_kv,qk_scratch))tq=tile_rows;
+                if constexpr(IME){
+                    if(use_ime){
+                        const size_t tile=size_t(ik2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
+                        const auto*ik=ocr_fa_pack_v40::ime_key_tile(ctx,dst,tile);
+                        if(ik[DK*KV_TILE_SZ]!=(_Float16)0&&ocr_qk_ime2_v53::qk(KQ,qpacked,ik,KV_TILE_SZ,tile_rows,max_active_kv,qk_scratch))tq=tile_rows;
+                    }
                 }
                 if(tq==0&&ocr_fa_x8_enabled()&&DK==72&&DV==72){
                     static std::atomic<bool> announced{false};
@@ -1907,22 +1910,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
             if constexpr(PROFILE)phase.tick(6); // max, exp, sum and online output rescale
             // Pack V as contiguous [KV_TILE_SZ][DV].
-            if(packed_kv&&ocr_fa_pack_v40::float_v_v51()){
-                const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
-                const float *vv=ocr_fa_pack_v40::values32(ctx,dst)+tile*DV*KV_TILE_SZ;
-                if constexpr(PROFILE)phase.tick(7);
-                int tq=0;
-                for(;tq+7<tile_rows;tq+=8){
-                    bool any_skip=false;for(int i=0;i<8;++i)any_skip|=skip[tq+i];
-                    if(any_skip){for(int i=0;i<8;++i)if(!skip[tq+i])rvv_pv_accumulate(VKQ32+(tq+i)*DV,KQ+(tq+i)*KV_TILE_SZ,vv,active_kv[tq+i],DV);}
-                    else{
-                        int active=0;for(int i=0;i<8;++i)active=std::max(active,active_kv[tq+i]);
-                        for(int i=0;i<8;++i)std::fill(KQ+(tq+i)*KV_TILE_SZ+active_kv[tq+i],KQ+(tq+i)*KV_TILE_SZ+active,0.f);
-                        ocr_pv_f32_x8_v51(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,vv,DV,KV_TILE_SZ,active);
-                    }
-                }
-                for(;tq<tile_rows;++tq)if(!skip[tq])rvv_pv_accumulate(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,vv,active_kv[tq],DV);
-            }else if (kv_type == GGML_TYPE_F16) {
+            if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
                 if(packed_kv){
                     const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
@@ -1955,10 +1943,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                         }else{
                             int group_active=0;for(int i=0;i<8;++i)group_active=std::max(group_active,active_kv[tq+i]);
                             for(int i=0;i<8;++i)std::fill(KQ+(tq+i)*KV_TILE_SZ+active_kv[tq+i],KQ+(tq+i)*KV_TILE_SZ+group_active,0.0f);
-                            if(packed_kv&&ocr_fa_pack_v40::wide_pv_v51()){
-                                ocr_pv_f16_x4_wide_v51(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
-                                ocr_pv_f16_x4_wide_v51(VKQ32+(tq+4)*DV,KQ+(tq+4)*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
-                            }else ocr_pv_f16_x8(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
+                            ocr_pv_f16_x8(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
                         }
                     }
                 }
@@ -2038,8 +2023,13 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 }
 
 void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context &ctx,ggml_tensor *dst,int ir0,int ir1){
-    if(ocr_fa_phases_v50::enabled()&&ocr_fa_pack_v40::eligible(dst))forward_flash_attn_v50_impl<true>(ctx,dst,ir0,ir1);
-    else forward_flash_attn_v50_impl<false>(ctx,dst,ir0,ir1);
+    if(ocr_fa_pack_v40::eligible(dst)&&ocr_fa_pack_v40::ime_qk(dst)){
+        if(ocr_fa_phases_v50::enabled())forward_flash_attn_v50_impl<true,true>(ctx,dst,ir0,ir1);
+        else forward_flash_attn_v50_impl<false,true>(ctx,dst,ir0,ir1);
+    }else{
+        if(ocr_fa_phases_v50::enabled()&&ocr_fa_pack_v40::eligible(dst))forward_flash_attn_v50_impl<true>(ctx,dst,ir0,ir1);
+        else forward_flash_attn_v50_impl<false>(ctx,dst,ir0,ir1);
+    }
 }
 
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
