@@ -6,8 +6,11 @@
 #include <cstring>
 namespace ocr_fa_pack_v40 {
 inline bool ime_qk(const ggml_tensor*op){
- static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_COMPUTE");return p&&std::strcmp(p,"3")==0;}();
+ static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_COMPUTE");return p&&(std::strcmp(p,"3")==0||std::strcmp(p,"4")==0);}();
  return on&&op&&op->src[3]==nullptr&&op->src[0]->ne[1]>=988;
+}
+inline bool pipeline_pv(){
+ static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_COMPUTE");return p&&std::strcmp(p,"4")==0;}();return on;
 }
 inline int direct_v44(){
     static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_DIRECT");
