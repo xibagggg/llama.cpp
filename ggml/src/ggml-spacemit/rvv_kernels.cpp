@@ -24,6 +24,7 @@
 #else
 #    include <riscv_vector.h>
 #    include "ocr-fa-x8-v39.h"
+#    include "ocr-fa-group-v45.h"
 #endif
 
 #if !defined(__riscv_zfh)
@@ -1780,6 +1781,16 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 if(ocr_fa_x8_enabled()&&DK==72&&DV==72){
                     static std::atomic<bool> announced{false};
                     if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-x8-v39: active D72 eight-query K/V reuse mask=%d\n",int(mask!=nullptr));
+                    if(packed_kv&&ocr_fa_group_v45::mode()){
+                        static std::atomic<bool>announced{false};
+                        if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-group-v45: active qk=%d pv=%d\n",ocr_fa_group_v45::qk_group(),ocr_fa_group_v45::pv_group());
+                        const int group=ocr_fa_group_v45::qk_group();
+                        if(group>8)for(;tq+group<=tile_rows;tq+=group){
+                            int active=0;for(int i=0;i<group;++i)active=std::max(active,active_kv[tq+i]);
+                            if(active){if(group==10)ocr_fa_group_v45::qk10(KQ+tq*KV_TILE_SZ,Q_f16+tq*DK,K_f16,DK,KV_TILE_SZ,active);
+                                else ocr_fa_group_v45::qk12(KQ+tq*KV_TILE_SZ,Q_f16+tq*DK,K_f16,DK,KV_TILE_SZ,active);}
+                        }
+                    }
                     for(;tq+7<tile_rows;tq+=8){
                         int group_active=0;for(int i=0;i<8;++i)group_active=std::max(group_active,active_kv[tq+i]);
                         if(group_active)ocr_qk_f16_x8(KQ+tq*KV_TILE_SZ,Q_f16+tq*DK,K_f16,DK,KV_TILE_SZ,group_active);
@@ -1867,6 +1878,20 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
 
                 int tq = 0;
                 if(ocr_fa_x8_enabled()&&DK==72&&DV==72){
+                    if(packed_kv&&ocr_fa_group_v45::pv_group()>8){
+                        const int group=ocr_fa_group_v45::pv_group();
+                        for(;tq+group<=tile_rows;tq+=group){
+                            bool any_skip=false;for(int i=0;i<group;++i)any_skip|=skip[tq+i];
+                            if(any_skip){
+                                for(int i=0;i<group;++i)if(!skip[tq+i])rvv_pv_accumulate_f16_x1(VKQ32+(tq+i)*DV,KQ+(tq+i)*KV_TILE_SZ,V_f16,active_kv[tq+i],DV);
+                            }else{
+                                int active=0;for(int i=0;i<group;++i)active=std::max(active,active_kv[tq+i]);
+                                for(int i=0;i<group;++i)std::fill(KQ+(tq+i)*KV_TILE_SZ+active_kv[tq+i],KQ+(tq+i)*KV_TILE_SZ+active,0.f);
+                                if(group==10)ocr_fa_group_v45::pv10(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,active);
+                                else ocr_fa_group_v45::pv12(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,active);
+                            }
+                        }
+                    }
                     for(;tq+7<tile_rows;tq+=8){
                         bool any_skip=false;for(int i=0;i<8;++i)any_skip|=skip[tq+i];
                         if(any_skip){
