@@ -1574,6 +1574,11 @@ static void prepare_ocr_fa_kv_v50_impl(ggml::spacemit::context &ctx,ggml_tensor 
         rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
         if(f32)rvv_pack_scaled_f16_as_f32((float*)dv,D*4,(const ggml_fp16_t*)((const char*)v->data+ic*v->nb[1]+head*v->nb[2]),v->nb[1],count,D,1.0f);
         else memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
+        if(ocr_fa_pack_v40::compute_v51()==3){
+            auto*ik=ocr_fa_pack_v40::ime_key_tile(ctx,op,task);
+            const bool valid=ocr_qk_ime2_v53::pack_k(dk,ik,KV,count);
+            ik[D*KV]=valid?(_Float16)1:(_Float16)0;
+        }
     }
     if constexpr(PROFILE)phase.tick(0); // shared K/V pack and tail initialization
     GGML_ASSERT(ctx.sync()==spert::Status::Ok);
@@ -1805,7 +1810,11 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
                 if constexpr(PROFILE)phase.tick(4); // K copy or direct pointer
                 int tq = 0;
-                if(qk_ime&&ocr_qk_ime2_v53::qk(KQ,qpacked,K_f16,KV_TILE_SZ,tile_rows,max_active_kv,qk_scratch))tq=tile_rows;
+                if(qk_ime){
+                    const size_t tile=size_t(ik2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
+                    const auto*ik=ocr_fa_pack_v40::ime_key_tile(ctx,dst,tile);
+                    if(ik[DK*KV_TILE_SZ]!=(_Float16)0&&ocr_qk_ime2_v53::qk(KQ,qpacked,ik,KV_TILE_SZ,tile_rows,max_active_kv,qk_scratch))tq=tile_rows;
+                }
                 if(tq==0&&ocr_fa_x8_enabled()&&DK==72&&DV==72){
                     static std::atomic<bool> announced{false};
                     if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-x8-v39: active D72 eight-query K/V reuse mask=%d\n",int(mask!=nullptr));

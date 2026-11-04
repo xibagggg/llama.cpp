@@ -4,18 +4,25 @@
 namespace ocr_qk_ime2_v53 {
 constexpr int D=72;
 constexpr size_t scratch_bytes=64*D*2+64*D*2+256*4;
+static bool scaled_copy(const _Float16*src,_Float16*dst,ptrdiff_t stride){
+ const auto h=__riscv_vlse16_v_f16m1(src,stride,8);
+ auto f=__riscv_vfwcvt_f_f_v_f32m2(h,8);
+ const auto bad=__riscv_vmor_mm_b16(__riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(f,8),63.f,8),__riscv_vmfne_vv_f32m2_b16(f,f,8),8);
+ if(__riscv_vcpop_m_b16(bad,8))return false;
+ __riscv_vse16_v_f16m1(dst,__riscv_vfncvt_f_f_w_f16m1(__riscv_vfmul_vf_f32m2(f,1024.f,8),8),8);
+ return true;
+}
 static bool pack_q(const _Float16*q,_Float16*p,int rows){
  for(int g=0;g<(rows+7)/8;++g)for(int d=0;d<D;d+=8)for(int r=0;r<8;++r){
   auto*dst=p+g*8*D+d*8+r*8;
-  if(g*8+r<rows){for(int j=0;j<8;++j){const float a=float(q[(g*8+r)*D+d+j]);if(!std::isfinite(a)||std::fabs(a)>63.f)return false;dst[j]=(_Float16)(a*1024.f);}}
-  else std::memset(dst,0,16);
+  if(g*8+r<rows){if(!scaled_copy(q+(g*8+r)*D+d,dst,2))return false;}else std::memset(dst,0,16);
  }
  return true;
 }
 static bool pack_k(const _Float16*k,_Float16*p,int stride,int count){
  for(int g=0;g<8;++g)for(int d=0;d<D;d+=8)for(int r=0;r<8;++r){
-  const size_t offset=g*8*D+d*8+r*8;
-  for(int j=0;j<8;++j){const float a=g*8+r<count?float(k[(d+j)*stride+g*8+r]):0.f;if(!std::isfinite(a)||std::fabs(a)>63.f)return false;p[offset+j]=(_Float16)(a*1024.f);}
+  auto*dst=p+g*8*D+d*8+r*8;
+  if(g*8+r<count){if(!scaled_copy(k+d*stride+g*8+r,dst,stride*2))return false;}else std::memset(dst,0,16);
  }
  return true;
 }
@@ -37,9 +44,9 @@ __attribute__((noinline)) static void core(const _Float16*x,const _Float16*w,flo
  :[x]"+&r"(x),[w]"+&r"(w),[w1]"+&r"(w1),[w2]"+&r"(w2),[w3]"+&r"(w3),[blocks]"+&r"(blocks)
  :[c]"r"(c):"t0","v2","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","memory");
 }
-static bool qk(float*dst,const _Float16*packed_q,const _Float16*k,int stride,int rows,int count,void*scratch){
+static bool qk(float*dst,const _Float16*packed_q,const _Float16*packed_k,int stride,int rows,int count,void*scratch){
  auto*pk=static_cast<_Float16*>(scratch);auto*tmp=reinterpret_cast<float*>(pk+64*D);
- if(!pack_k(k,pk,stride,count))return false;
+ std::memcpy(pk,packed_k,64*D*2);
  for(int q=0;q<rows;q+=8)for(int key=0;key<count;key+=32){
   core(packed_q+q*D,pk+key*D,tmp);
   for(int g=0;g<4;++g)for(int r=0;r<8&&q+r<rows;++r)for(int j=0;j<8&&key+g*8+j<count;++j)

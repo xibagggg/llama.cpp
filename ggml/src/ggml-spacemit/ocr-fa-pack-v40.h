@@ -32,9 +32,11 @@ inline size_t scratch_offset(int threads){
 }
 inline size_t tiles(const ggml_tensor *op){return (size_t(op->src[1]->ne[1])+GGML_FA_TILE_KV-1)/GGML_FA_TILE_KV;}
 inline size_t packed_elements(const ggml_tensor *op){return tiles(op)*16*72*GGML_FA_TILE_KV;}
-inline size_t work_bytes(int threads,const ggml_tensor *op){return scratch_offset(threads)+(float_v_v51()?3:2)*packed_elements(op)*sizeof(_Float16);}
+inline size_t work_bytes(int threads,const ggml_tensor *op){return scratch_offset(threads)+((compute_v51()>=2?3:2)*packed_elements(op)+(compute_v51()==3?tiles(op)*16*32:0))*sizeof(_Float16);}
 inline _Float16 *keys(ggml::spacemit::context &ctx){return reinterpret_cast<_Float16*>(static_cast<char*>(ctx.workspace)+scratch_offset(ctx.nth));}
 inline _Float16 *values(ggml::spacemit::context &ctx,const ggml_tensor *op){return keys(ctx)+packed_elements(op);}
 inline float *values32(ggml::spacemit::context &ctx,const ggml_tensor *op){return reinterpret_cast<float*>(values(ctx,op));}
+
+inline _Float16 *ime_key_tile(ggml::spacemit::context &ctx,const ggml_tensor*op,size_t tile){return keys(ctx)+2*packed_elements(op)+tile*(72*GGML_FA_TILE_KV+32);}
 
 }
