@@ -6,8 +6,8 @@
 #include <cstring>
 namespace ocr_fa_pack_v40 {
 inline int compute_v51(){static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_COMPUTE");return p&&p[0]>='1'&&p[0]<='3'&&!p[1]?p[0]-'0':0;}();return v;}
-inline bool wide_pv_v51(){return compute_v51()&1;}
-inline bool float_v_v51(){return compute_v51()&2;}
+inline bool wide_pv_v51(){return compute_v51()==1;}
+inline bool float_v_v51(){return compute_v51()==2;}
 
 inline int direct_v44(){
     static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_DIRECT");
