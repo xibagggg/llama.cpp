@@ -4,6 +4,7 @@
 #include "ocr-fa-pack-v40.h"
 #include "ocr-down-tcm-v41.h"
 #include "ocr-down-sched-v42.h"
+#include "ocr-down-compact-v43.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1559,7 +1560,8 @@ void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
     for(int task=ctx.ith;task<16*nt;task+=ctx.nth){
         const int head=task/nt,ic=(task%nt)*KV,count=std::min(KV,int(k->ne[1])-ic);
         auto *dk=pk+size_t(task)*D*KV,*dv=pv+size_t(task)*D*KV;
-        std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*2);
+        // Full tiles are overwritten by the transpose/copy; tails still need zero padding.
+        if(!ocr_fa_pack_v40::lazy_init()||count<KV){std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*2);}
         rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
         memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
     }
@@ -1616,6 +1618,11 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
     GGML_ASSERT(k->type == v->type);
     const ggml_type kv_type = k->type;
     const bool packed_kv=ocr_fa_pack_v40::eligible(dst);
+    const bool lazy_init=packed_kv&&ocr_fa_pack_v40::lazy_init();
+    if(lazy_init){
+        static std::atomic<bool> announced{false};
+        if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-lazy-v43: active full overwrite K / bounded active V; tail packing still initialized\n");
+    }
 
     // broadcast factors
     const int64_t rk2 = neq2 / nek2;
@@ -1723,8 +1730,11 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             int       active_kv[Q_TILE_SZ];
             int       max_active_kv = kv_tile;
 
-            rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
-            rvv_zero_f32(V32, KV_TILE_SZ * DV);
+            // Packed K copies the entire padded tile; PV reads only bounded active V rows.
+            if(!lazy_init){
+                rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
+                rvv_zero_f32(V32, KV_TILE_SZ * DV);
+            }
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
@@ -4700,6 +4710,7 @@ static __attribute__((noipa)) void forward_mul_mat_f16_f32_m4_cache(ggml::spacem
 void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     ocr_down_diagnostic_v36::scope capture(ctx, op);
     if (ocr_ime2_fp16_v35::forward(ctx, op)) return;
+    if (ocr_down_compact_v43::forward(ctx, op)) return;
     if (ocr_down_sched_v42::forward(ctx, op)) return;
     if (ocr_down_tcm_v41::forward(ctx, op)) return;
     static const bool m4_cache_enabled = [] {

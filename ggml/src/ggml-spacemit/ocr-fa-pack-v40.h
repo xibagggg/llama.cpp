@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <cstring>
 namespace ocr_fa_pack_v40 {
+inline bool lazy_init(){
+    static const bool value=[] {const char *p=std::getenv("GGML_SPACEMIT_OCR_FA_LAZY_INIT");return p&&std::strcmp(p,"1")==0;}();return value;
+}
 inline bool eligible(const ggml_tensor *op){
     static const bool enabled=[] {const char *v=std::getenv("GGML_SPACEMIT_OCR_FA_PACK");return v&&std::strcmp(v,"1")==0;}();
     if(!enabled||!op||op->op!=GGML_OP_FLASH_ATTN_EXT||!op->src[0]||!op->src[1]||!op->src[2])return false;
