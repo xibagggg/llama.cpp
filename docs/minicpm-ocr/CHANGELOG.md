@@ -61,3 +61,7 @@ Optional exact M4 activation tiles 8/16 with shape/scratch guards and diagnostic
 ## 2026-11-03 — v42 paired down scheduling
 
 Optional 2x2 weight reuse over v41 TCM16 with unchanged per-output arithmetic. Frozen-reference replay across nine sizes including odd tails, seven OCR quality cases, incremental same-binary ABBA and full operator profile. Added bounded timestamp recovery for one interleaved quality-request log, preserving original evidence. New scheduling flag remains unset by default.
+
+## 2026-11-04 — v43 compact down and attention initialization
+
+Optional compact20 paired down with two weight scratch rows; skip only overwritten attention initialization, retaining tail padding and fallback. Exact down replay, poison-scratch attention replay, seven OCR cases, same-binary combined ABBA and full operator diagnostic. Both new switches remain unset by default.
