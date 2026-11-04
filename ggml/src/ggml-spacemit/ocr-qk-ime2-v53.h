@@ -49,8 +49,18 @@ static bool qk(float*dst,const _Float16*packed_q,const _Float16*packed_k,int str
  std::memcpy(pk,packed_k,64*D*2);
  for(int q=0;q<rows;q+=8)for(int key=0;key<count;key+=32){
   core(packed_q+q*D,pk+key*D,tmp);
-  for(int g=0;g<4;++g)for(int r=0;r<8&&q+r<rows;++r)for(int j=0;j<8&&key+g*8+j<count;++j)
-   dst[(q+r)*stride+key+g*8+j]=tmp[g*64+r*8+j]*(1.f/1048576.f);
+  // Each IME2 accumulator is an 8x8 row-major result. Unpack one row
+  // with a 32-lane gather, instead of 256 individual scalar loads/stores.
+  const int columns=std::min(32,count-key);
+  const auto ids=__riscv_vid_v_u32m1(columns);
+  const auto idx=__riscv_vsll_vx_u32m1(__riscv_vadd_vv_u32m1(
+      __riscv_vsll_vx_u32m1(__riscv_vsrl_vx_u32m1(ids,3,columns),6,columns),
+      __riscv_vand_vx_u32m1(ids,7,columns),columns),2,columns);
+  for(int r=0;r<8&&q+r<rows;++r){
+   auto values=__riscv_vluxei32_v_f32m1(tmp+r*8,idx,columns);
+   values=__riscv_vfmul_vf_f32m1(values,1.f/1048576.f,columns);
+   __riscv_vse32_v_f32m1(dst+(q+r)*stride+key,values,columns);
+  }
  }
  return true;
 }
