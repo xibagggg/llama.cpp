@@ -1,0 +1,14 @@
+{
+  "base_commit": "97e5c63240cef58b9751f08868f5cc040bfda6fc",
+  "kind": "standalone replay only",
+  "candidates": {
+    "5": "v47 baseline",
+    "8": "prefetch two weight rows ahead",
+    "9": "prefetch four rows ahead",
+    "10": "prefetch eight rows ahead"
+  },
+  "files": {
+    "bench_down_prefetch_v48.cpp": "9cf8a4f98ff2dcd0b0fe2524b60dab75f602fa5d417125806bb7a77d46d2a7f8",
+    "ocr-down-prefetch-v48.h": "bb1c821b17b3f76a7f20f70050872e1eefdf87d826a792f02588b2d3769d1712"
+  }
+}

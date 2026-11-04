@@ -65,3 +65,7 @@ Optional 2x2 weight reuse over v41 TCM16 with unchanged per-output arithmetic. F
 ## 2026-11-04 — v43 compact down and attention initialization
 
 Optional compact20 paired down with two weight scratch rows; skip only overwritten attention initialization, retaining tail padding and fallback. Exact down replay, poison-scratch attention replay, seven OCR cases, same-binary combined ABBA and full operator diagnostic. Both new switches remain unset by default.
+
+## 2026-11-04 — v44-v47 long campaign
+
+Opt-in aligned down scratch/direct packed V reads and bounded text CONCAT TCM transpose. Measured short/partial-write regressions cause explicit original-path fallback. Wider-query and K-direct negative results retained.5,184 exact formal micro runs, full OCR and four table GT cases, final combined three-case ABBA, full operator profile and deadline-bound mixed-document soak. All new switches remain unset by default; permanent deployment unchanged.

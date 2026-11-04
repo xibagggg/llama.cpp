@@ -15,7 +15,11 @@
     "GGML_SPACEMIT_OCR_DOWN_PHASES": "unset",
     "GGML_SPACEMIT_OCR_DOWN_SCHEDULE": "unset",
     "GGML_SPACEMIT_OCR_DOWN_COMPACT_TILE": "unset",
-    "GGML_SPACEMIT_OCR_FA_LAZY_INIT": "unset"
+    "GGML_SPACEMIT_OCR_FA_LAZY_INIT": "unset",
+    "GGML_SPACEMIT_OCR_DOWN_VECTOR": "unset",
+    "GGML_SPACEMIT_OCR_FA_DIRECT": "unset",
+    "GGML_SPACEMIT_OCR_FA_GROUP": "unset",
+    "GGML_SPACEMIT_OCR_CONCAT_TCM": "unset"
   },
   "model_precision": {
     "text": "Q4_0",
@@ -25,10 +29,10 @@
   "historical_candidate": "runtime-barrier-acquire-v8",
   "eight_worker_drift_resolved": false,
   "experimental_branch": "minicpm-ocr/k3-q4q4",
-  "experimental_tag": "minicpm-ocr-k3-v43-experimental",
-  "tested_experimental_commit": "d08ae561690ebe5d24555b12e47d187bf4b7084c",
+  "experimental_tag": "minicpm-ocr-k3-v47-experimental",
+  "tested_experimental_commit": "97e5c63240cef58b9751f08868f5cc040bfda6fc",
   "candidate_promoted": false,
-  "benchmark_record": "benchmark-results-v43.json",
+  "benchmark_record": "benchmark-results-v47.json",
   "candidate_flags": {
     "GGML_SPACEMIT_F16_M4_CACHE": "1",
     "GGML_SPACEMIT_IME2_FP16_DOWN": "1",
@@ -40,6 +44,16 @@
     "GGML_SPACEMIT_OCR_DOWN_TCM_TILE": "16",
     "GGML_SPACEMIT_OCR_DOWN_SCHEDULE": "paired",
     "GGML_SPACEMIT_OCR_DOWN_COMPACT_TILE": "20",
-    "GGML_SPACEMIT_OCR_FA_LAZY_INIT": "1"
+    "GGML_SPACEMIT_OCR_FA_LAZY_INIT": "1",
+    "GGML_SPACEMIT_OCR_DOWN_VECTOR": "5",
+    "GGML_SPACEMIT_OCR_FA_DIRECT": "2",
+    "GGML_SPACEMIT_OCR_FA_GROUP": "unset",
+    "GGML_SPACEMIT_OCR_CONCAT_TCM": "4"
+  },
+  "campaign_tested_commits": {
+    "v44": "6caaa5ff3cc1a51fc28f8e537eae13c5ae1728c0",
+    "v45": "c4b230a57e3d6a2befd5eba358a3776770052b0e",
+    "v46": "c8defb632f796f0fc9bb167af002295ead8953a2",
+    "v47": "97e5c63240cef58b9751f08868f5cc040bfda6fc"
   }
 }
