@@ -3,7 +3,7 @@
 // 2^10 preserves its FP16 subnormals on IME2; undo scaling in FP32 afterward.
 namespace ocr_qk_ime2_v53 {
 constexpr int D=72;
-constexpr size_t scratch_bytes=64*D*2+64*D*2+256*4;
+constexpr size_t scratch_bytes=64*D*2+64*D*2+512*4;
 static bool scaled_copy(const _Float16*src,_Float16*dst,ptrdiff_t stride){
  const auto h=__riscv_vlse16_v_f16m1(src,stride,8);
  auto f=__riscv_vfwcvt_f_f_v_f32m2(h,8);
@@ -44,11 +44,60 @@ __attribute__((noinline)) static void core(const _Float16*x,const _Float16*w,flo
  :[x]"+&r"(x),[w]"+&r"(w),[w1]"+&r"(w1),[w2]"+&r"(w2),[w3]"+&r"(w3),[blocks]"+&r"(blocks)
  :[c]"r"(c):"t0","v2","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","memory");
 }
+// Two query panels reuse the four K panels in each K8 iteration.
+__attribute__((noinline)) static void core16(const _Float16*x,const _Float16*w,float*c){
+ const _Float16*x1=x+8*D,*w1=w+8*D,*w2=w+16*D,*w3=w+24*D;int blocks=D/8;
+ asm volatile(
+ "vsetvli t0,zero,e32,m2,ta,ma\n\t"
+ "vmv.v.i v16,0\n\t"
+ "vmv.v.i v18,0\n\t"
+ "vmv.v.i v20,0\n\t"
+ "vmv.v.i v22,0\n\t"
+ "vmv.v.i v24,0\n\t"
+ "vmv.v.i v26,0\n\t"
+ "vmv.v.i v28,0\n\t"
+ "vmv.v.i v30,0\n\t"
+ "vsetvli t0,zero,e16,m1,ta,ma\n\t1:\n\t"
+ "vle16.v v2,(%[x])\n\t"
+ "vle16.v v3,(%[x1])\n\t"
+ "vle16.v v8,(%[w])\n\t"
+ "vle16.v v9,(%[w1])\n\t"
+ "vle16.v v10,(%[w2])\n\t"
+ "vle16.v v11,(%[w3])\n\t"
+ "smt.vfwmadot v16,v2,v8\n\t"
+ "smt.vfwmadot v18,v2,v9\n\t"
+ "smt.vfwmadot v20,v2,v10\n\t"
+ "smt.vfwmadot v22,v2,v11\n\t"
+ "smt.vfwmadot v24,v3,v8\n\t"
+ "smt.vfwmadot v26,v3,v9\n\t"
+ "smt.vfwmadot v28,v3,v10\n\t"
+ "smt.vfwmadot v30,v3,v11\n\t"
+ "addi %[x],%[x],128\n\t"
+ "addi %[x1],%[x1],128\n\t"
+ "addi %[w],%[w],128\n\t"
+ "addi %[w1],%[w1],128\n\t"
+ "addi %[w2],%[w2],128\n\t"
+ "addi %[w3],%[w3],128\n\t"
+ "addi %[blocks],%[blocks],-1\n\tbnez %[blocks],1b\n\t"
+ "vsetvli t0,zero,e32,m2,ta,ma\n\t"
+ "addi t0,%[c],0\n\tvse32.v v16,(t0)\n\t"
+ "addi t0,%[c],256\n\tvse32.v v18,(t0)\n\t"
+ "addi t0,%[c],512\n\tvse32.v v20,(t0)\n\t"
+ "addi t0,%[c],768\n\tvse32.v v22,(t0)\n\t"
+ "addi t0,%[c],1024\n\tvse32.v v24,(t0)\n\t"
+ "addi t0,%[c],1280\n\tvse32.v v26,(t0)\n\t"
+ "addi t0,%[c],1536\n\tvse32.v v28,(t0)\n\t"
+ "addi t0,%[c],1792\n\tvse32.v v30,(t0)\n\t"
+ :[x]"+&r"(x),[x1]"+&r"(x1),[w]"+&r"(w),[w1]"+&r"(w1),[w2]"+&r"(w2),[w3]"+&r"(w3),[blocks]"+&r"(blocks)
+ :[c]"r"(c):"t0","v2","v3","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory");
+}
 static bool qk(float*dst,const _Float16*packed_q,const _Float16*packed_k,int stride,int rows,int count,void*scratch){
  auto*pk=static_cast<_Float16*>(scratch);auto*tmp=reinterpret_cast<float*>(pk+64*D);
  std::memcpy(pk,packed_k,64*D*2);
- for(int q=0;q<rows;q+=8)for(int key=0;key<count;key+=32){
-  core(packed_q+q*D,pk+key*D,tmp);
+ for(int q=0;q<rows;q+=16)for(int key=0;key<count;key+=32){
+  const int qr=std::min(16,rows-q);
+  if(qr>8)core16(packed_q+q*D,pk+key*D,tmp);
+  else core(packed_q+q*D,pk+key*D,tmp);
   // Each IME2 accumulator is an 8x8 row-major result. Unpack one row
   // with a 32-lane gather, instead of 256 individual scalar loads/stores.
   const int columns=std::min(32,count-key);
@@ -56,8 +105,8 @@ static bool qk(float*dst,const _Float16*packed_q,const _Float16*packed_k,int str
   const auto idx=__riscv_vsll_vx_u32m1(__riscv_vadd_vv_u32m1(
       __riscv_vsll_vx_u32m1(__riscv_vsrl_vx_u32m1(ids,3,columns),6,columns),
       __riscv_vand_vx_u32m1(ids,7,columns),columns),2,columns);
-  for(int r=0;r<8&&q+r<rows;++r){
-   auto values=__riscv_vluxei32_v_f32m1(tmp+r*8,idx,columns);
+  for(int r=0;r<qr;++r){
+   auto values=__riscv_vluxei32_v_f32m1(tmp+(r/8)*256+(r%8)*8,idx,columns);
    values=__riscv_vfmul_vf_f32m1(values,1.f/1048576.f,columns);
    __riscv_vse32_v_f32m1(dst+(q+r)*stride+key,values,columns);
   }

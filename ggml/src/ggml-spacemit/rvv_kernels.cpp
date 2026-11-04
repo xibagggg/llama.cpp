@@ -27,7 +27,6 @@
 #    include <riscv_vector.h>
 #    include "ocr-fa-x8-v39.h"
 #    include "ocr-qk-ime2-v53.h"
-#    include "ocr-pv-pipeline-v60.h"
 #    include "ocr-fa-group-v45.h"
 #endif
 
@@ -1944,9 +1943,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                         }else{
                             int group_active=0;for(int i=0;i<8;++i)group_active=std::max(group_active,active_kv[tq+i]);
                             for(int i=0;i<8;++i)std::fill(KQ+(tq+i)*KV_TILE_SZ+active_kv[tq+i],KQ+(tq+i)*KV_TILE_SZ+group_active,0.0f);
-                            if(packed_kv&&ocr_fa_pack_v40::pipeline_pv()&&group_active>=24)
-                                pv_u4(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
-                            else ocr_pv_f16_x8(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
+                            ocr_pv_f16_x8(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
                         }
                     }
                 }
