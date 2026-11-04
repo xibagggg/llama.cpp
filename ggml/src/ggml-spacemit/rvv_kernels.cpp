@@ -2,6 +2,7 @@
 #include "ocr-ime2-fp16-v35.h"
 #include "ocr-down-diagnostic-v36.h"
 #include "ocr-fa-pack-v40.h"
+#include "ocr-fa-phases-v50.h"
 #include "ocr-down-tcm-v41.h"
 #include "ocr-down-sched-v42.h"
 #include "ocr-down-compact-v43.h"
@@ -1554,9 +1555,12 @@ void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(ggml::spacemit::co
     }
 }
 
-void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
+template<bool PROFILE>
+static void prepare_ocr_fa_kv_v50_impl(ggml::spacemit::context &ctx,ggml_tensor *op){
     if(!ocr_fa_pack_v40::eligible(op))return;
     GGML_ASSERT(ctx.workspace&&ctx.workspace_size>=ocr_fa_pack_v40::work_bytes(ctx.nth,op));
+    ocr_fa_phases_v50::record phase(ctx,op,"prepare");
+    if constexpr(PROFILE)phase.begin();
     constexpr int D=72,KV=GGML_FA_TILE_KV;
     const auto *k=op->src[1],*v=op->src[2];const int nt=int(ocr_fa_pack_v40::tiles(op));
     auto *pk=ocr_fa_pack_v40::keys(ctx),*pv=ocr_fa_pack_v40::values(ctx,op);
@@ -1568,15 +1572,25 @@ void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
         rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
         memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
     }
+    if constexpr(PROFILE)phase.tick(0); // shared K/V pack and tail initialization
     GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+    if constexpr(PROFILE){phase.tick(1);phase.finish();}
     static std::atomic<bool> announced{false};
     if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-pack-v40: active N=%lld workspace=%zu transient per attention call\n",(long long)k->ne[1],ocr_fa_pack_v40::work_bytes(ctx.nth,op));
 }
 
-void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ctx,
+void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
+    if(ocr_fa_phases_v50::enabled()&&ocr_fa_pack_v40::eligible(op))prepare_ocr_fa_kv_v50_impl<true>(ctx,op);
+    else prepare_ocr_fa_kv_v50_impl<false>(ctx,op);
+}
+
+template<bool PROFILE>
+static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
                                                     int                       ir1) {
+    ocr_fa_phases_v50::record phase(ctx,dst,"compute");
+    if constexpr(PROFILE)phase.begin();
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1732,6 +1746,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             memcpy2d(Q_f32, DK * sizeof(float), pq, nbq1, tile_rows, DK * sizeof(float));
         }
 
+        if constexpr(PROFILE)phase.tick(2); // query packing / output initialization
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
             int       active_kv[Q_TILE_SZ];
@@ -1762,12 +1777,14 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 }
 
                 if (max_active_kv == 0) {
+                    if constexpr(PROFILE)phase.tick(3);
                     continue;
                 }
             } else {
                 std::fill_n(active_kv, tile_rows, kv_tile);
             }
 
+            if constexpr(PROFILE)phase.tick(3); // mask preparation / tile bookkeeping
             if (kv_type == GGML_TYPE_F16) {
                 if(packed_kv){
                     const size_t tile=size_t(ik2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
@@ -1778,6 +1795,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                                             max_active_kv,
                                             DK);
 
+                if constexpr(PROFILE)phase.tick(4); // K copy or direct pointer
                 int tq = 0;
                 if(ocr_fa_x8_enabled()&&DK==72&&DV==72){
                     static std::atomic<bool> announced{false};
@@ -1830,6 +1848,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 }
             }
 
+            if constexpr(PROFILE)phase.tick(5); // QK dot products
             bool skip[Q_TILE_SZ] = {};
 
             for (int tq = 0; tq < tile_rows; tq++) {
@@ -1868,6 +1887,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 S[tq] += rvv_softmax_exp_inplace_f32(kq_row, row_active, Mnew);
             }
 
+            if constexpr(PROFILE)phase.tick(6); // max, exp, sum and online output rescale
             // Pack V as contiguous [KV_TILE_SZ][DV].
             if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
@@ -1877,6 +1897,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                     else std::memcpy(V_f16,ocr_fa_pack_v40::values(ctx,dst)+tile*DV*KV_TILE_SZ,max_active_kv*DV*sizeof(_Float16));
                 }else memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
 
+                if constexpr(PROFILE)phase.tick(7); // V copy or direct pointer
                 int tq = 0;
                 if(ocr_fa_x8_enabled()&&DK==72&&DV==72){
                     if(packed_kv&&ocr_fa_group_v45::pv_group()>8){
@@ -1942,8 +1963,10 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                     }
                 }
             }
+            if constexpr(PROFILE)phase.tick(8); // PV accumulations
         }
 
+        if constexpr(PROFILE)phase.tick(9); // final KV tile PV / loop bookkeeping
         // sinks (apply only to valid rows in the tile)
         if (sinks) {
             const float s = ((float *) ((char *) sinks->data))[h];
@@ -1973,7 +1996,14 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
         rvv_pack_scaled_f32_as_f32(dst_ptr, nb1 * ne1, VKQ32, DV * sizeof(float), tile_rows, DV, S);
 
         ir += tile_rows;
+        if constexpr(PROFILE)phase.tick(9); // output normalization / store
     }
+    if constexpr(PROFILE)phase.finish();
+}
+
+void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context &ctx,ggml_tensor *dst,int ir0,int ir1){
+    if(ocr_fa_phases_v50::enabled()&&ocr_fa_pack_v40::eligible(dst))forward_flash_attn_v50_impl<true>(ctx,dst,ir0,ir1);
+    else forward_flash_attn_v50_impl<false>(ctx,dst,ir0,ir1);
 }
 
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {

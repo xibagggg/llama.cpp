@@ -701,6 +701,20 @@ ggml_tensor * clip_graph::build_ffn(
     }
 
     if (down) {
+        // Dedicated MiniCPM-OCR candidate: pad both operands from K4304 to
+        // K4352. The standard Q4_0/IME2 K256 kernel can then process all groups.
+        // Do this after GELU; padding an earlier biased activation is unsafe.
+        if (model.proj_type == PROJECTOR_TYPE_MINICPM_OCR_1_0 &&
+            hparams.n_ff == 4304 && down->ne[0] == 4352 && cur->ne[0] == 4304) {
+            const char *enable = std::getenv("MTMD_OCR_PADDED_DOWN");
+            if (!enable || std::strcmp(enable, "1") != 0) {
+                throw std::runtime_error("Padded OCR down model requires MTMD_OCR_PADDED_DOWN=1");
+            }
+            GGML_ASSERT(down->ne[1] == 1152 &&
+                        (down->type == GGML_TYPE_Q4_0 || down->type == GGML_TYPE_F16));
+            cur = ggml_pad(ctx0, cur, 48, 0, 0, 0);
+            cb(cur, "ffn_down_pad48", il);
+        }
         cur = build_mm(down, cur);
     }
 
