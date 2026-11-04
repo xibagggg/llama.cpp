@@ -26,6 +26,8 @@
 
 #include "ime.h"
 #include "repack.h"
+#include "ocr-fa-phases-v50.h"
+#include "ocr-fa-pack-v40.h"
 #include "spacemit-env.h"
 #include "spine_mem_pool.h"
 #include "rvv_kernels.h"
@@ -653,7 +655,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 // Every core must finish the current node before any core starts
                 // the next one. A bounded pointer look-ahead is not sufficient:
                 // dependencies can be farther away or hidden behind aliases/views.
-                ctx.sync();
+                if(ocr_fa_phases_v50::enabled()&&ocr_fa_pack_v40::eligible(op)){
+                    ocr_fa_phases_v50::record phase(ctx,op,"final_sync");phase.begin();
+                    GGML_ASSERT(ctx.sync()==spert::Status::Ok);phase.tick(10);phase.finish();
+                }else ctx.sync();
             }
 
             ctx.clear();
