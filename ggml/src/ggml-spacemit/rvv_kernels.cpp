@@ -6,6 +6,7 @@
 #include "ocr-down-sched-v42.h"
 #include "ocr-down-compact-v43.h"
 #include "ocr-down-vector-v44.h"
+#include "ocr-concat-tcm-v46.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -5405,6 +5406,8 @@ bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tens
         ne12 != ne2 || ne03 != ne3 || ne13 != ne3) {
         return false;
     }
+
+    if(ocr_concat_tcm_v46::forward(ctx,op,col0))return true;
 
     const int64_t dc = (ne1 + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
     const int64_t c0 = dc * (int64_t) ctx.ith;
