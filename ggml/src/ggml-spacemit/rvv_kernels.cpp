@@ -1566,11 +1566,13 @@ static void prepare_ocr_fa_kv_v50_impl(ggml::spacemit::context &ctx,ggml_tensor 
     auto *pk=ocr_fa_pack_v40::keys(ctx),*pv=ocr_fa_pack_v40::values(ctx,op);
     for(int task=ctx.ith;task<16*nt;task+=ctx.nth){
         const int head=task/nt,ic=(task%nt)*KV,count=std::min(KV,int(k->ne[1])-ic);
-        auto *dk=pk+size_t(task)*D*KV,*dv=pv+size_t(task)*D*KV;
-        // Full tiles are overwritten by the transpose/copy; tails still need zero padding.
-        if(!ocr_fa_pack_v40::lazy_init()||count<KV){std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*2);}
+        auto *dk=pk+size_t(task)*D*KV;
+        const bool f32=ocr_fa_pack_v40::float_v_v51();
+        void *dv=f32?(void*)(ocr_fa_pack_v40::values32(ctx,op)+size_t(task)*D*KV):(void*)(pv+size_t(task)*D*KV);
+        if(!ocr_fa_pack_v40::lazy_init()||count<KV){std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*(f32?4:2));}
         rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
-        memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
+        if(f32)rvv_pack_scaled_f16_as_f32((float*)dv,D*4,(const ggml_fp16_t*)((const char*)v->data+ic*v->nb[1]+head*v->nb[2]),v->nb[1],count,D,1.0f);
+        else memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
     }
     if constexpr(PROFILE)phase.tick(0); // shared K/V pack and tail initialization
     GGML_ASSERT(ctx.sync()==spert::Status::Ok);
@@ -1889,7 +1891,22 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
             if constexpr(PROFILE)phase.tick(6); // max, exp, sum and online output rescale
             // Pack V as contiguous [KV_TILE_SZ][DV].
-            if (kv_type == GGML_TYPE_F16) {
+            if(packed_kv&&ocr_fa_pack_v40::float_v_v51()){
+                const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
+                const float *vv=ocr_fa_pack_v40::values32(ctx,dst)+tile*DV*KV_TILE_SZ;
+                if constexpr(PROFILE)phase.tick(7);
+                int tq=0;
+                for(;tq+7<tile_rows;tq+=8){
+                    bool any_skip=false;for(int i=0;i<8;++i)any_skip|=skip[tq+i];
+                    if(any_skip){for(int i=0;i<8;++i)if(!skip[tq+i])rvv_pv_accumulate(VKQ32+(tq+i)*DV,KQ+(tq+i)*KV_TILE_SZ,vv,active_kv[tq+i],DV);}
+                    else{
+                        int active=0;for(int i=0;i<8;++i)active=std::max(active,active_kv[tq+i]);
+                        for(int i=0;i<8;++i)std::fill(KQ+(tq+i)*KV_TILE_SZ+active_kv[tq+i],KQ+(tq+i)*KV_TILE_SZ+active,0.f);
+                        ocr_pv_f32_x8_v51(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,vv,DV,KV_TILE_SZ,active);
+                    }
+                }
+                for(;tq<tile_rows;++tq)if(!skip[tq])rvv_pv_accumulate(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,vv,active_kv[tq],DV);
+            }else if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
                 if(packed_kv){
                     const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
@@ -1922,7 +1939,10 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                         }else{
                             int group_active=0;for(int i=0;i<8;++i)group_active=std::max(group_active,active_kv[tq+i]);
                             for(int i=0;i<8;++i)std::fill(KQ+(tq+i)*KV_TILE_SZ+active_kv[tq+i],KQ+(tq+i)*KV_TILE_SZ+group_active,0.0f);
-                            ocr_pv_f16_x8(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
+                            if(packed_kv&&ocr_fa_pack_v40::wide_pv_v51()){
+                                ocr_pv_f16_x4_wide_v51(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
+                                ocr_pv_f16_x4_wide_v51(VKQ32+(tq+4)*DV,KQ+(tq+4)*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
+                            }else ocr_pv_f16_x8(VKQ32+tq*DV,KQ+tq*KV_TILE_SZ,V_f16,DV,KV_TILE_SZ,group_active);
                         }
                     }
                 }
