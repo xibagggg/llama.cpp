@@ -23,12 +23,29 @@ and `MTMD_OCR_PADDED_DOWN=1`. Text output/embedding can remain Q6_K;
 activations, softmax and accumulations retain their required precision.
 Quantization labels do not imply every operation runs in INT4.
 
-Latest bounded experiment: [v50 results](RESULTS-v50-20261104.md). Formal
-same-binary ABBA reduced vision time by about 24%, with one observed missing
-bullet in ten OCR cases. v55 attention experiments were slower and showed
-unresolved full-model feature differences even in mode 0; use the immutable
-v50 tag for the measured speed candidate. Neither version replaces the board
-service or establishes a fix for historical feature drift.
+Latest bounded experiment: [v61 results](RESULTS-v61-20261104.md).
+On the v50 padded Q4-down model, opt-in IME2 QK now vectorizes output reorder
+and reuses K panels across sixteen queries. The complete N1008 attention
+microbenchmark is about 7.1% faster; use the formal ABBA table for actual OCR
+latency. Ten selected OCR outputs/tokens match v50, but saved last-slice
+features differ by up to 6.15% relative L2. This is not a confidence or general
+accuracy equivalence result. v50's previously observed missing bullet remains.
+
+Strict repeated-feature acceptance failed: repeated saved last-slice features
+vary in both compute0 and compute3. OCR text/tokens still match. These timing
+observations are not an accepted/promoted speed candidate. The original strict
+audit is retained and still fails; its descriptive successor records false.
+
+The compute switch defaults to 0; explicitly set
+`GGML_SPACEMIT_OCR_FA_COMPUTE=3` alongside the v50 configuration to reproduce.
+The candidate only selects eligible unmasked large D72 attention. Masked,
+small and unsupported/numerically unsafe inputs retain the original path.
+The v58/v60 PV unroll was rejected after complete-attention measurement.
+Neither version replaces the board service or establishes a fix for the
+historical eight-worker feature drift. This campaign also observed feature
+variation with seven workers; a common cause is not established.
+[v50 results](RESULTS-v50-20261104.md)
+remain available as the preceding baseline.
 
 ## Reproducible build
 

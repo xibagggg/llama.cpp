@@ -32,10 +32,10 @@
   "historical_candidate": "runtime-barrier-acquire-v8",
   "eight_worker_drift_resolved": false,
   "experimental_branch": "minicpm-ocr/k3-q4q4",
-  "experimental_tag": "minicpm-ocr-k3-v50-experimental",
-  "tested_experimental_commit": "54afbdeaa7709cacdf061171bc107d7bd1257347",
+  "experimental_tag": "minicpm-ocr-k3-v61-experimental",
+  "tested_experimental_commit": "67de3f567ddef0deea4d37591d8656c0e6cb6c7c",
   "candidate_promoted": false,
-  "benchmark_record": "benchmark-results-v50.json",
+  "benchmark_record": "benchmark-results-v61.json",
   "candidate_flags": {
     "GGML_SPACEMIT_F16_M4_CACHE": "1",
     "GGML_SPACEMIT_IME2_FP16_DOWN": "1",
@@ -53,7 +53,7 @@
     "GGML_SPACEMIT_OCR_FA_GROUP": "unset",
     "GGML_SPACEMIT_OCR_CONCAT_TCM": "4",
     "MTMD_OCR_PADDED_DOWN": "1",
-    "GGML_SPACEMIT_OCR_FA_COMPUTE": "unset"
+    "GGML_SPACEMIT_OCR_FA_COMPUTE": "3"
   },
   "campaign_tested_commits": {
     "v44": "6caaa5ff3cc1a51fc28f8e537eae13c5ae1728c0",
@@ -61,7 +61,11 @@
     "v46": "c8defb632f796f0fc9bb167af002295ead8953a2",
     "v47": "97e5c63240cef58b9751f08868f5cc040bfda6fc",
     "v50": "54afbdeaa7709cacdf061171bc107d7bd1257347",
-    "v55": "72c2c9bb79ec34d2bdadd65e2d9d6075c76adcd6"
+    "v55": "72c2c9bb79ec34d2bdadd65e2d9d6075c76adcd6",
+    "v57": "770891f65d73e0aafaa9d5eb1c56403edb5c67a5",
+    "v59": "03fe87e4255898c45d8aec3e3fed3ec95154a2c8",
+    "v60": "78181f62e4f139b88e330506945d61d793d7ae99",
+    "v61": "67de3f567ddef0deea4d37591d8656c0e6cb6c7c"
   },
   "failed_attention_experiment": {
     "commit": "72c2c9bb79ec34d2bdadd65e2d9d6075c76adcd6",
@@ -69,5 +73,11 @@
     "adopted": false,
     "reason": "Slower in complete attention microbenchmarks; unresolved full-model embedding variation even with compute mode0."
   },
-  "candidate_quality_note": "9/10 exact output/token matches; one real missing end-of-heading bullet. Four table GT cases pass."
+  "candidate_quality_note": "Strict feature-repeat acceptance FAILED in both compute0 and compute3. All 24 ABBA text/tokens and ten quality outputs match v50; last features differ. v50 missing bullet remains. No promotion or general quality/confidence equivalence.",
+  "feature_repeat_acceptance_passed": false,
+  "rejected_pv_unroll": {
+    "commit": "78181f62e4f139b88e330506945d61d793d7ae99",
+    "adopted": false,
+    "reason": "Isolated TCM PV speedup did not survive combination with QK in complete attention."
+  }
 }

@@ -85,3 +85,23 @@ slower and remain disabled. v55 mode0 also has unresolved full-model feature
 variation, despite matching text/tokens in the checked table. v50 is the
 immutable measured speed candidate; v55 is a diagnostic/failed experiment.
 See RESULTS-v50-20261104.md and benchmark-results-v50.json.
+
+## 2026-11-04 — v61 guarded IME2 QK on padded Q4 down
+
+Vectorized QK output reorder and shared K packing; sixteen queries reuse the
+same K panel loads. N1008 unmasked complete attention: 43.2564 to 40.1910 ms.
+Shape/mask/numerical guards retain the original RVV path when ineligible.
+Restored the v50 default attention/PV implementation; formal mode0 outputs
+and tokens match frozen v50, but repeated saved features are NOT bitwise
+stable in either compute0 or compute3. Strict acceptance failed and the
+candidate remains unpromoted. The original strict audit and failure evidence
+are retained. The rejected v60 PV unroll
+is not in the selected hot path. The earlier v55 feature issue is not claimed
+to have been diagnosed.
+
+Three-case same-binary OFF/ON/ON/OFF, n=2 per state/case, plus ten-document
+quality and 54 boundary runs. All ten OCR outputs/tokens match v50, but last
+saved feature relative L2 reaches 6.15%; the existing v50 bullet omission
+remains. No production promotion or general Q4/Q8 confidence claim.
+See RESULTS-v61-20261104.md and benchmark-results-v61.json for measured
+end-to-end gains, limits and reproduction identity.
