@@ -69,3 +69,19 @@ Optional compact20 paired down with two weight scratch rows; skip only overwritt
 ## 2026-11-04 — v44-v47 long campaign
 
 Opt-in aligned down scratch/direct packed V reads and bounded text CONCAT TCM transpose. Measured short/partial-write regressions cause explicit original-path fallback. Wider-query and K-direct negative results retained.5,184 exact formal micro runs, full OCR and four table GT cases, final combined three-case ABBA, full operator profile and deadline-bound mixed-document soak. All new switches remain unset by default; permanent deployment unchanged.
+
+## 2026-11-04 — v50 padded Q4 down, v51–v55 attention diagnostics
+
+Opt-in MiniCPM-OCR graph padding after GELU and standard ggml Q4_0 conversion
+for all 27 K4304 down matrices, using K4352 and the existing K256 IME2 kernel.
+Three-case same-binary ABBA: 23.96–24.43% less vision time and 13.25–17.78%
+less HTTP latency. Nine of ten OCR outputs/tokens match; one heading bullet
+is omitted. Four table GT cases pass structure, 70/70 text and 34/34 numbers.
+No production promotion or general Q4/Q8 confidence equivalence claim.
+
+Added opt-in worker phase diagnostics, including the existing final barrier.
+Wide-PV, pre-widened-V and normalized/shared-packed IME2 QK experiments are
+slower and remain disabled. v55 mode0 also has unresolved full-model feature
+variation, despite matching text/tokens in the checked table. v50 is the
+immutable measured speed candidate; v55 is a diagnostic/failed experiment.
+See RESULTS-v50-20261104.md and benchmark-results-v50.json.

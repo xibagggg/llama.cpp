@@ -19,20 +19,23 @@
     "GGML_SPACEMIT_OCR_DOWN_VECTOR": "unset",
     "GGML_SPACEMIT_OCR_FA_DIRECT": "unset",
     "GGML_SPACEMIT_OCR_FA_GROUP": "unset",
-    "GGML_SPACEMIT_OCR_CONCAT_TCM": "unset"
+    "GGML_SPACEMIT_OCR_CONCAT_TCM": "unset",
+    "MTMD_OCR_PADDED_DOWN": "unset",
+    "GGML_SPACEMIT_OCR_FA_PHASES": "unset",
+    "GGML_SPACEMIT_OCR_FA_COMPUTE": "unset"
   },
   "model_precision": {
     "text": "Q4_0",
     "vision": "Q4_0",
-    "vision_ffn_down": "F16"
+    "vision_ffn_down": "Q4_0 K4352 in v50 opt-in model; F16 in original model"
   },
   "historical_candidate": "runtime-barrier-acquire-v8",
   "eight_worker_drift_resolved": false,
   "experimental_branch": "minicpm-ocr/k3-q4q4",
-  "experimental_tag": "minicpm-ocr-k3-v47-experimental",
-  "tested_experimental_commit": "97e5c63240cef58b9751f08868f5cc040bfda6fc",
+  "experimental_tag": "minicpm-ocr-k3-v50-experimental",
+  "tested_experimental_commit": "54afbdeaa7709cacdf061171bc107d7bd1257347",
   "candidate_promoted": false,
-  "benchmark_record": "benchmark-results-v47.json",
+  "benchmark_record": "benchmark-results-v50.json",
   "candidate_flags": {
     "GGML_SPACEMIT_F16_M4_CACHE": "1",
     "GGML_SPACEMIT_IME2_FP16_DOWN": "1",
@@ -48,12 +51,23 @@
     "GGML_SPACEMIT_OCR_DOWN_VECTOR": "5",
     "GGML_SPACEMIT_OCR_FA_DIRECT": "2",
     "GGML_SPACEMIT_OCR_FA_GROUP": "unset",
-    "GGML_SPACEMIT_OCR_CONCAT_TCM": "4"
+    "GGML_SPACEMIT_OCR_CONCAT_TCM": "4",
+    "MTMD_OCR_PADDED_DOWN": "1",
+    "GGML_SPACEMIT_OCR_FA_COMPUTE": "unset"
   },
   "campaign_tested_commits": {
     "v44": "6caaa5ff3cc1a51fc28f8e537eae13c5ae1728c0",
     "v45": "c4b230a57e3d6a2befd5eba358a3776770052b0e",
     "v46": "c8defb632f796f0fc9bb167af002295ead8953a2",
-    "v47": "97e5c63240cef58b9751f08868f5cc040bfda6fc"
-  }
+    "v47": "97e5c63240cef58b9751f08868f5cc040bfda6fc",
+    "v50": "54afbdeaa7709cacdf061171bc107d7bd1257347",
+    "v55": "72c2c9bb79ec34d2bdadd65e2d9d6075c76adcd6"
+  },
+  "failed_attention_experiment": {
+    "commit": "72c2c9bb79ec34d2bdadd65e2d9d6075c76adcd6",
+    "tag": "minicpm-ocr-k3-v55-experimental",
+    "adopted": false,
+    "reason": "Slower in complete attention microbenchmarks; unresolved full-model embedding variation even with compute mode0."
+  },
+  "candidate_quality_note": "9/10 exact output/token matches; one real missing end-of-heading bullet. Four table GT cases pass."
 }

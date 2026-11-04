@@ -16,9 +16,19 @@ not part of this repository.
   historical intermittent eight-worker vision-feature drift.
 - Existing diagnostics stay behind their compile-time or environment guards.
 
-`Q4/Q4` means text-GGUF Q4_0 and vision-GGUF Q4_0. The vision FFN-down
-matrices remain F16 and text output/embedding can remain Q6_K. Quantization
-labels do not imply every operation runs in INT4.
+`Q4/Q4` means text-GGUF Q4_0 and vision-GGUF Q4_0. Original vision
+FFN-down matrices remain F16; the opt-in v50 model pads K4304 to K4352 and
+quantizes all 27 down matrices to Q4_0. It requires the matching graph adapter
+and `MTMD_OCR_PADDED_DOWN=1`. Text output/embedding can remain Q6_K;
+activations, softmax and accumulations retain their required precision.
+Quantization labels do not imply every operation runs in INT4.
+
+Latest bounded experiment: [v50 results](RESULTS-v50-20261104.md). Formal
+same-binary ABBA reduced vision time by about 24%, with one observed missing
+bullet in ten OCR cases. v55 attention experiments were slower and showed
+unresolved full-model feature differences even in mode 0; use the immutable
+v50 tag for the measured speed candidate. Neither version replaces the board
+service or establishes a fix for historical feature drift.
 
 ## Reproducible build
 
