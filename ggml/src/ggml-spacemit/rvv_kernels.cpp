@@ -1749,11 +1749,11 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
             memcpy2d(Q_f32, DK * sizeof(float), pq, nbq1, tile_rows, DK * sizeof(float));
         }
 
-        const bool qk_ime=packed_kv&&ocr_fa_pack_v40::compute_v51()==3&&ctx.shared.data&&
+        bool qk_ime=packed_kv&&ocr_fa_pack_v40::compute_v51()==3&&ctx.shared.data&&
             ctx.shared.size>=base_size+ocr_qk_ime2_v53::scratch_bytes;
         auto *qpacked=reinterpret_cast<_Float16*>(reinterpret_cast<char*>(base)+base_size);
         auto *qk_scratch=qpacked+64*72;
-        if(qk_ime)ocr_qk_ime2_v53::pack_q(Q_f16,qpacked,tile_rows);
+        if(qk_ime)qk_ime=ocr_qk_ime2_v53::pack_q(Q_f16,qpacked,tile_rows);
         if constexpr(PROFILE)phase.tick(2); // query packing / output initialization
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
@@ -1805,11 +1805,8 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
                 if constexpr(PROFILE)phase.tick(4); // K copy or direct pointer
                 int tq = 0;
-                if(qk_ime){
-                    ocr_qk_ime2_v53::qk(KQ,qpacked,K_f16,KV_TILE_SZ,tile_rows,max_active_kv,qk_scratch);
-                    tq=tile_rows;
-                }
-                if(!qk_ime&&ocr_fa_x8_enabled()&&DK==72&&DV==72){
+                if(qk_ime&&ocr_qk_ime2_v53::qk(KQ,qpacked,K_f16,KV_TILE_SZ,tile_rows,max_active_kv,qk_scratch))tq=tile_rows;
+                if(tq==0&&ocr_fa_x8_enabled()&&DK==72&&DV==72){
                     static std::atomic<bool> announced{false};
                     if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-x8-v39: active D72 eight-query K/V reuse mask=%d\n",int(mask!=nullptr));
                     if(packed_kv&&ocr_fa_group_v45::mode()){

@@ -4,17 +4,20 @@
 namespace ocr_qk_ime2_v53 {
 constexpr int D=72;
 constexpr size_t scratch_bytes=64*D*2+64*D*2+256*4;
-static void pack_q(const _Float16*q,_Float16*p,int rows){
+static bool pack_q(const _Float16*q,_Float16*p,int rows){
  for(int g=0;g<(rows+7)/8;++g)for(int d=0;d<D;d+=8)for(int r=0;r<8;++r){
   auto*dst=p+g*8*D+d*8+r*8;
-  if(g*8+r<rows)std::memcpy(dst,q+(g*8+r)*D+d,16);else std::memset(dst,0,16);
+  if(g*8+r<rows){for(int j=0;j<8;++j){const float a=float(q[(g*8+r)*D+d+j]);if(!std::isfinite(a)||std::fabs(a)>63.f)return false;dst[j]=(_Float16)(a*1024.f);}}
+  else std::memset(dst,0,16);
  }
+ return true;
 }
-static void pack_k(const _Float16*k,_Float16*p,int stride,int count){
+static bool pack_k(const _Float16*k,_Float16*p,int stride,int count){
  for(int g=0;g<8;++g)for(int d=0;d<D;d+=8)for(int r=0;r<8;++r){
   const size_t offset=g*8*D+d*8+r*8;
-  for(int j=0;j<8;++j)p[offset+j]=g*8+r<count?(_Float16)(float(k[(d+j)*stride+g*8+r])*1024.f):(_Float16)0;
+  for(int j=0;j<8;++j){const float a=g*8+r<count?float(k[(d+j)*stride+g*8+r]):0.f;if(!std::isfinite(a)||std::fabs(a)>63.f)return false;p[offset+j]=(_Float16)(a*1024.f);}
  }
+ return true;
 }
 __attribute__((noinline)) static void core(const _Float16*x,const _Float16*w,float*c){
  const _Float16*w1=w+8*D,*w2=w+16*D,*w3=w+24*D;int blocks=D/8;
@@ -34,13 +37,14 @@ __attribute__((noinline)) static void core(const _Float16*x,const _Float16*w,flo
  :[x]"+&r"(x),[w]"+&r"(w),[w1]"+&r"(w1),[w2]"+&r"(w2),[w3]"+&r"(w3),[blocks]"+&r"(blocks)
  :[c]"r"(c):"t0","v2","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","memory");
 }
-static void qk(float*dst,const _Float16*packed_q,const _Float16*k,int stride,int rows,int count,void*scratch){
+static bool qk(float*dst,const _Float16*packed_q,const _Float16*k,int stride,int rows,int count,void*scratch){
  auto*pk=static_cast<_Float16*>(scratch);auto*tmp=reinterpret_cast<float*>(pk+64*D);
- pack_k(k,pk,stride,count);
+ if(!pack_k(k,pk,stride,count))return false;
  for(int q=0;q<rows;q+=8)for(int key=0;key<count;key+=32){
   core(packed_q+q*D,pk+key*D,tmp);
   for(int g=0;g<4;++g)for(int r=0;r<8&&q+r<rows;++r)for(int j=0;j<8&&key+g*8+j<count;++j)
-   dst[(q+r)*stride+key+g*8+j]=tmp[g*64+r*8+j]*(1.f/1024.f);
+   dst[(q+r)*stride+key+g*8+j]=tmp[g*64+r*8+j]*(1.f/1048576.f);
  }
+ return true;
 }
 }
