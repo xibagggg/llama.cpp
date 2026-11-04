@@ -5,6 +5,7 @@
 #include "ocr-down-tcm-v41.h"
 #include "ocr-down-sched-v42.h"
 #include "ocr-down-compact-v43.h"
+#include "ocr-down-vector-v44.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1619,6 +1620,10 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
     const ggml_type kv_type = k->type;
     const bool packed_kv=ocr_fa_pack_v40::eligible(dst);
     const bool lazy_init=packed_kv&&ocr_fa_pack_v40::lazy_init();
+    const int direct_kv=packed_kv?ocr_fa_pack_v40::direct_v44():0;
+    if(direct_kv){static std::atomic<bool>announced{false};
+        if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-direct-v44: active mode=%d shared DDR packed K/V\n",direct_kv);}
+
     if(lazy_init){
         static std::atomic<bool> announced{false};
         if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-lazy-v43: active full overwrite K / bounded active V; tail packing still initialized\n");
@@ -1764,7 +1769,8 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             if (kv_type == GGML_TYPE_F16) {
                 if(packed_kv){
                     const size_t tile=size_t(ik2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
-                    std::memcpy(K_f16,ocr_fa_pack_v40::keys(ctx)+tile*DK*KV_TILE_SZ,DK*KV_TILE_SZ*sizeof(_Float16));
+                    if(direct_kv&1)K_f16=ocr_fa_pack_v40::keys(ctx)+tile*DK*KV_TILE_SZ;
+                    else std::memcpy(K_f16,ocr_fa_pack_v40::keys(ctx)+tile*DK*KV_TILE_SZ,DK*KV_TILE_SZ*sizeof(_Float16));
                 }else rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
                                             (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1,
                                             max_active_kv,
@@ -1855,7 +1861,8 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
                 if(packed_kv){
                     const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
-                    std::memcpy(V_f16,ocr_fa_pack_v40::values(ctx,dst)+tile*DV*KV_TILE_SZ,max_active_kv*DV*sizeof(_Float16));
+                    if(direct_kv&2)V_f16=ocr_fa_pack_v40::values(ctx,dst)+tile*DV*KV_TILE_SZ;
+                    else std::memcpy(V_f16,ocr_fa_pack_v40::values(ctx,dst)+tile*DV*KV_TILE_SZ,max_active_kv*DV*sizeof(_Float16));
                 }else memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
 
                 int tq = 0;
@@ -4710,6 +4717,7 @@ static __attribute__((noipa)) void forward_mul_mat_f16_f32_m4_cache(ggml::spacem
 void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     ocr_down_diagnostic_v36::scope capture(ctx, op);
     if (ocr_ime2_fp16_v35::forward(ctx, op)) return;
+    if (ocr_down_vector_v44::forward(ctx, op)) return;
     if (ocr_down_compact_v43::forward(ctx, op)) return;
     if (ocr_down_sched_v42::forward(ctx, op)) return;
     if (ocr_down_tcm_v41::forward(ctx, op)) return;

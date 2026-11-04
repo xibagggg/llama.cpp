@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <cstring>
 namespace ocr_fa_pack_v40 {
+inline int direct_v44(){
+    static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_DIRECT");
+        return p&&p[0]>='1'&&p[0]<='3'&&!p[1]?int(p[0]-'0'):0;}();return v;
+}
 inline bool lazy_init(){
     static const bool value=[] {const char *p=std::getenv("GGML_SPACEMIT_OCR_FA_LAZY_INIT");return p&&std::strcmp(p,"1")==0;}();return value;
 }
