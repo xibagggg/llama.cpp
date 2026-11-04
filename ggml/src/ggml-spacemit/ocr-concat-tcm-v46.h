@@ -41,6 +41,9 @@ inline bool forward(ggml::spacemit::context&ctx,ggml_tensor*op,int64_t col0,int 
  const int m=selected<0?mode():selected;
  if(!m||!op||!op->src[0]||!op->src[1]||col0<0||col0>op->ne[0])return false;
  const auto*a=op->src[0],*b=op->src[1];
+ // v47: measured 1-token and trailing-three writes regress with TCM staging.
+ // Keep original handling for partial writes and fewer than four new tokens.
+ if(col0!=0||b->ne[0]<4)return false;
  if(op->type!=GGML_TYPE_F32||a->type!=GGML_TYPE_F32||b->type!=GGML_TYPE_F32||
     ggml_get_op_params_i32(op,0)!=0||op->nb[0]!=4||a->nb[0]!=4||b->nb[1]!=4||b->nb[0]==4||
     op->ne[0]!=a->ne[0]+b->ne[0]||op->nb[1]<size_t(op->ne[0])*4||
