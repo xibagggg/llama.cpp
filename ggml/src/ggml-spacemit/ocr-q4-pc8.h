@@ -11,13 +11,8 @@
 #include <vector>
 #include <riscv_vector.h>
 #include "ocr-pc8-load.h"
+#include "ocr-pc8-options.h"
 namespace ocr_q4_pc8 {
-inline int mode(){static const int m=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_Q4_PC8");return p?std::atoi(p):0;}();return m;}
-inline bool rows8(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_Q4_PC8_M8");return p&&std::strcmp(p,"1")==0;}();return x;}
-inline bool down_rows8(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_Q4_PC8_DOWN_M8");return p&&!std::strcmp(p,"1");}();return x;}
-inline bool multi_n(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_Q4_PC8_MULTI_N");return p&&std::strcmp(p,"1")==0;}();return x;}
-// Prepare each immutable weight panel once, rather than for every M tile.
-inline bool prepack(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_PREPACK");return p&&std::strcmp(p,"1")==0;}();return x;}
 __attribute__((noinline)) static void prepack_panel(int8_t*p,int k){
     int blocks=k/32;
     asm volatile(
@@ -250,10 +245,9 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         size_t size=0;GGML_ASSERT(work_size(ctx.nth,op,size));GGML_ASSERT(ctx.workspace&&ctx.workspace_size>=size&&ctx.shared.data&&ctx.shared.size>=size_t((32+scratch_rows)*K+temp_elements*4+256));
         auto*packed=static_cast<int8_t*>(ctx.workspace);auto*scales=reinterpret_cast<float*>(packed+size_t(MP)*K);
         const auto*x=static_cast<const float*>(input->data);
-        static const bool reuse_enabled=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_REUSE_INPUT");return p&&!std::strcmp(p,"1");}();
+        const bool reuse_enabled=reuse_input();
         const bool reuse=reuse_enabled&&!PAD&&ctx.pc8_packed_source==input;
-        static const bool trace_reuse=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_REUSE_TRACE");return p&&!std::strcmp(p,"1");}();
-        if(reuse&&trace_reuse&&ctx.ith==0)GGML_LOG_INFO("ocr-pc8-reuse: K=%d M=%d\n",K,M);
+        if(reuse&&trace_reuse()&&ctx.ith==0)GGML_LOG_INFO("ocr-pc8-reuse: K=%d M=%d\n",K,M);
         ctx.mark_subphase(100); // activation quantization and packing
         if(!reuse)for(int g=ctx.ith;g<MP/4;g+=ctx.nth)for(int r=0;r<4;++r){
             if(g*4+r>=M){scales[g*4+r]=0;for(int k=0;k<K;k+=32)std::memset(packed+size_t(g)*4*K+k*4+r*32,0,32);continue;}

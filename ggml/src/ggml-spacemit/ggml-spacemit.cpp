@@ -35,6 +35,7 @@
 #include "ggml-profile.h"
 #include "ocr-op-timing.h"
 #include "ocr-op-progress.h"
+#include "ocr-pc8-options.h"
 #include "ocr-fa-phases-v50.h"
 #include "ocr-im2col-pack.h"
 #include "ocr-cast-kv-pack.h"
@@ -977,6 +978,9 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     }
     auto * contexts = sess->contexts.data();
     // Keep first-use option parsing and diagnostic allocation off AI workers.
+    const char * pc8_host_options = std::getenv("GGML_SPACEMIT_PC8_HOST_OPTIONS");
+    if (!pc8_host_options || std::strcmp(pc8_host_options, "0") != 0)
+        ocr_q4_pc8::prepare_options_on_host();
     spacemit_kernels::rvv::prepare_ocr_worker_state();
     (void)ocr_fa_schedule::configured_rows(ggml_fa_tile_config::Q);
     (void)ocr_fa_schedule::separate_barrier_enabled();
