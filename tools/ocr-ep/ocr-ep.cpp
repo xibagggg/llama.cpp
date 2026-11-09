@@ -81,23 +81,29 @@ struct runtime {
             Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(options, "height", height));
             Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(options, "width", width));
         }
-        const std::array<const char *, 6> keys = {
+        const std::array<const char *, 7> keys = {
             "SPERT_BACKEND", "SPACEMIT_EP_INTER_THREAD_NUM", "SPACEMIT_EP_INTRA_THREAD_NUM",
-            "SPACEMIT_EP_ENABLE_DMA", "SPACEMIT_EP_DENSE_ACCURACY_LEVEL", "SPACEMIT_EP_ENABLE_BLOCKLAYOUT"};
+            "SPACEMIT_EP_ENABLE_DMA", "SPACEMIT_EP_DENSE_ACCURACY_LEVEL", "SPACEMIT_EP_ENABLE_BLOCKLAYOUT",
+            "SPACEMIT_EP_DEBUG_PROFILE"};
         const auto threads = std::to_string(integer_setting("OCR_EP_THREADS", 8, 1, 8));
         const auto accuracy = std::to_string(integer_setting("OCR_EP_DENSE_ACCURACY", 0, 0, 2));
-        const auto blocklayout = setting("OCR_EP_BLOCKLAYOUT", "0");
-        const std::array<const char *, 6> values = {"spacemit-k3", "1", threads.c_str(), "0", accuracy.c_str(), blocklayout.c_str()};
-        Ort::ThrowOnError(OrtSessionOptionsSpaceMITEnvInit(options, keys.data(), values.data(), keys.size()));
+        const auto blocklayout = std::to_string(integer_setting("OCR_EP_BLOCKLAYOUT", 0, 0, 1));
+        const auto ep_profile = profile + "-ep-" + kind + "-" + std::to_string(width) + "x" + std::to_string(height);
+        const std::array<const char *, 7> values = {"spacemit-k3", "1", threads.c_str(), "0", accuracy.c_str(),
+                                                  blocklayout.c_str(), ep_profile.c_str()};
+        Ort::ThrowOnError(OrtSessionOptionsSpaceMITEnvInit(options, keys.data(), values.data(), profile.empty() ? 6 : keys.size()));
         auto result = std::make_unique<Ort::Session>(env, path.c_str(), options);
-        std::fprintf(stderr, "OCR_EP_COMPILE kind=%s shape=%dx%d seconds=%.6f strict=%s scratch=DDR threads=%s\n",
-                     kind, width, height, elapsed(start), strict.c_str(), threads.c_str());
+        std::fprintf(stderr, "OCR_EP_COMPILE kind=%s shape=%dx%d seconds=%.6f strict=%s scratch=DDR threads=%s accuracy=%s\n",
+                     kind, width, height, elapsed(start), strict.c_str(), threads.c_str(), accuracy.c_str());
         return result;
     }
 
     Ort::Session & vision_session(int width, int height) {
+        const bool dynamic = integer_setting("OCR_EP_VISION_DYNAMIC", 0, 0, 1) != 0;
+        const int key_width = dynamic ? 0 : width;
+        const int key_height = dynamic ? 0 : height;
         for (auto it = vision.begin(); it != vision.end(); ++it) {
-            if (it->width == width && it->height == height) {
+            if (it->width == key_width && it->height == key_height) {
                 vision.splice(vision.begin(), vision, it);
                 return *vision.front().session;
             }
@@ -106,12 +112,14 @@ struct runtime {
         if (vision.size() >= static_cast<size_t>(limit)) {
             vision.pop_back();
         }
-        auto session = create(setting("OCR_EP_VISION_MODEL"), width, height, "VISION");
+        auto session = create(setting("OCR_EP_VISION_MODEL"), key_width, key_height, "VISION");
         const auto shape = session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-        if (shape != std::vector<int64_t>({1, 3, height, width})) {
-            throw std::runtime_error("Vision EP specialization did not produce the requested input shape");
+        const auto expected = dynamic ? std::vector<int64_t>({1, 3, -1, -1}) :
+                                        std::vector<int64_t>({1, 3, height, width});
+        if (shape != expected) {
+            throw std::runtime_error("Vision EP session did not produce the requested input signature");
         }
-        vision.push_front({width, height, std::move(session)});
+        vision.push_front({key_width, key_height, std::move(session)});
         return *vision.front().session;
     }
 };

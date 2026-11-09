@@ -7,6 +7,7 @@
 #include <csignal>
 #include <execinfo.h>
 #include <unistd.h>
+#include <chrono>
 
 namespace {
 void fault_trace(int signal) {
@@ -15,14 +16,49 @@ void fault_trace(int signal) {
     backtrace_symbols_fd(stack, count, STDERR_FILENO);
     _exit(128 + signal);
 }
+
+void vision_file(int width, int height, const std::string & path, const std::string & output) {
+    if (width < 1 || height < 1 || width > 8192 || height > 8192) {
+        throw std::invalid_argument("Invalid sequence dimensions");
+    }
+    std::vector<float> pixels(static_cast<size_t>(width) * height * 3);
+    std::ifstream file(path, std::ios::binary);
+    if (!file.read(reinterpret_cast<char *>(pixels.data()), pixels.size() * sizeof(float)) || file.peek() != EOF) {
+        throw std::runtime_error("Sequence input must contain exactly width*height*3 float32 values");
+    }
+    std::vector<float> features;
+    const auto start = std::chrono::steady_clock::now();
+    ocr_ep_encode_hwc(pixels.data(), width, height, features);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::fprintf(stderr, "EP_PROBE_SEQUENCE shape=%dx%d wall_seconds=%.6f\n", width, height, seconds);
+    std::ofstream out(output, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(features.data()), features.size() * sizeof(float));
+    if (!out) { throw std::runtime_error("Cannot save sequence visual features"); }
+}
 }
 
 int main(int argc, char ** argv) {
     std::signal(SIGSEGV, fault_trace);
     std::signal(SIGABRT, fault_trace);
     try {
+        if (argc == 5 && std::string(argv[1]) == "vision-sequence") {
+            const int repeats = std::stoi(argv[4]);
+            if (repeats < 1 || repeats > 100) { throw std::invalid_argument("Invalid sequence repeats"); }
+            for (int iteration = 0; iteration < repeats; ++iteration) {
+                std::ifstream manifest(argv[2]);
+                if (!manifest) { throw std::runtime_error("Cannot open sequence manifest"); }
+                int width, height, index = 0;
+                std::string path;
+                while (manifest >> width >> height >> path) {
+                    vision_file(width, height, path, std::string(argv[3])+"."+std::to_string(iteration)+"."+std::to_string(index++)+".f32");
+                }
+                if (!manifest.eof() || index == 0) { throw std::runtime_error("Invalid sequence manifest"); }
+            }
+            std::puts("PASS: EP sequence completed");
+            return 0;
+        }
         if (argc != 7) {
-            throw std::invalid_argument("Usage: ocr-ep-probe layout|vision WIDTH HEIGHT INPUT_F32 OUTPUT_PREFIX REPEATS");
+            throw std::invalid_argument("Usage: ocr-ep-probe layout|vision WIDTH HEIGHT INPUT_F32 OUTPUT_PREFIX REPEATS; or vision-sequence MANIFEST OUTPUT_PREFIX REPEATS");
         }
         const std::string mode = argv[1];
         const int width = std::stoi(argv[2]);
