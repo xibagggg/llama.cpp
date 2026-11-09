@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 
 struct spacemit_opnode;  // forward declaration (defined in spacemit-opnode.h)
 
@@ -20,24 +21,39 @@ struct context {
     void *                  workspace     = nullptr;
     size_t                  workspace_size = 0;
     spert::SharedBufferView shared        = {};
+    std::atomic<int64_t> * work_queue     = nullptr;
+
+    // Valid only across adjacent PC8 nodes inside one graph launch. The graph
+    // executor clears this for every other op; reset prevents cross-call reuse.
+    const ggml_tensor * pc8_packed_source = nullptr;
+    // Produced by the immediately preceding cast-pair node only. Never persists
+    // across a graph launch or an intervening workspace-writing operation.
+    const ggml_tensor * ocr_prepared_attention = nullptr;
 
     void reset(spert::Context & runtime_in, uint32_t ith_in, uint32_t nth_in,
-               void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in) {
+               void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in,
+               std::atomic<int64_t> * work_queue_in = nullptr) {
+        pc8_packed_source = nullptr;
+        ocr_prepared_attention = nullptr;
         runtime        = &runtime_in;
         ith            = ith_in;
         nth            = nth_in;
         workspace      = workspace_in;
         workspace_size = workspace_size_in;
         shared         = shared_in;
+        work_queue     = work_queue_in;
     }
 
     void clear() {
+        pc8_packed_source = nullptr;
+        ocr_prepared_attention = nullptr;
         runtime        = nullptr;
         ith            = 0;
         nth            = 0;
         workspace      = nullptr;
         workspace_size = 0;
         shared         = {};
+        work_queue     = nullptr;
     }
 
     spert::Status sync() { return runtime->sync(); }

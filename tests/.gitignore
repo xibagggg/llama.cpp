@@ -1,6 +1,16 @@
 *
 !*.*
 !snapshots/
+!ocr/
+ocr/*
+!ocr/test_add_gelu_fusion.cpp
+!ocr/test_matmul_bias_fusion.cpp
+!ocr/test_rvv_copy_contract.cpp
+!ocr/test_doclayout_grid_sample.cpp
+!ocr/bench_clip_fusion.cpp
+!ocr/*.cpp
+!ocr/*.h
+!ocr/*.py
 !fusion/
 !llama-context/
 *.o

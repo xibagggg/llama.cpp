@@ -1,0 +1,7 @@
+# GGML layout precision reporting — 2026-11-06
+
+The layout C API now reports actual loaded weight types, constructed Q4/Q8 convolution matrix counts, and input/output types. The SDK uses these diagnostics instead of labeling every GGUF layout model as FP32. A skipped detector is reported as not run; older libraries without precision metadata are reported as unknown. This changes reporting only, with no compute or quantization changes.
+
+The server verified six actual model/backend combinations against independent GGUF storage inspection: FP32, Q4 convolution and Q8 convolution, each on CPU and CPU scheduler. Q4/Q8 each retain 95 quantized convolution matrices, 387 F32 weight tensors, F32 input and four F32 outputs. They are mixed precision. The actual SDK report branch, small diagnostic buffer recovery, and one full scanned-page Q8 scheduler regression passed; all four full outputs match their accepted hashes and the input is preserved. The report-branch check does not execute the complete SDK. ONNX Runtime was not imported.
+
+The CLI and shared library cross-compile for K3 against the previous archived compute libraries; no K3 inference, deployment, Feishu update, commit or push occurred. Hardware dispatch, latest candidate performance, EP parity and full SDK acceptance remain unverified. Source snapshots, model/input/output hashes, build logs and `finalize.py` are archived in workspace evidence `results/optimization/20261106-layout-precision-metadata/`.

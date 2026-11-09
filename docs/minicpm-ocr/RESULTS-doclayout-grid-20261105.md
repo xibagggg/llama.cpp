@@ -1,0 +1,11 @@
+# Native GGML GridSample for PP-DocLayoutV3 (2026-11-05)
+
+`tools/ocr-ggml/doclayout-ops.cpp` implements the model's finite-input FP32, linear, zero-padding, align_corners=0 GridSample as a GGML custom CPU node. Contiguous images use GGML dimensions W,H,C,N; grids use 2,Wout,Hout,N. Coordinates and weights are shared across channels, independent points are distributed across workers, and fully out-of-range coordinates are handled before float-to-integer conversion. Unsupported types/layouts return null. Nonfinite grid values propagate nonfinite output; general ONNX nonfinite semantics are not certified.
+
+The inspected preprocessed FP32 graph has 1408 nodes and 18 sampling nodes across six decoder layers. Feature shapes are NCHW [8,32,25,25], [8,32,50,50], [8,32,100,100]; every grid is [8,300,4,2] and output is [8,32,300,4]. This source is not a full PP-DocLayoutV3 GGUF loader or complete single-engine SDK.
+
+Server tests compare complete outputs against ONNX CPU with graph optimization disabled. Five seeded fixtures cover single-pixel/non-square images, the three model shapes, boundary, half-pixel, adjacent-boundary and extreme finite out-of-range coordinates. Three additional fixtures use actual trained first-decoder activations and sampling locations from the benchmark table raster. All eight cases pass at one and four threads, three repeats each: 48 executions, input preservation, byte-exact repeats and worker-count outputs, finite outputs and full reference comparison. Maximum absolute error is 7.153e-7 across all cases, 2.384e-7 on trained fixtures. Other decoder layers and full box/order/mask quality have not been validated.
+
+Build with `bash scripts/ocr/build-doclayout-grid.sh` after building the native GGML CPU libraries. The standalone RISC-V test also cross-compiles; SHA256 `ed056dc731d59bacd381842482a44df2d2692c2f2ec74fdff49b20ed9e48b7ca`. No board inference or deployment took place. These correctness checks do not establish K3 timing, IME2 acceleration, EP parity or the document latency targets.
+
+Raw fixtures, model/image hashes, source/binary audit and logs reside in workspace evidence `results/optimization/20261105-doclayout-ggml/`. Full graph conversion still requires the other layout-specific operators and integer/boolean semantics, followed by complete outputs and end-to-end acceptance.

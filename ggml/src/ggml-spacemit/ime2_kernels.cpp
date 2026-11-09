@@ -32,6 +32,12 @@
 namespace spacemit_kernels {
 namespace ime2 {
 
+#include "ocr-q4-m8.h"
+size_t gemm_kernel_i8i4_ocr_m8(size_t blk_len,const uint8_t * a,const uint8_t * b,
+                               const uint8_t * zp,float * c,size_t m,size_t n,size_t k_blks,size_t ldc) {
+    return ocr_q4_m8(blk_len,a,b,zp,c,m,n,k_blks,ldc);
+}
+
 template <size_t MB_ROWS, size_t NB_COLS>
 void gemm_kernel_i8i2k_mrow_ref(size_t          blk_len,
                                 const uint8_t * quant_a_ptr,
@@ -2898,7 +2904,8 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
                             size_t          count_m,
                             size_t          count_n,
                             size_t          k_blks,
-                            size_t          ldc) {
+                            size_t          ldc,
+                            const float *   bias) {
     constexpr size_t NB_COLS                = 32;
     constexpr size_t k_subblks_per_superblk = 8;
 
@@ -3001,12 +3008,16 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
 
                 // save
                 "vsetvli        t0, x0, e32, m1         \n\t"
+                "beqz           %[BIAS], 1f              \n\t"
+                "vle32.v        v0, (%[BIAS])            \n\t"
+                "vfadd.vv       v31, v31, v0             \n\t"
+                "1:                                      \n\t"
                 "vse32.v        v31, (%[DST])           \n\t"
                 : [A] "+r"(a_data), [B] "+r"(b_data)
-                : [DST] "r"(dst_c), [BK] "r"(k_blks)
+                : [DST] "r"(dst_c), [BK] "r"(k_blks), [BIAS] "r"(bias ? bias + ni : nullptr)
                 : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9",
                   "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
-                  "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "ft0", "ft1");
+                  "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "ft0", "ft1", "memory");
         }
     } else {
         // TODO: support quant_b_zp for i8i4 hp kernel
@@ -3384,7 +3395,8 @@ void gemm_kernel_i8i4_hp_m4(size_t          blk_len,
                             size_t          count_m,
                             size_t          count_n,
                             size_t          k_blks,
-                            size_t          ldc) {
+                            size_t          ldc,
+                            const float *   bias) {
     constexpr size_t NB_COLS                = 32;
     constexpr size_t K_SUBBLKS_PER_SUPERBLK = 8;
     constexpr size_t K_SUBBLK_LEN           = 32;
@@ -3742,6 +3754,13 @@ void gemm_kernel_i8i4_hp_m4(size_t          blk_len,
 
                 "_BLK_LPND%=:                             \n\t"
                 "vsetvli        t0, x0, e32, m1           \n\t"
+                "beqz           %[BIAS], 1f                \n\t"
+                "vle32.v        v0, (%[BIAS])              \n\t"
+                "vfadd.vv       v28, v28, v0               \n\t"
+                "vfadd.vv       v29, v29, v0               \n\t"
+                "vfadd.vv       v30, v30, v0               \n\t"
+                "vfadd.vv       v31, v31, v0               \n\t"
+                "1:                                        \n\t"
                 "add            t2, %[LDC], %[DST]        \n\t"
                 "vse32.v        v28, (%[DST])             \n\t"
                 "add            t3, %[LDC], t2            \n\t"
@@ -3750,7 +3769,8 @@ void gemm_kernel_i8i4_hp_m4(size_t          blk_len,
                 "vse32.v        v30, (t3)                 \n\t"
                 "vse32.v        v31, (t2)                 \n\t"
                 : [A] "+r"(a_block), [B] "+r"(b_tile_base)
-                : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks), [HP16] "f"(hp_scale_16), [HP1] "f"(hp_scale_1)
+                : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks), [HP16] "f"(hp_scale_16), [HP1] "f"(hp_scale_1),
+                  [BIAS] "r"(bias ? bias + ni : nullptr)
                 : "t0", "t2", "t3", "t4", "t5", "t6", "s5", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v10",
                   "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v24", "v25", "v26",
                   "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "ft1", "ft2", "ft3", "ft4", "memory");
@@ -5654,7 +5674,8 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
         gemm_kernel_i8i4_hp_mrow_ref<4, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
                                             k_blks, ldc);
 #else
-        gemm_kernel_i8i4_hp_m4(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
+        gemm_kernel_i8i4_hp_m4(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc,
+                               nullptr);
 #endif
         return 4;
     } else {
@@ -5662,10 +5683,41 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
         gemm_kernel_i8i4_hp_mrow_ref<1, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
                                             k_blks, ldc);
 #else
-        gemm_kernel_i8i4_hp_m1(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
+        gemm_kernel_i8i4_hp_m1(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc,
+                               nullptr);
 #endif
         return 1;
     }
+}
+
+size_t gemm_kernel_i8i4_hp_bias(size_t          blk_len,
+                                const uint8_t * quant_a_ptr,
+                                const uint8_t * quant_b_data,
+                                const uint8_t * quant_b_zp,
+                                float *         c_ptr,
+                                size_t          count_m,
+                                size_t          count_n,
+                                size_t          k_blks,
+                                size_t          ldc,
+                                const float *   bias) {
+    if (bias == nullptr) {
+        return gemm_kernel_i8i4_hp(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
+                                   k_blks, ldc);
+    }
+
+    // The graph matcher and trait dispatcher must retain the ordinary MatMul
+    // plus Add for unsupported layouts. Never silently omit a non-null bias.
+    GGML_ASSERT(blk_len == 256 && quant_b_zp == nullptr && count_m > 0 && count_n > 0 && count_n % 32 == 0);
+
+    if (count_m >= 4) {
+        gemm_kernel_i8i4_hp_m4(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc,
+                               bias);
+        return 4;
+    }
+
+    gemm_kernel_i8i4_hp_m1(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc,
+                           bias);
+    return 1;
 }
 
 size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,

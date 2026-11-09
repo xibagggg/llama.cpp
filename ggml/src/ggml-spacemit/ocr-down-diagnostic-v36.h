@@ -65,8 +65,8 @@ struct scope {
     }
 };
 struct quant_scope {
-    ggml::spacemit::context &ctx;ggml_tensor *op;std::string prefix;bool active=false;
-    quant_scope(ggml::spacemit::context &c,ggml_tensor *t):ctx(c),op(t){
+    ggml::spacemit::context &ctx;ggml_tensor *op;ggml_tensor *output;std::string prefix;bool active=false;
+    quant_scope(ggml::spacemit::context &c,ggml_tensor *t,ggml_tensor *result=nullptr):ctx(c),op(t),output(result?result:t){
         static const char *dir=std::getenv("GGML_SPACEMIT_OCR_QUANT_CAPTURE");
         if(!dir||!*dir||!op->src[0]||!op->src[1])return;
         const char *w=op->src[0]->name;
@@ -93,7 +93,7 @@ struct quant_scope {
     ~quant_scope(){
         if(!active)return;
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);
-        if(ctx.ith==0)write_file(prefix+"-y.f32",op->data,ggml_nbytes(op));
+        if(ctx.ith==0)write_file(prefix+"-y.f32",output->data,ggml_nbytes(output));
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);
     }
 };

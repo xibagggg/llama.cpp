@@ -32,12 +32,22 @@ enum spacemit_op_code {
     SPACEMIT_OP_PERMUTE,
     SPACEMIT_OP_TRANSPOSE,
     SPACEMIT_OP_NONE,
+    SPACEMIT_OP_ADD_GELU,
+    SPACEMIT_OP_IM2COL_MUL_MAT,
+    SPACEMIT_OP_NORM_AFFINE,
+    SPACEMIT_OP_RESIDUAL_NORM_AFFINE,
+    SPACEMIT_OP_PC8_PAD_MUL_MAT,
+    SPACEMIT_OP_PC8_MUL_MAT_BIAS,
+    SPACEMIT_OP_OCR_CAST_KV_PACK,
 };
 
 #define SPACEMIT_OP_MAX_KERN_PARAMS 32
 
 struct spacemit_opnode {
     ggml_tensor * node = nullptr;
+    ggml_tensor * packed_im2col = nullptr;
+    ggml_tensor * elided_pad = nullptr;
+    ggml_tensor * prepared_attention = nullptr;
 
     std::vector<ggml_tensor *> fused;
 
@@ -91,6 +101,7 @@ struct spacemit_opnode {
     }
 
     bool stackable() const {
+        if(packed_im2col||elided_pad)return false;
         switch (this->op()) {
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID:
@@ -105,6 +116,8 @@ struct spacemit_opnode {
     }
 
     std::vector<const ggml_tensor *> get_inputs() const {
+        if(elided_pad)return {node->src[0],elided_pad->src[0]};
+        if(packed_im2col)return {node->src[0],packed_im2col->src[0],packed_im2col->src[1]};
         if (fused.empty()) {
             int last_non_null = -1;
             for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -162,6 +175,8 @@ struct spacemit_opnode {
     }
 
     std::string op_name() const {
+        if(elided_pad)return "PAD+PC8_MUL_MAT";
+        if(packed_im2col)return "IM2COL+PACK+MUL_MAT";
         if (fused.empty()) {
             return ggml_op_desc(node);
         }

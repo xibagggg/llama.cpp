@@ -5,7 +5,6 @@
 #include "spacemit-context.h"
 
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -23,9 +22,15 @@ struct spacemit_session {
     // Serialize graph_compute calls because the hardware stream is exclusive.
     std::mutex stream_mutex;
 
+    // Opt-in diagnostic sequence for no-callback operator output hashes.
+    uint64_t op_hash_trace_sequence = 0;
+
     void * workspace = nullptr;
     size_t workspace_size = 0;
     std::vector<ggml::spacemit::context> contexts;
+    // Graph calls on this session are serialized by stream_mutex. The counter
+    // is reset and synchronized before each dynamic attention dispatch.
+    std::atomic<int64_t> attention_work_queue{0};
 
     struct {
         uint64_t uid = 0;

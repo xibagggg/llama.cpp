@@ -3240,6 +3240,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // Drain every worker's trailing trace events before returning the graph.
+    // Without this, a thread-local tail smaller than TRACE_BUFFER_SIZE is lost.
+    ggml_profile_flush_tls();
     ggml_barrier(state->threadpool);
 
     return 0;

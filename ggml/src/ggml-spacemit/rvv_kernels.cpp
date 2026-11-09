@@ -8,6 +8,7 @@
 #include "ocr-down-compact-v43.h"
 #include "ocr-down-vector-v44.h"
 #include "ocr-concat-tcm-v46.h"
+#include "ocr-worker-events.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -27,6 +28,8 @@
 #    include <riscv_vector.h>
 #    include "ocr-fa-x8-v39.h"
 #    include "ocr-qk-ime2-v53.h"
+#    include "ocr-pv-ime2.h"
+#    include "ocr-fa-fullkv.h"
 #    include "ocr-fa-group-v45.h"
 #endif
 
@@ -41,6 +44,61 @@
 #endif
 
 namespace spacemit_kernels::rvv {
+
+void prepare_ocr_worker_state() {
+    // Resolve these guards/environment reads on the dispatching host thread,
+    // in this TU (ocr_fa_x8_enabled has internal linkage). No RVV/IME work here.
+    (void)ocr_worker_events::get();
+    (void)ocr_fa_pack_v40::eligible(nullptr);
+    (void)ocr_fa_pack_v40::ime_qk(nullptr);
+    (void)ocr_fa_pack_v40::ime_pv(nullptr);
+    (void)ocr_fa_pack_v40::full_kv_mode();
+    (void)ocr_fa_pack_v40::direct_v44();
+    (void)ocr_fa_pack_v40::lazy_init();
+    (void)ocr_fa_fullkv::trust_bounds_enabled();
+    (void)ocr_fa_fullkv::head_key_cache_enabled();
+    (void)ocr_fa_fullkv::all_key_cache_enabled();
+    (void)ocr_fa_fullkv::half_pack_enabled();
+    (void)ocr_fa_fullkv::lean_prepare_enabled();
+    (void)ocr_fa_fullkv::batch_check_enabled();
+    (void)ocr_fa_fullkv::fixed_index_enabled();
+    (void)ocr_fa_fullkv::p_store64_enabled();
+    (void)ocr_fa_fullkv::fused_query_enabled();
+    (void)ocr_fa_fullkv::query32_enabled();
+    (void)ocr_fa_fullkv::compact_enabled();
+    (void)ocr_fa_fullkv::softmax_pack_mode();
+    (void)ocr_fa_fullkv::direct_pack_enabled();
+    (void)ocr_qk_ime2_v53::scatter_enabled();
+    (void)ocr_qk_pipeline::enabled();
+    (void)ocr_pv_pipeline::enabled();
+    (void)ocr_pv_pipeline::tail_enabled();
+    (void)ocr_pv_ime2::mode();
+    (void)ocr_fa_x8_enabled();
+    (void)ocr_fa_group_v45::mode();
+}
+
+void drain_ocr_worker_events() {
+    using ocr_worker_events::kind;
+    ocr_worker_events::get().drain([](kind event, const ocr_worker_events::values & v) {
+        switch(event) {
+            case kind::pack:
+                GGML_LOG_INFO("ocr-fa-pack-v40: active N=%lld workspace=%zu transient per attention call\n",(long long)v.a,size_t(v.b));break;
+            case kind::full_kv:
+                GGML_LOG_INFO("ocr-fa-full-kv: active N=%d Q=%d passes=%d all_keys=%d TCM=%zu/%zu\n",int(v.a),int(v.b),int(v.c),int(v.d),size_t(v.e),size_t(v.f));break;
+            case kind::direct:
+                GGML_LOG_INFO("ocr-fa-direct-v44: active mode=%d shared DDR packed K/V\n",int(v.a));break;
+            case kind::lazy:
+                GGML_LOG_INFO("ocr-fa-lazy-v43: active full overwrite K / bounded active V; tail packing still initialized\n");break;
+            case kind::x8:
+                GGML_LOG_INFO("ocr-fa-x8-v39: active D72 eight-query K/V reuse mask=%d\n",int(v.a));break;
+            case kind::group:
+                GGML_LOG_INFO("ocr-fa-group-v45: active qk=%d pv=%d\n",int(v.a),int(v.b));break;
+            case kind::pv:
+                GGML_LOG_INFO("ocr-pv-ime2: active passes=%d FP32 probability split, FP32 accumulation\n",int(v.a));break;
+            case kind::count: break;
+        }
+    });
+}
 
 namespace {
 
@@ -477,9 +535,10 @@ static inline void rvv_transposed_s32_mn_to_nm(int8_t * dst,
         "bnez                   t2, LOOP_M1%=                 \n\t"
         "END%=:                                               \n\t"
 
-        : [src] "+r"(in), [dst] "+r"(out), [isz0] "+r"(m)
-        : [isz1] "r"(n), [is0] "r"(m_src_stride), [os0] "r"(n_dst_stride)
-        : "cc", "t0", "t1", "t2", "t3", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "a1");
+        : [src] "+&r"(in), [dst] "+&r"(out)
+        : [isz0] "r"(m), [isz1] "r"(n), [is0] "r"(m_src_stride), [os0] "r"(n_dst_stride)
+        : "cc", "t0", "t1", "t2", "t3", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "a1",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "memory");
 }
 
 static inline void rvv_transposed_s16_mn_to_nm(int8_t * dst,
@@ -559,9 +618,10 @@ static inline void rvv_transposed_s16_mn_to_nm(int8_t * dst,
         "bnez                   t2, LOOP_M1%=                 \n\t"
         "END%=:                                               \n\t"
 
-        : [src] "+r"(in), [dst] "+r"(out), [isz0] "+r"(m)
-        : [isz1] "r"(n), [is0] "r"(m_src_stride), [os0] "r"(n_dst_stride)
-        : "cc", "t0", "t1", "t2", "t3", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "a1");
+        : [src] "+&r"(in), [dst] "+&r"(out)
+        : [isz0] "r"(m), [isz1] "r"(n), [is0] "r"(m_src_stride), [os0] "r"(n_dst_stride)
+        : "cc", "t0", "t1", "t2", "t3", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "a1",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "memory");
 }
 
 static inline void rvv_qk_dot_tile_f16_x1(float *          dst,
@@ -1095,6 +1155,9 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
 }  // namespace
 
 void memcpy1d(void * dst, const void * src, int64_t size) {
+    if (size <= 0) {
+        return;
+    }
     size_t byte_size_all = size;
     size_t vlen          = __riscv_vlenb() * 8;
     if (vlen == 256) {
@@ -1137,9 +1200,13 @@ void memcpy1d(void * dst, const void * src, int64_t size) {
             "add            %[d], %[d], t0              \n\t"
             "bnez           t1, memcpy_tail_loop%=      \n\t"
             "out%=:                                     \n\t"
-            : [s] "+r"(src), [d] "+r"(dst)
+            : [s] "+&r"(src), [d] "+&r"(dst)
             : [size] "r"(byte_size_all)
-            : "cc", "t0", "t1");
+            : "cc", "t0", "t1",
+              "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+              "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+              "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+              "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
     } else if (vlen == 1024) {
         // 2048 bytes
         __asm__ volatile(
@@ -1175,9 +1242,11 @@ void memcpy1d(void * dst, const void * src, int64_t size) {
             "add            %[d], %[d], t0              \n\t"
             "bnez           t1, memcpy_tail_loop%=      \n\t"
             "out%=:                                     \n\t"
-            : [s] "+r"(src), [d] "+r"(dst)
+            : [s] "+&r"(src), [d] "+&r"(dst)
             : [size] "r"(byte_size_all)
-            : "cc", "t0", "t1", "t2", "t3", "t5");
+            : "cc", "t0", "t1", "t2", "t3", "t5",
+              "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+              "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "memory");
     } else {
         __asm__ volatile(
             //
@@ -1190,9 +1259,10 @@ void memcpy1d(void * dst, const void * src, int64_t size) {
             "vse8.v         v0, (%[d])                  \n\t"
             "add            %[d], %[d], t0              \n\t"
             "bnez           t1, memcpy_tail_loop%=      \n\t"
-            : [s] "+r"(src), [d] "+r"(dst)
+            : [s] "+&r"(src), [d] "+&r"(dst)
             : [size] "r"(byte_size_all)
-            : "cc", "t0", "t1", "t2", "t4", "t3");
+            : "cc", "t0", "t1", "t2", "t4", "t3",
+              "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "memory");
     }
 }
 
@@ -1565,29 +1635,324 @@ static void prepare_ocr_fa_kv_v50_impl(ggml::spacemit::context &ctx,ggml_tensor 
     constexpr int D=72,KV=GGML_FA_TILE_KV;
     const auto *k=op->src[1],*v=op->src[2];const int nt=int(ocr_fa_pack_v40::tiles(op));
     auto *pk=ocr_fa_pack_v40::keys(ctx),*pv=ocr_fa_pack_v40::values(ctx,op);
+    const bool lean=ocr_fa_fullkv::lean_prepare_enabled()&&ocr_fa_pack_v40::full_kv(op)&&ocr_fa_fullkv::direct_pack_enabled();
     for(int task=ctx.ith;task<16*nt;task+=ctx.nth){
         const int head=task/nt,ic=(task%nt)*KV,count=std::min(KV,int(k->ne[1])-ic);
         auto *dk=pk+size_t(task)*D*KV,*dv=pv+size_t(task)*D*KV;
         // Full tiles are overwritten by the transpose/copy; tails still need zero padding.
-        if(!ocr_fa_pack_v40::lazy_init()||count<KV){std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*2);}
-        rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
-        memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
+        if(!lean){
+            if(!ocr_fa_pack_v40::lazy_init()||count<KV){std::memset(dk,0,D*KV*2);std::memset(dv,0,D*KV*2);}
+            rvv_transposed_s16_mn_to_nm((int8_t*)dk,KV*2,(int8_t*)k->data+ic*k->nb[1]+head*k->nb[2],k->nb[1],count,D);
+            memcpy2d(dv,D*2,(const char*)v->data+ic*v->nb[1]+head*v->nb[2],v->nb[1],count,D*2);
+        }
         if(ocr_fa_pack_v40::ime_qk(op)){
             auto*ik=ocr_fa_pack_v40::ime_key_tile(ctx,op,task);
-            const bool valid=ocr_qk_ime2_v53::pack_k(dk,ik,KV,count);
+            const auto *src=reinterpret_cast<const _Float16*>(reinterpret_cast<const char*>(k->data)+ic*k->nb[1]+head*k->nb[2]);
+            const bool valid=ocr_fa_pack_v40::full_kv(op)&&ocr_fa_fullkv::direct_pack_enabled()
+                ?ocr_fa_fullkv::pack_rows(src,k->nb[1],count,KV,ik)
+                :ocr_qk_ime2_v53::pack_k(dk,ik,KV,count);
             ik[D*KV]=valid?(_Float16)1:(_Float16)0;
         }
+        if(ocr_fa_pack_v40::ime_pv(op)){
+            auto * iv=ocr_fa_pack_v40::ime_value_tile(ctx,op,task);
+            const bool valid=ocr_pv_ime2::pack_weight(dv,count,iv);
+            iv[96*72]=valid?(_Float16)1:(_Float16)0;
+        }
+    }
+    if(ocr_fa_pack_v40::full_kv(op))for(int head=ctx.ith;head<16;head+=ctx.nth){
+        const int n=int(v->ne[1]),padded=int(ocr_fa_pack_v40::full_k(op));
+        auto * dst=ocr_fa_pack_v40::full_value_head(ctx,op,head);
+        const auto * src=reinterpret_cast<const _Float16*>(reinterpret_cast<const char*>(v->data)+head*v->nb[2]);
+        const bool valid=ocr_fa_fullkv::pack_v(src,v->nb[1],n,padded,dst);
+        dst[96*padded]=valid?(_Float16)1:(_Float16)0;
     }
     if constexpr(PROFILE)phase.tick(0); // shared K/V pack and tail initialization
     GGML_ASSERT(ctx.sync()==spert::Status::Ok);
     if constexpr(PROFILE){phase.tick(1);phase.finish();}
-    static std::atomic<bool> announced{false};
-    if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-pack-v40: active N=%lld workspace=%zu transient per attention call\n",(long long)k->ne[1],ocr_fa_pack_v40::work_bytes(ctx.nth,op));
+    if(ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::pack,
+        {uint64_t(k->ne[1]),ocr_fa_pack_v40::work_bytes(ctx.nth,op)});
 }
 
-void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
+bool prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op){
+    if(!ocr_fa_pack_v40::eligible(op))return false;
+    if(ctx.ocr_prepared_attention==op){
+        ctx.ocr_prepared_attention=nullptr;
+        // The graph barrier published the pack. This additional collective is
+        // still required to publish the dynamic attention queue reset.
+        GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+        return true;
+    }
     if(ocr_fa_phases_v50::enabled()&&ocr_fa_pack_v40::eligible(op))prepare_ocr_fa_kv_v50_impl<true>(ctx,op);
     else prepare_ocr_fa_kv_v50_impl<false>(ctx,op);
+    return true;
+}
+
+void cast_pack_ocr_kv(ggml::spacemit::context &ctx,ggml_tensor *op){
+    GGML_ASSERT(ocr_fa_pack_v40::full_kv(op));
+    GGML_ASSERT(ctx.workspace&&ctx.workspace_size>=ocr_fa_pack_v40::work_bytes(ctx.nth,op));
+    constexpr int D=72,KV=GGML_FA_TILE_KV;
+    constexpr size_t vl=D;
+    const int n=int(op->src[1]->ne[1]),padded=int(ocr_fa_pack_v40::full_k(op));
+    const int nt=int(ocr_fa_pack_v40::tiles(op));
+    const auto ch=__riscv_vid_v_u32m4(vl);
+    const auto key_offsets=__riscv_vsll_vx_u32m4(__riscv_vadd_vv_u32m4(
+        __riscv_vsll_vx_u32m4(__riscv_vsrl_vx_u32m4(ch,3,vl),6,vl),
+        __riscv_vand_vx_u32m4(ch,7,vl),vl),1,vl);
+    const auto value_offsets=__riscv_vadd_vv_u32m4(
+        __riscv_vmul_vx_u32m4(__riscv_vsrl_vx_u32m4(ch,3,vl),8*padded,vl),
+        __riscv_vsll_vx_u32m4(__riscv_vand_vx_u32m4(ch,7,vl),3,vl),vl);
+    // Independent K/V heads balance both conversion and packing across workers.
+    for(int task=ctx.ith;task<32;task+=ctx.nth){
+        const bool value=task%2;
+        const int head=task/2;
+        auto *dst=op->src[value?2:1];
+        const auto *src=dst->src[0];
+        auto *packed=value?ocr_fa_pack_v40::full_value_head(ctx,op,head):nullptr;
+        if(value){
+            // All real rows overwrite D channels. Only padded channels need
+            // clearing when N already satisfies the IME eight-row alignment.
+            if(n==padded)std::memset(packed+size_t(D)*padded,0,size_t(96-D)*padded*sizeof(_Float16));
+            else std::memset(packed,0,size_t(96)*padded*sizeof(_Float16));
+        }
+        bool valid=true;
+        for(int row=0;row<n;++row){
+            if(!value&&row%KV==0)valid=true;
+            const auto *input=reinterpret_cast<const float*>(static_cast<const char*>(src->data)+
+                head*src->nb[2]+row*src->nb[1]);
+            auto *output=reinterpret_cast<_Float16*>(static_cast<char*>(dst->data)+
+                head*dst->nb[2]+row*dst->nb[1]);
+            const auto h=__riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(input,vl),vl);
+            __riscv_vse16_v_f16m2(output,h,vl);
+            const auto f=__riscv_vfwcvt_f_f_v_f32m4(h,vl);
+            const auto bad=__riscv_vmor_mm_b8(__riscv_vmfne_vv_f32m4_b8(f,f,vl),
+                __riscv_vmfgt_vf_f32m4_b8(__riscv_vfabs_v_f32m4(f,vl),63.f,vl),vl);
+            if(__riscv_vcpop_m_b8(bad,vl))valid=false;
+            const auto scaled=__riscv_vfncvt_f_f_w_f16m2(__riscv_vfmul_vf_f32m4(f,1024.f,vl),vl);
+            if(value){
+                const auto offsets=__riscv_vsll_vx_u32m4(__riscv_vadd_vx_u32m4(
+                    value_offsets,(row/8)*64+row%8,vl),1,vl);
+                __riscv_vsuxei32_v_f16m2(packed,offsets,scaled,vl);
+            }else{
+                auto *tile=ocr_fa_pack_v40::ime_key_tile(ctx,op,size_t(head)*nt+row/KV);
+                if(row%KV==0){
+                    if(n-row<KV)std::memset(tile,0,D*KV*sizeof(_Float16));
+                }
+                auto *out=tile+size_t((row%KV)/8)*8*D+(row%8)*8;
+                __riscv_vsuxei32_v_f16m2(out,key_offsets,scaled,vl);
+                if(row%KV==KV-1||row==n-1)tile[D*KV]=valid?(_Float16)1:(_Float16)0;
+            }
+        }
+        if(value)packed[96*padded]=valid?(_Float16)1:(_Float16)0;
+    }
+    // The normal executor barrier publishes every head and both cast outputs.
+    ctx.ocr_prepared_attention=op;
+}
+
+template<bool PROFILE>
+static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int capacity,
+                            _Float16*high,_Float16*low,int passes,float*inverse){
+    const int mode=ocr_fa_fullkv::softmax_pack_mode();
+    const bool fixed_index=ocr_fa_fullkv::fixed_index_enabled();
+    const bool store64=ocr_fa_fullkv::p_store64_enabled();
+    // Full-KV validates every Q/K FP16 value before IME2, so every score is
+    // finite and exp(score-max) is in [0,1]. Avoid rechecking that invariant
+    // for every probability vector. Keep max and positive-sum guards.
+    const bool trusted=ocr_fa_fullkv::trust_bounds_enabled();
+    const auto lanes=__riscv_vid_v_u32m2(64);
+    const auto lane_offsets=__riscv_vsll_vx_u32m2(__riscv_vadd_vv_u32m2(
+        __riscv_vsll_vx_u32m2(__riscv_vsrl_vx_u32m2(lanes,3,64),6,64),
+        __riscv_vand_vx_u32m2(lanes,7,64),64),1,64);
+    // Each aligned group of four FP16 values is contiguous in the IME2
+    // panel. Store its bits as one 64-bit element, reducing scatter lanes
+    // without changing exp, reduction grouping or either FP16 rounding.
+    const auto words=__riscv_vid_v_u32mf2(16);
+    const auto word_offsets=__riscv_vadd_vv_u32mf2(
+        __riscv_vsll_vx_u32mf2(__riscv_vsrl_vx_u32mf2(words,1,16),7,16),
+        __riscv_vsll_vx_u32mf2(__riscv_vand_vx_u32mf2(words,1,16),3,16),16);
+    if(rows!=capacity||n!=padded){
+        std::memset(high,0,size_t(capacity)*padded*sizeof(_Float16));
+        if(passes==2)std::memset(low,0,size_t(capacity)*padded*sizeof(_Float16));
+    }
+    for(int row=0;row<rows;++row){
+        const float*p=scores+size_t(row)*n;
+        auto vmax=__riscv_vfmv_v_f_f32m4(-INFINITY,128);
+        for(int k=0;k<n;k+=128){const size_t vl=std::min(128,n-k);
+            vmax=__riscv_vfmax_vv_f32m4_tu(vmax,vmax,__riscv_vle32_v_f32m4(p+k,vl),vl);}
+        const float maximum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m4_f32m1(
+            vmax,__riscv_vfmv_v_f_f32m1(-INFINITY,1),128));
+        if(!std::isfinite(maximum))return false;
+        float sum=0;auto vsum=__riscv_vfmv_v_f_f32m2(0,64);
+        const bool batch_check=ocr_fa_fullkv::batch_check_enabled();
+        auto bad_any=__riscv_vmclr_m_b16(64);
+        const size_t base=size_t(row/8)*8*padded+(row%8)*8;
+        // vsetvl may split the final AVL in (VLMAX,2*VLMAX) into two
+        // balanced vectors. Mode 1 retains the original sum grouping.
+        for(int k=0;k<n;){const size_t vl=mode==1?__riscv_vsetvl_e32m2(n-k):std::min(64,n-k);
+            const auto f=rvv_expf_approx_f32m2(__riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(p+k,vl),maximum,vl),vl);
+            if(!trusted){
+                const auto bad=__riscv_vmor_mm_b16(__riscv_vmfne_vv_f32m2_b16(f,f,vl),
+                    __riscv_vmor_mm_b16(__riscv_vmflt_vf_f32m2_b16(f,0.f,vl),__riscv_vmfgt_vf_f32m2_b16(f,1.001f,vl),vl),vl);
+                // Only full masks can be combined; tail bits are unspecified.
+                if(batch_check&&vl==64)bad_any=__riscv_vmor_mm_b16(bad_any,bad,64);
+                else if(__riscv_vcpop_m_b16(bad,vl))return false;
+            }
+            if(mode==2)vsum=__riscv_vfadd_vv_f32m2_tu(vsum,vsum,f,vl);
+            else sum+=reduce_sum_f32m2_vlen1024(f,vl);
+            const bool aligned=fixed_index&&!(k&7);
+            const auto ids=__riscv_vadd_vx_u32m2(__riscv_vid_v_u32m2(vl),k,vl);
+            const auto offsets=aligned?lane_offsets:__riscv_vsll_vx_u32m2(__riscv_vadd_vv_u32m2(
+                __riscv_vsll_vx_u32m2(__riscv_vsrl_vx_u32m2(ids,3,vl),6,vl),
+                __riscv_vand_vx_u32m2(ids,7,vl),vl),1,vl);
+            const size_t offset_base=base+(aligned?size_t(k)*8:0);
+            const auto h=__riscv_vfncvt_f_f_w_f16m1(__riscv_vfmul_vf_f32m2(f,1024.f,vl),vl);
+            const bool wide=store64&&!(k&7)&&!(vl&7);
+            if(wide)__riscv_vsuxei32_v_u64m1(reinterpret_cast<uint64_t*>(high+base+size_t(k)*8),
+                word_offsets,__riscv_vreinterpret_v_u16m1_u64m1(__riscv_vreinterpret_v_f16m1_u16m1(h)),vl/4);
+            else __riscv_vsuxei32_v_f16m1(high+offset_base,offsets,h,vl);
+            if(passes==2){const auto restored=__riscv_vfmul_vf_f32m2(__riscv_vfwcvt_f_f_v_f32m2(h,vl),1.f/1024.f,vl);
+                const auto l=__riscv_vfncvt_f_f_w_f16m1(
+                    __riscv_vfmul_vf_f32m2(__riscv_vfsub_vv_f32m2(f,restored,vl),16777216.f,vl),vl);
+                if(wide)__riscv_vsuxei32_v_u64m1(reinterpret_cast<uint64_t*>(low+base+size_t(k)*8),
+                    word_offsets,__riscv_vreinterpret_v_u16m1_u64m1(__riscv_vreinterpret_v_f16m1_u16m1(l)),vl/4);
+                else __riscv_vsuxei32_v_f16m1(low+offset_base,offsets,l,vl);}
+            k+=int(vl);
+        }
+        if(mode==2)sum=reduce_sum_f32m2_vlen1024(vsum,64);
+        if(!trusted&&batch_check&&__riscv_vcpop_m_b16(bad_any,64))return false;
+        if(!(sum>0.f)||!std::isfinite(sum))return false;
+        inverse[row]=1.f/sum;
+    }
+    return true;
+}
+
+template<bool PROFILE>
+static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,int ir0,int ir1){
+    if(!ocr_fa_pack_v40::full_kv(dst)||!ctx.shared.data)return false;
+    constexpr int D=ocr_fa_fullkv::D;
+    const auto *q=dst->src[0];const int n=int(q->ne[1]);
+    const int padded=int(ocr_fa_pack_v40::full_k(dst)),passes=ocr_fa_pack_v40::full_kv_mode();
+    float scale;std::memcpy(&scale,dst->op_params,sizeof(scale));
+    const size_t qk_bytes=64*D*sizeof(_Float16)+512*sizeof(float);
+    const bool compact=ocr_fa_fullkv::compact_enabled();
+    const int vd=compact?D:96;
+    const int key_tiles=int(ocr_fa_pack_v40::tiles(dst));
+    const bool head_option=ocr_fa_fullkv::head_key_cache_enabled();
+    const bool all_key_option=ocr_fa_fullkv::all_key_cache_enabled();
+    const size_t cached_key_bytes=size_t(key_tiles-1)*64*D*sizeof(_Float16);
+    // QK scratch is dead before probabilities are written, and packed Q is
+    // dead before PV starts. Reuse those two regions for the QK/PV results.
+    // The saved 4096 bytes let N1008 keep the final padded K tile in TCM too.
+    const size_t all_key_bytes=16*D*sizeof(_Float16)+16*n*sizeof(float)+
+        16*padded*sizeof(_Float16)+vd*padded*sizeof(_Float16)+
+        size_t(key_tiles)*64*D*sizeof(_Float16);
+    const bool all_key_cache=all_key_option&&head_option&&passes==1&&
+        ocr_fa_fullkv::direct_pack_enabled()&&all_key_bytes<=ctx.shared.size;
+    const auto bytes_for=[&](int queries,bool cache){return (cache?1:2)*queries*D*sizeof(_Float16)+
+        (cache?512*sizeof(float):qk_bytes)+queries*n*sizeof(float)+passes*queries*padded*sizeof(_Float16)+
+        vd*padded*sizeof(_Float16)+passes*512*sizeof(float)+(cache?cached_key_bytes:0);};
+    // Cache complete K tiles with V, leaving the final K tile transient in
+    // the not-yet-written P buffer. Q16 fits without enlarging the TCM grant.
+    const bool head_cache=all_key_cache||(head_option&&passes==1&&ocr_fa_fullkv::direct_pack_enabled()&&bytes_for(16,true)<=ctx.shared.size);
+    const int Q=head_cache?16:ocr_fa_fullkv::query32_enabled()&&bytes_for(32,false)<=ctx.shared.size?32:16;
+    const size_t needed=all_key_cache?all_key_bytes:bytes_for(Q,head_cache);
+    if(needed>ctx.shared.size||ir0<0||ir1>n*16)return false;
+    auto *raw=static_cast<_Float16*>(ctx.shared.data);
+    auto *packed_q=head_cache?raw:raw+Q*D;
+    void *qk_scratch=packed_q+Q*D;
+    auto *scores=reinterpret_cast<float*>(static_cast<char*>(qk_scratch)+(all_key_cache?0:head_cache?512*sizeof(float):qk_bytes));
+    auto *high=reinterpret_cast<_Float16*>(scores+Q*n);
+    auto *low=high+Q*padded;
+    auto *weights=high+passes*Q*padded;
+    // The QK helper writes at most 512 floats, before softmax overwrites P.
+    // PV writes at most 512 floats, after QK has consumed all packed queries.
+    if(all_key_cache)qk_scratch=high;
+    auto *acc_high=all_key_cache?reinterpret_cast<float*>(packed_q):reinterpret_cast<float*>(weights+vd*padded);
+    auto *acc_low=acc_high+512;
+    auto *cached_keys=all_key_cache?weights+vd*padded:reinterpret_cast<_Float16*>(acc_high+passes*512);
+    ocr_fa_phases_v50::record phase(ctx,dst,"fullkv");
+    if constexpr(PROFILE)phase.begin();
+    int loaded_head=-1;
+    for(int ir=ir0;ir<ir1;){
+        const int head=ir/n,iq=ir%n,rows=std::min(Q,std::min(ir1-ir,n-iq));
+        if(head!=loaded_head){
+            const auto *shared_v=ocr_fa_pack_v40::full_value_head(ctx,dst,head);
+            if(shared_v[96*padded]==(_Float16)0)return false;
+            const int nt=int(ocr_fa_pack_v40::tiles(dst));
+            for(int t=0;t<nt;++t)
+                if(ocr_fa_pack_v40::ime_key_tile(ctx,dst,size_t(head)*nt+t)[D*64]==(_Float16)0)return false;
+            std::memcpy(weights,shared_v,size_t(vd)*padded*sizeof(_Float16));
+            if(head_cache)for(int t=0;t<(all_key_cache?key_tiles:key_tiles-1);++t)
+                std::memcpy(cached_keys+size_t(t)*64*D,ocr_fa_pack_v40::ime_key_tile(ctx,dst,size_t(head)*key_tiles+t),64*D*sizeof(_Float16));
+            loaded_head=head;
+        }
+        if constexpr(PROFILE)phase.tick(7); // one whole-head V copy per assigned range
+        const auto *src=reinterpret_cast<const uint8_t*>(q->data)+iq*q->nb[1]+head*q->nb[2];
+        bool valid_q;
+        if(head_cache||(ocr_fa_fullkv::fused_query_enabled()&&ocr_fa_fullkv::direct_pack_enabled()))
+            valid_q=ocr_fa_fullkv::pack_query(src,q->nb[1],rows,(rows+7)/8*8,scale,packed_q);
+        else{
+            rvv_pack_f32_as_scaled_f16(reinterpret_cast<uint8_t*>(raw),D*sizeof(_Float16),
+                src,q->nb[1],rows,D,scale);
+            valid_q=ocr_fa_fullkv::direct_pack_enabled()
+                ?ocr_fa_fullkv::pack_rows(raw,D*sizeof(_Float16),rows,(rows+7)/8*8,packed_q)
+                :ocr_qk_ime2_v53::pack_q(raw,packed_q,rows);
+        }
+        if(!valid_q)return false;
+        if constexpr(PROFILE)phase.tick(2);
+        for(int ic=0;ic<n;ic+=64){
+            const auto *pk=ocr_fa_pack_v40::ime_key_tile(ctx,dst,size_t(head)*ocr_fa_pack_v40::tiles(dst)+ic/64);
+            const bool cached=head_cache&&(all_key_cache||ic/64<key_tiles-1);
+            const auto*key=cached?cached_keys+size_t(ic/64)*64*D:pk;
+            // Last-tile scratch aliases P only before softmax writes P.
+            void*scratch=head_cache&&!cached?static_cast<void*>(high):qk_scratch;
+            if(!ocr_qk_ime2_v53::qk(scores+ic,packed_q,key,n,rows,std::min(64,n-ic),scratch,cached))return false;
+        }
+        if constexpr(PROFILE)phase.tick(5); // QK includes packed-key copy
+        float inverse[32];
+        if(ocr_fa_fullkv::softmax_pack_mode()){
+            if(!ocr_softmax_pack<PROFILE>(scores,rows,n,padded,Q,high,low,passes,inverse))return false;
+            if constexpr(PROFILE)phase.tick(6); // fused softmax + probability packing
+        }else{
+        for(int row=0;row<rows;++row){
+            auto *p=scores+row*n;
+            const float maximum=rvv_max_f32(p,n);
+            const float sum=rvv_softmax_exp_inplace_f32(p,n,maximum);
+            if(!(sum>0.f)||!std::isfinite(sum))return false;
+            inverse[row]=1.f/sum;
+        }
+        if constexpr(PROFILE)phase.tick(6);
+        if(!ocr_fa_fullkv::pack_p(scores,rows,n,padded,high,low,passes,Q))return false;
+        if constexpr(PROFILE)phase.tick(2); // probability packing
+        }
+        for(int first_row=0;first_row<rows;first_row+=16)for(int channel=0;channel<D;channel+=32){
+            const auto multiply=compact&&channel==64?ocr_fa_fullkv::pv16x8:ocr_fa_fullkv::pv16;
+            multiply(high+first_row*padded,weights+channel*padded,acc_high,padded);
+            if(passes==2)multiply(low+first_row*padded,weights+channel*padded,acc_low,padded);
+            if constexpr(PROFILE)phase.tick(8);
+            const int columns=std::min(32,D-channel);
+            const auto ids=__riscv_vid_v_u32m1(columns);
+            const auto offsets=__riscv_vsll_vx_u32m1(__riscv_vadd_vv_u32m1(
+                __riscv_vsll_vx_u32m1(__riscv_vsrl_vx_u32m1(ids,3,columns),6,columns),
+                __riscv_vand_vx_u32m1(ids,7,columns),columns),2,columns);
+            for(int local_row=0;local_row<std::min(16,rows-first_row);++local_row){
+                const int row=first_row+local_row;
+                const int offset=(local_row/8)*256+(local_row%8)*8;
+                auto value=__riscv_vfmul_vf_f32m1(__riscv_vluxei32_v_f32m1(acc_high+offset,offsets,columns),1.f/1048576.f,columns);
+                if(passes==2)value=__riscv_vfmacc_vf_f32m1(value,1.f/17179869184.f,
+                    __riscv_vluxei32_v_f32m1(acc_low+offset,offsets,columns),columns);
+                value=__riscv_vfmul_vf_f32m1(value,inverse[row],columns);
+                auto *out=reinterpret_cast<float*>(reinterpret_cast<char*>(dst->data)+
+                    (size_t(iq+row)*dst->ne[1]+head)*dst->nb[1])+channel;
+                __riscv_vse32_v_f32m1(out,value,columns);
+            }
+            if constexpr(PROFILE)phase.tick(9);
+        }
+        ir+=rows;
+    }
+    if constexpr(PROFILE)phase.finish();
+    ocr_worker_events::publish(ocr_worker_events::kind::full_kv,
+        {uint64_t(n),uint64_t(Q),uint64_t(passes),uint64_t(all_key_cache),needed,ctx.shared.size});
+    return true;
 }
 
 template<bool PROFILE,bool IME=false>
@@ -1595,6 +1960,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
                                                     int                       ir1) {
+    if constexpr(IME)if(forward_ocr_full_kv<PROFILE>(ctx,dst,ir0,ir1))return;
     ocr_fa_phases_v50::record phase(ctx,dst,"compute");
     if constexpr(PROFILE)phase.begin();
     const ggml_tensor * q     = dst->src[0];
@@ -1640,15 +2006,18 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
     GGML_ASSERT(k->type == v->type);
     const ggml_type kv_type = k->type;
+    // Lean full-KV preparation deliberately leaves the legacy buffers
+    // unwritten. Any full-KV failure must rebuild K/V from original tensors
+    // locally, including zeroed tails, rather than read stale shared bytes.
     const bool packed_kv=ocr_fa_pack_v40::eligible(dst);
-    const bool lazy_init=packed_kv&&ocr_fa_pack_v40::lazy_init();
-    const int direct_kv=packed_kv?ocr_fa_pack_v40::direct_v44():0;
-    if(direct_kv){static std::atomic<bool>announced{false};
-        if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-direct-v44: active mode=%d shared DDR packed K/V\n",direct_kv);}
+    const bool legacy_packed_kv=packed_kv&&
+        !(ocr_fa_fullkv::lean_prepare_enabled()&&ocr_fa_pack_v40::full_kv(dst)&&ocr_fa_fullkv::direct_pack_enabled());
+    const bool lazy_init=legacy_packed_kv&&ocr_fa_pack_v40::lazy_init();
+    const int direct_kv=legacy_packed_kv?ocr_fa_pack_v40::direct_v44():0;
+    if(direct_kv&&ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::direct,{uint64_t(direct_kv)});
 
     if(lazy_init){
-        static std::atomic<bool> announced{false};
-        if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-lazy-v43: active full overwrite K / bounded active V; tail packing still initialized\n");
+        if(ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::lazy);
     }
 
     // broadcast factors
@@ -1800,7 +2169,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
             if constexpr(PROFILE)phase.tick(3); // mask preparation / tile bookkeeping
             if (kv_type == GGML_TYPE_F16) {
-                if(packed_kv){
+                if(legacy_packed_kv){
                     const size_t tile=size_t(ik2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
                     if(direct_kv&1)K_f16=ocr_fa_pack_v40::keys(ctx)+tile*DK*KV_TILE_SZ;
                     else std::memcpy(K_f16,ocr_fa_pack_v40::keys(ctx)+tile*DK*KV_TILE_SZ,DK*KV_TILE_SZ*sizeof(_Float16));
@@ -1819,11 +2188,10 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                     }
                 }
                 if(tq==0&&ocr_fa_x8_enabled()&&DK==72&&DV==72){
-                    static std::atomic<bool> announced{false};
-                    if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-x8-v39: active D72 eight-query K/V reuse mask=%d\n",int(mask!=nullptr));
+                    if(ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::x8,{uint64_t(mask!=nullptr)});
                     if(packed_kv&&ocr_fa_group_v45::mode()){
-                        static std::atomic<bool>announced{false};
-                        if(ctx.ith==0&&!announced.exchange(true))GGML_LOG_INFO("ocr-fa-group-v45: active qk=%d pv=%d\n",ocr_fa_group_v45::qk_group(),ocr_fa_group_v45::pv_group());
+                        if(ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::group,
+                            {uint64_t(ocr_fa_group_v45::qk_group()),uint64_t(ocr_fa_group_v45::pv_group())});
                         const int group=ocr_fa_group_v45::qk_group();
                         if(group>8)for(;tq+group<=tile_rows;tq+=group){
                             int active=0;for(int i=0;i<group;++i)active=std::max(active,active_kv[tq+i]);
@@ -1912,7 +2280,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
             // Pack V as contiguous [KV_TILE_SZ][DV].
             if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                if(packed_kv){
+                if(legacy_packed_kv){
                     const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
                     if(direct_kv&2)V_f16=ocr_fa_pack_v40::values(ctx,dst)+tile*DV*KV_TILE_SZ;
                     else std::memcpy(V_f16,ocr_fa_pack_v40::values(ctx,dst)+tile*DV*KV_TILE_SZ,max_active_kv*DV*sizeof(_Float16));
@@ -1920,6 +2288,20 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
 
                 if constexpr(PROFILE)phase.tick(7); // V copy or direct pointer
                 int tq = 0;
+                if constexpr(IME) {
+                    if (use_ime && ocr_fa_pack_v40::ime_pv(dst) && mask == nullptr &&
+                        ctx.shared.size >= base_size + ocr_qk_ime2_v53::scratch_bytes + ocr_pv_ime2::scratch_bytes) {
+                        void * pv_scratch = reinterpret_cast<char *>(base) + base_size + ocr_qk_ime2_v53::scratch_bytes;
+                        const size_t tile=size_t(iv2)*ocr_fa_pack_v40::tiles(dst)+ic/KV_TILE_SZ;
+                        const auto * packed_v=ocr_fa_pack_v40::ime_value_tile(ctx,dst,tile);
+                        if (packed_v[96*72]!=(_Float16)0 &&
+                            ocr_pv_ime2::forward(VKQ32, KQ, V_f16, tile_rows, max_active_kv,
+                                                KV_TILE_SZ, pv_scratch, ocr_pv_ime2::mode(), packed_v)) {
+                            tq = tile_rows;
+                            ocr_worker_events::publish(ocr_worker_events::kind::pv,{uint64_t(ocr_pv_ime2::mode())});
+                        }
+                    }
+                }
                 if(ocr_fa_x8_enabled()&&DK==72&&DV==72){
                     if(packed_kv&&ocr_fa_group_v45::pv_group()>8){
                         const int group=ocr_fa_group_v45::pv_group();
@@ -4191,6 +4573,27 @@ void forward_cpy_f32_row_strided(ggml::spacemit::context & ctx, ggml_tensor * op
     }
 }
 
+// Permuting K/V changes only the outer strides. Convert each D72 row on AI
+// workers, preserving ordinary FP16 rounding and the original tensor layout.
+void forward_cpy_f32_to_f16_strided(ggml::spacemit::context &ctx,ggml_tensor*op){
+    const auto*x=op->src[0];
+    GGML_ASSERT(x&&x->type==GGML_TYPE_F32&&op->type==GGML_TYPE_F16&&
+        x->nb[0]==4&&ggml_is_contiguous(op)&&ggml_are_same_shape(x,op));
+    const int64_t width=x->ne[0],rows=ggml_nrows(x);
+    auto*out=static_cast<_Float16*>(op->data);
+    for(int64_t row=ctx.ith;row<rows;row+=ctx.nth){
+        const int64_t j=row%x->ne[1],q=row/x->ne[1];
+        const auto*in=reinterpret_cast<const float*>(static_cast<const char*>(x->data)+
+            j*x->nb[1]+(q%x->ne[2])*x->nb[2]+(q/x->ne[2])*x->nb[3]);
+        for(int64_t c=0;c<width;){
+            const size_t vl=__riscv_vsetvl_e32m4(width-c);
+            __riscv_vse16_v_f16m2(out+row*width+c,
+                __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(in+c,vl),vl),vl);
+            c+=vl;
+        }
+    }
+}
+
 void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
@@ -4318,6 +4721,99 @@ void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
                 __riscv_vfmul_vv_f32m2(x, __riscv_vfadd_vf_f32m2(th, 1.0f, vl), vl), 0.5f, vl);
         __riscv_vse32_v_f32m2(dst_ptr + i, out, vl);
         i += vl;
+    }
+}
+
+void forward_gelu_f32_tile(float *data,size_t elements) {
+    static constexpr float GELU_ALPHA = 0.7978845608f;
+    static constexpr float GELU_BETA  = 0.044715f;
+
+    size_t i = 0;
+    while (i < elements) {
+        const size_t vl = __riscv_vsetvl_e32m2(elements - i);
+
+        vfloat32m2_t x     = __riscv_vle32_v_f32m2(data + i, vl);
+        vfloat32m2_t x2    = __riscv_vfmul_vv_f32m2(x, x, vl);
+        vfloat32m2_t inner = __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(1.0f, vl), GELU_BETA, x2, vl);
+        inner              = __riscv_vfmul_vf_f32m2(__riscv_vfmul_vv_f32m2(x, inner, vl), GELU_ALPHA, vl);
+        vfloat32m2_t th    = rvv_tanh_approx_f32m2(inner, vl);
+        vfloat32m2_t out   = __riscv_vfmul_vf_f32m2(
+                __riscv_vfmul_vv_f32m2(x, __riscv_vfadd_vf_f32m2(th, 1.0f, vl), vl), 0.5f, vl);
+        __riscv_vse32_v_f32m2(data + i, out, vl);
+        i += vl;
+    }
+}
+
+bool forward_add_gelu_f32(ggml::spacemit::context & ctx, const ggml_tensor * add, ggml_tensor * gelu) {
+    const ggml_tensor * src0 = add->src[0];
+    const ggml_tensor * src1 = add->src[1];
+    ggml_tensor *       dst  = gelu;
+
+    const bool scalar_bias = src1 && ggml_nelements(src1) == 1;
+    const bool row_bias = src0 && src1 && src1->ne[0] == src0->ne[0] &&
+                          src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
+    if (!src0 || !src1 || add->op != GGML_OP_ADD || dst->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(dst) != GGML_UNARY_OP_GELU || src0->type != GGML_TYPE_F32 ||
+        src1->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        dst->src[0] != add || !ggml_are_same_shape(src0, add) || !ggml_are_same_shape(add, dst) ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+        !ggml_can_repeat(src1, src0) || (!scalar_bias && !row_bias)) {
+        return false;
+    }
+
+    const int64_t ne0  = src0->ne[0];
+    const int64_t rows = ggml_nrows(src0);
+    const int64_t dr   = (rows + ctx.nth - 1) / ctx.nth;
+    const int64_t r0   = dr * ctx.ith;
+    const int64_t r1   = MIN(r0 + dr, rows);
+
+    const float * x_base = (const float *) src0->data;
+    const float * b_base = (const float *) src1->data;
+    float *       y_base = (float *) dst->data;
+
+    static constexpr float GELU_ALPHA = 0.7978845608f;
+    static constexpr float GELU_BETA  = 0.044715f;
+
+    for (int64_t row = r0; row < r1; ++row) {
+        const float * x = x_base + row * ne0;
+        float *       y = y_base + row * ne0;
+        int64_t       i = 0;
+        while (i < ne0) {
+            const size_t vl = __riscv_vsetvl_e32m2(ne0 - i);
+            const vfloat32m2_t lhs = __riscv_vle32_v_f32m2(x + i, vl);
+            vfloat32m2_t sum;
+            if (scalar_bias) {
+                sum = __riscv_vfadd_vf_f32m2(lhs, b_base[0], vl);
+            } else {
+                const vfloat32m2_t rhs = __riscv_vle32_v_f32m2(b_base + i, vl);
+                sum = __riscv_vfadd_vv_f32m2(lhs, rhs, vl);
+            }
+
+            const vfloat32m2_t x2 = __riscv_vfmul_vv_f32m2(sum, sum, vl);
+            vfloat32m2_t inner = __riscv_vfmacc_vf_f32m2(
+                __riscv_vfmv_v_f_f32m2(1.0f, vl), GELU_BETA, x2, vl);
+            inner = __riscv_vfmul_vf_f32m2(__riscv_vfmul_vv_f32m2(sum, inner, vl), GELU_ALPHA, vl);
+            const vfloat32m2_t th = rvv_tanh_approx_f32m2(inner, vl);
+            const vfloat32m2_t out = __riscv_vfmul_vf_f32m2(
+                __riscv_vfmul_vv_f32m2(sum, __riscv_vfadd_vf_f32m2(th, 1.0f, vl), vl), 0.5f, vl);
+            __riscv_vse32_v_f32m2(y + i, out, vl);
+            i += vl;
+        }
+    }
+    return true;
+}
+
+void forward_add_bias_f32_tile(float * dst, const float * bias, int64_t rows, int64_t cols, int64_t row_stride) {
+    GGML_ASSERT(dst != nullptr && bias != nullptr && rows >= 0 && cols >= 0 && row_stride >= cols);
+    for (int64_t row = 0; row < rows; ++row) {
+        int64_t col = 0;
+        while (col < cols) {
+            const size_t vl = __riscv_vsetvl_e32m4(cols - col);
+            const vfloat32m4_t x = __riscv_vle32_v_f32m4(dst + row * row_stride + col, vl);
+            const vfloat32m4_t b = __riscv_vle32_v_f32m4(bias + col, vl);
+            __riscv_vse32_v_f32m4(dst + row * row_stride + col, __riscv_vfadd_vv_f32m4(x, b, vl), vl);
+            col += vl;
+        }
     }
 }
 

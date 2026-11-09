@@ -2208,6 +2208,19 @@ struct clip_model_loader {
     }
 
     void load_tensors(clip_ctx & ctx_clip) {
+        // Host-only opt-in diagnostics: preserve the last completed loading
+        // stage even when startup never reaches the normal model-ready log.
+        const char * load_trace_env = std::getenv("MTMD_MODEL_LOAD_TRACE");
+        const bool load_trace = load_trace_env && std::strcmp(load_trace_env, "1") == 0;
+        auto trace_load = [&](const char * stage, const ggml_tensor * tensor = nullptr) {
+            if (!load_trace) {
+                return;
+            }
+            std::fprintf(stderr, "mtmd-load: stage=%s tensor=%s bytes=%zu\n", stage,
+                         tensor ? tensor->name : "-", tensor ? ggml_nbytes(tensor) : size_t(0));
+            std::fflush(stderr);
+        };
+        trace_load("begin");
         auto & model = ctx_clip.model;
         auto & hparams = model.hparams;
         std::map<std::string, size_t> tensor_offset;
@@ -3744,7 +3757,12 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+            trace_load("allocate-begin");
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            if (!ctx_clip.buf) {
+                throw std::runtime_error(string_format("%s: failed to allocate tensor buffers\n", __func__));
+            }
+            trace_load("allocate-end");
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!ctx_clip.no_alloc) {
@@ -3752,6 +3770,7 @@ struct clip_model_loader {
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
+                    trace_load("tensor-begin", cur);
                     auto it_off = tensor_offset.find(t->name);
                     GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
                     const size_t offset = it_off->second;
@@ -3769,6 +3788,7 @@ struct clip_model_loader {
                         fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
                     }
+                    trace_load("tensor-end", cur);
                     data_loaded += num_bytes;
                     if (progress_callback && total_data_size > 0) {
                         const float progress = (float)data_loaded / (float)total_data_size;
@@ -3783,7 +3803,7 @@ struct clip_model_loader {
             }
             fin.close();
         }
-
+        trace_load("end");
     }
 
     struct support_info_op {

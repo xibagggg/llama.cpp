@@ -1,8 +1,13 @@
 #pragma once
+#include "ocr-qk-pipeline.h"
 // Experimental D72 QK matrix product. Inputs are still FP16. Scaling K by
 // 2^10 preserves its FP16 subnormals on IME2; undo scaling in FP32 afterward.
 namespace ocr_qk_ime2_v53 {
 constexpr int D=72;
+inline bool scatter_enabled(){
+ static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_QK_SCATTER");
+  return p&&!std::strcmp(p,"1");}();return on;
+}
 constexpr size_t scratch_bytes=64*D*2+64*D*2+512*4;
 static bool scaled_copy(const _Float16*src,_Float16*dst,ptrdiff_t stride){
  const auto h=__riscv_vlse16_v_f16m1(src,stride,8);
@@ -91,16 +96,36 @@ __attribute__((noinline)) static void core16(const _Float16*x,const _Float16*w,f
  :[x]"+&r"(x),[x1]"+&r"(x1),[w]"+&r"(w),[w1]"+&r"(w1),[w2]"+&r"(w2),[w3]"+&r"(w3),[blocks]"+&r"(blocks)
  :[c]"r"(c):"t0","v2","v3","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory");
 }
-static bool qk(float*dst,const _Float16*packed_q,const _Float16*packed_k,int stride,int rows,int count,void*scratch){
- auto*pk=static_cast<_Float16*>(scratch);auto*tmp=reinterpret_cast<float*>(pk+64*D);
- std::memcpy(pk,packed_k,64*D*2);
+static bool qk(float*dst,const _Float16*packed_q,const _Float16*packed_k,int stride,int rows,int count,void*scratch,bool preloaded=false){
+ const auto*pk=preloaded?packed_k:static_cast<_Float16*>(scratch);
+ auto*tmp=preloaded?static_cast<float*>(scratch):reinterpret_cast<float*>(static_cast<_Float16*>(scratch)+64*D);
+ if(!preloaded)std::memcpy(static_cast<_Float16*>(scratch),packed_k,64*D*2);
  for(int q=0;q<rows;q+=16)for(int key=0;key<count;key+=32){
   const int qr=std::min(16,rows-q);
-  if(qr>8)core16(packed_q+q*D,pk+key*D,tmp);
+  if(qr>8){
+   if(ocr_qk_pipeline::enabled())ocr_qk_pipeline::core16(packed_q+q*D,pk+key*D,tmp);
+   else core16(packed_q+q*D,pk+key*D,tmp);
+  }
   else core(packed_q+q*D,pk+key*D,tmp);
   // Each IME2 accumulator is an 8x8 row-major result. Unpack one row
   // with a 32-lane gather, instead of 256 individual scalar loads/stores.
   const int columns=std::min(32,count-key);
+  if(scatter_enabled()&&columns%8==0){
+   // Read whole IME2 8x8 accumulators with unit stride, then scatter each
+   // block into row-major scores. This halves vector operations for a
+   // complete Q16 tile and avoids the old strided accumulator gathers.
+   const auto ids=__riscv_vid_v_u32m2(64);
+   const auto idx=__riscv_vsll_vx_u32m2(__riscv_vadd_vv_u32m2(
+       __riscv_vmul_vx_u32m2(__riscv_vsrl_vx_u32m2(ids,3,64),stride,64),
+       __riscv_vand_vx_u32m2(ids,7,64),64),2,64);
+   for(int r=0;r<qr;r+=8)for(int c=0;c<columns;c+=8){
+    const size_t vl=std::min(8,qr-r)*8;
+    auto values=__riscv_vle32_v_f32m2(tmp+(r/8)*256+(c/8)*64,vl);
+    values=__riscv_vfmul_vf_f32m2(values,1.f/1048576.f,vl);
+    __riscv_vsuxei32_v_f32m2(dst+(q+r)*stride+key+c,idx,values,vl);
+   }
+   continue;
+  }
   const auto ids=__riscv_vid_v_u32m1(columns);
   const auto idx=__riscv_vsll_vx_u32m1(__riscv_vadd_vv_u32m1(
       __riscv_vsll_vx_u32m1(__riscv_vsrl_vx_u32m1(ids,3,columns),6,columns),

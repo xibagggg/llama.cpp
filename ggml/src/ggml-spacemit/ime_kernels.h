@@ -86,6 +86,8 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
 }  // namespace ime1
 
 namespace ime2 {
+size_t gemm_kernel_i8i4_ocr_m8(size_t blk_len,const uint8_t * a,const uint8_t * b,
+                               const uint8_t * zp,float * c,size_t m,size_t n,size_t k_blks,size_t ldc);
 size_t gemm_kernel_i8i2k(size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,
@@ -125,6 +127,20 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
                            size_t          count_n,
                            size_t          k_blks,
                            size_t          ldc);
+
+// Q4_0 HP GEMM with an optional contiguous F32 output-channel bias fused into
+// the final IME2 tile epilogue. Bias is supported only for the no-zero-point
+// path, whose output width is a full 32-column tile.
+size_t gemm_kernel_i8i4_hp_bias(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc,
+                               const float *   bias);
 
 size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
                                const uint8_t ** quant_a_ptr,

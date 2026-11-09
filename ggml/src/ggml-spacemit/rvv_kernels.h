@@ -40,6 +40,10 @@ constexpr size_t q8k_blk_size(size_t blk_len) {
 using quantize_a_row_def = std::function<void(size_t, const float *, size_t, uint8_t *)>;
 
 namespace rvv {
+// Host-only preparation and draining around the graph launch/future.
+void prepare_ocr_worker_state();
+void drain_ocr_worker_events();
+
 void memcpy1d(void * dst, const void * src, int64_t size);
 
 void memcpy2d(void * dst, int64_t dst_stride, const void * src, int64_t src_stride, int64_t tile_rows, int64_t size);
@@ -66,7 +70,9 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
                                                     int                       ir1);
-void prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op);
+// Returns true only when the collective K/V pack completed its grid barrier.
+bool prepare_ocr_fa_kv_v40(ggml::spacemit::context &ctx,ggml_tensor *op);
+void cast_pack_ocr_kv(ggml::spacemit::context &ctx,ggml_tensor *attention);
 
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
@@ -89,6 +95,11 @@ bool forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
 bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
 // RMS_NORM followed by MUL with a weight row, written to the MUL's dst
 void forward_rms_norm_mul_f32(ggml::spacemit::context & ctx, const ggml_tensor * rms, ggml_tensor * mul);
+// Continuous F32 ADD followed by GELU, with scalar/row bias, written to GELU dst.
+void forward_gelu_f32_tile(float *data,size_t elements);
+bool forward_add_gelu_f32(ggml::spacemit::context & ctx, const ggml_tensor * add, ggml_tensor * gelu);
+// Add a contiguous F32 output-channel bias to a just-computed row-major GEMM tile.
+void forward_add_bias_f32_tile(float * dst, const float * bias, int64_t rows, int64_t cols, int64_t row_stride);
 
 template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op);
 
@@ -97,6 +108,7 @@ void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 // F32 -> F32 with contiguous rows (nb[0] == sizeof(float)) but arbitrary outer strides on both sides;
 // used by the GDN rollback-snapshot copies into the row-strided cache_s views
 void forward_cpy_f32_row_strided(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_cpy_f32_to_f16_strided(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_cpy_f16_to_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
