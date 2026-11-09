@@ -281,11 +281,14 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         std::memset(base,0xa5,128);std::memset(temp+temp_elements,0xa5,128);auto*out=static_cast<float*>((dst?dst:op)->data);
         for(int nb=ctx.ith;nb<tiles;nb+=simultaneous*ctx.nth){
             const int batch=std::min(simultaneous,(tiles-1-nb)/int(ctx.nth)+1);
-            ctx.mark_subphase(200 + uint64_t(nb) * 16); // weight panel copy
             for(int t=0;t<batch;++t){
-                std::memcpy(sw+size_t(t)*32*K,weights+size_t(nb+t*ctx.nth)*32*K,32*K);
-                ctx.mark_subphase(201 + uint64_t(nb) * 16); // panel permutation
-                if(prepack())prepack_panel(sw+size_t(t)*32*K,K);
+                const uint64_t tile = nb + t * ctx.nth;
+                ctx.mark_subphase(200 + tile * 16); // this panel's weight copy
+                std::memcpy(sw+size_t(t)*32*K,weights+size_t(tile)*32*K,32*K);
+                if(prepack()) {
+                    ctx.mark_subphase(201 + tile * 16); // this panel's permutation
+                    prepack_panel(sw+size_t(t)*32*K,K);
+                }
             }
             for(int g=0;g<MP/4;){const int count=m8&&g+1<MP/4?8:4;
                 ctx.mark_subphase(0x100000000ull | (uint64_t(nb)<<24) | (uint64_t(g)<<4));
