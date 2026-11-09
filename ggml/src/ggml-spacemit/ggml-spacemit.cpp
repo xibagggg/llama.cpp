@@ -18,6 +18,7 @@
 #include "ggml-common.h"
 #include "ggml-impl.h"
 #include "ggml-spacemit.h"
+#include "ocr-ai-complete.h"
 
 #include "spacemit-session.h"
 #include "spacemit-kernels.h"
@@ -611,6 +612,8 @@ static void * ggml_backend_spacemit_buffer_get_base(ggml_backend_buffer_t buffer
 
 static enum ggml_status ggml_backend_spacemit_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                                                    ggml_tensor *         tensor) {
+    // Embedding lookup needs the original row-addressable quantized layout.
+    if (tensor->flags & GGML_TENSOR_FLAG_NO_REPACK) { tensor->extra = nullptr; return GGML_STATUS_SUCCESS; }
     tensor->extra =
         (void *) const_cast<ggml::spacemit::tensor_traits_base *>(ggml_spacemit_get_optimal_repack_type(tensor));
 
@@ -829,7 +832,18 @@ static void ggml_spacemit_trace_op_output(FILE * file, uint64_t sequence, uint64
                  ggml_nbytes(tensor), static_cast<unsigned long long>(hash));
 }
 
+static std::mutex g_spacemit_execution_mutex;
+
+void ggml_backend_spacemit_acquire(void) {
+    g_spacemit_execution_mutex.lock();
+}
+
+void ggml_backend_spacemit_release(void) {
+    g_spacemit_execution_mutex.unlock();
+}
+
 static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    std::lock_guard<std::mutex> execution_lock(g_spacemit_execution_mutex);
     auto sess = static_cast<spacemit_session *>(backend->context);
     // Serialize hardware use across backend handles. Streams are graph-scoped
     // by default; the opt-in persistent mode retains its CC grant per session.
@@ -994,6 +1008,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
          attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
          op_progress, progress_sequence](spert::Context * runtime) {
             const uint32_t ith = runtime->program_id(0);
+            if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
+                throw std::runtime_error("inference worker is outside AI cores 8-15");
             ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
             const bool use_ddr = scratch_mode == ggml::spacemit::scratch_mode::locked_ddr;
             ggml::spacemit::tcm_lease lease(*runtime, shared_mem_size,
@@ -1200,6 +1216,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
 
+    if (ocr_ai_complete::supported(op)) return true;
     bool supp = false;
     switch (op->op) {
         case GGML_OP_NONE:

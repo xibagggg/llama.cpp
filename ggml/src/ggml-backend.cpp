@@ -599,6 +599,26 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 }
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    const char * required = getenv("GGML_SCHED_REQUIRE_BACKEND");
+    const char * audit = getenv("GGML_SCHED_AUDIT_PATH");
+    int compute_nodes = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const auto * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
+        ++compute_nodes;
+        if (required && strcmp(required, ggml_backend_name(backend))) {
+            GGML_LOG_ERROR("strict inference placement rejected: backend=%s op=%s tensor=%s\n",
+                ggml_backend_name(backend), ggml_op_desc(node), node->name);
+            return GGML_STATUS_FAILED;
+        }
+    }
+    if (audit && compute_nodes) {
+        FILE * f = fopen(audit, "a");
+        if (!f) return GGML_STATUS_FAILED;
+        fprintf(f, "{\"backend\":\"%s\",\"compute_nodes\":%d}\n", ggml_backend_name(backend), compute_nodes);
+        fclose(f);
+    }
     GGML_ASSERT(backend);
     return backend->iface.graph_compute(backend, cgraph);
 }

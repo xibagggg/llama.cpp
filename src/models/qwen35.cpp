@@ -38,6 +38,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const int mtp_flags   = nf.mtp;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    tok_embd->flags |= GGML_TENSOR_FLAG_NO_REPACK;
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);

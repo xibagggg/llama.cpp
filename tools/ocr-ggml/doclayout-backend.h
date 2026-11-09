@@ -54,14 +54,14 @@ public:
         for(const auto & item:descriptors) {
             const std::string name=item.at("id");
             auto * source=ggml_get_tensor(original,name.c_str());require(source,"missing source weight: "+name);
-            const bool offload=accelerator && (source->type==GGML_TYPE_Q4_0||source->type==GGML_TYPE_Q8_0);
+            const bool offload=accelerator != nullptr;
             auto * target=ggml_dup_tensor(offload?accelerator_context:pending_host_context,source);
             require(target,"weight metadata allocation failed");ggml_set_name(target,name.c_str());
-            imported.emplace(name,target);if(offload)accelerated_weights.insert(target);
+            imported.emplace(name,target);if(offload && ggml_is_quantized(source->type))accelerated_weights.insert(target);
         }
         host_weights_buffer=ggml_backend_alloc_ctx_tensors(pending_host_context,cpu);
-        require(host_weights_buffer,"host weight allocation failed");
-        ggml_backend_buffer_set_usage(host_weights_buffer,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        require(host_weights_buffer || accelerator,"host weight allocation failed");
+        if(host_weights_buffer)ggml_backend_buffer_set_usage(host_weights_buffer,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         if(accelerator) {
             require(!accelerated_weights.empty(),"SpacemiT layout requires a packed Q4/Q8 convolution model");
             accelerator_weights_buffer=ggml_backend_alloc_ctx_tensors(accelerator_context,accelerator);
@@ -97,7 +97,8 @@ public:
             for(int s=0;s<GGML_MAX_SRC;++s) {
                 auto * t=out->src[s];if(!t||!t->data||t->buffer||t->view_src)continue;
                 auto * original=t->data;
-                auto * buffer=ggml_backend_alloc_buffer(cpu,ggml_nbytes(t)+ggml_backend_get_alignment(cpu));
+                auto * leaf_backend=accelerator?accelerator:cpu;
+                auto * buffer=ggml_backend_alloc_buffer(leaf_backend,ggml_nbytes(t)+ggml_backend_get_alignment(leaf_backend));
                 require(buffer,"external leaf allocation failed");external_buffers.push_back(buffer);
                 auto allocator=ggml_tallocr_new(buffer);t->data=nullptr;
                 require(ggml_tallocr_alloc(&allocator,t)==GGML_STATUS_SUCCESS,"external leaf binding failed");
@@ -108,32 +109,32 @@ public:
         ggml_backend_t backends[]={accelerator,cpu};
         scheduler=ggml_backend_sched_new(accelerator?backends:backends+1,nullptr,accelerator?2:1,20000,false,false);
         require(scheduler,"layout scheduler initialization failed");
-        ggml_backend_sched_set_tensor_backend(scheduler,input,cpu);
+        ggml_backend_sched_set_tensor_backend(scheduler,input,accelerator?accelerator:cpu);
         for(int i=0;i<ggml_graph_n_nodes(graph);++i) {
             auto * out=ggml_graph_node(graph,i);
             if(out->op==GGML_OP_NONE||out->op==GGML_OP_VIEW||out->op==GGML_OP_RESHAPE||
                out->op==GGML_OP_PERMUTE||out->op==GGML_OP_TRANSPOSE)continue;
             const bool matrix=accelerator && out->op==GGML_OP_MUL_MAT && accelerated_weights.count(out->src[0]);
-            const bool im2col=im2cols.count(out)!=0;
-            const bool offload=matrix||im2col;
+            const bool im2col=accelerator && out->op==GGML_OP_IM2COL;
+            const bool offload=accelerator != nullptr;
             auto * selected=offload?accelerator:cpu;
             // supports_op in SpacemiT rejects foreign allocated buffers. The
             // scheduler will copy these inputs; query its post-copy layout.
             auto candidate=*out;ggml_tensor sources[GGML_MAX_SRC];
-            if(im2col) {
+            if(offload) {
                 candidate.buffer=nullptr;candidate.view_src=nullptr;
                 for(int s=0;s<GGML_MAX_SRC;++s)if(out->src[s]) {
                     sources[s]=*out->src[s];sources[s].buffer=nullptr;sources[s].view_src=nullptr;
                     candidate.src[s]=&sources[s];
                 }
             }
-            require(ggml_backend_supports_op(selected,im2col?&candidate:out),std::string("layout backend cannot execute ")+ggml_op_name(out->op));
+            require(ggml_backend_supports_op(selected,offload?&candidate:out),std::string("layout backend cannot execute ")+ggml_op_name(out->op));
             ggml_backend_sched_set_tensor_backend(scheduler,out,selected);
             if(matrix)++accelerated_matrices;
             else if(im2col) {
                 ++accelerated_im2cols;offloaded_im2col_image_bytes+=ggml_nbytes(out->src[1]);
                 offloaded_im2col_patch_bytes+=ggml_nbytes(out);
-            }else ++cpu_nodes;
+            }else if(!offload) ++cpu_nodes;
         }
         require(!accelerator||accelerated_matrices>0,"no layout matrices assigned to SpacemiT");
         require(ggml_backend_sched_alloc_graph(scheduler,graph),"layout scheduler allocation failed");
@@ -163,6 +164,6 @@ public:
                 {"cpu_compute_buffer_bytes",scheduler?ggml_backend_sched_get_buffer_size(scheduler,cpu):0},
                 {"accelerator_compute_buffer_bytes",scheduler&&accelerator?ggml_backend_sched_get_buffer_size(scheduler,accelerator):0},
                 {"graph_splits",scheduler?ggml_backend_sched_get_n_splits(scheduler):0},
-                {"hardware_execution_validated",false}};
+                {"strict_ai_inference",accelerator!=nullptr},{"hardware_execution_validated",compute_calls>0&&cpu_nodes==0&&accelerator!=nullptr}};
     }
 };

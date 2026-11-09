@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
+option(OCR_SPACEMIT_EP "Enable in-process EP layout and vision for OCR" OFF)
 include(CheckIncludeFileCXX)
 
 ### llama.cpp version

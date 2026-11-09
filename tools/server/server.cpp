@@ -1,4 +1,10 @@
 #include "server-context.h"
+#if defined(OCR_SPACEMIT_EP)
+#include "ocr-ep.h"
+#include <cstring>
+#include <cstdlib>
+#include <unistd.h>
+#endif
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -350,6 +356,44 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
 
+#if defined(OCR_SPACEMIT_EP)
+    if (!is_router_server) {
+        ctx_http.post("/v1/ocr/layout", ex_wrapper([](const server_http_req & request) -> server_http_res_ptr {
+            constexpr size_t count = 3 * 800 * 800;
+            if (request.body.size() != count * sizeof(float)) {
+                throw std::invalid_argument("Layout body must be float32 NCHW, shape 1x3x800x800");
+            }
+            if (request.should_stop()) {
+                throw std::runtime_error("Layout request cancelled before inference");
+            }
+            // std::string does not promise float alignment.
+            std::vector<float> pixels(count);
+            std::memcpy(pixels.data(), request.body.data(), request.body.size());
+            double seconds = 0;
+            const auto tensors = ocr_ep_layout(pixels.data(), pixels.size(), seconds);
+            const char * strict = std::getenv("OCR_EP_STRICT");
+            json header = {{"version", 1}, {"pid", getpid()}, {"inference_s", seconds},
+                {"strict_ai", !strict || std::strcmp(strict, "0") != 0}, {"tensors", json::array()}};
+            size_t offset = 0;
+            for (const auto & tensor : tensors) {
+                header["tensors"].push_back({{"name", tensor.name}, {"dtype", tensor.dtype},
+                    {"shape", tensor.shape}, {"offset", offset}, {"bytes", tensor.data.size()}});
+                offset += tensor.data.size();
+            }
+            auto response = std::make_unique<server_http_res>();
+            response->content_type = "application/octet-stream";
+            const auto metadata = header.dump();
+            const uint32_t bytes = metadata.size();
+            response->data.reserve(sizeof(bytes) + bytes + offset);
+            response->data.append(reinterpret_cast<const char *>(&bytes), sizeof(bytes));
+            response->data.append(metadata);
+            for (const auto & tensor : tensors) {
+                response->data.append(reinterpret_cast<const char *>(tensor.data.data()), tensor.data.size());
+            }
+            return response;
+        }));
+    }
+#endif
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));

@@ -11,6 +11,9 @@ if (MTMD_VIDEO AND NOT LLAMA_SUBPROCESS)
 endif()
 
 find_package(Threads REQUIRED)
+if (OCR_SPACEMIT_EP)
+    add_subdirectory(../ocr-ep ${CMAKE_CURRENT_BINARY_DIR}/ocr-ep)
+endif()
 
 add_library(mtmd
             mtmd.cpp
@@ -82,6 +85,10 @@ set_target_properties(mtmd PROPERTIES
 )
 
 target_link_libraries     (mtmd PUBLIC ggml llama)
+if (OCR_SPACEMIT_EP)
+    target_link_libraries(mtmd PRIVATE ocr-ep)
+    target_compile_definitions(mtmd PRIVATE OCR_SPACEMIT_EP)
+endif()
 target_link_libraries     (mtmd PRIVATE Threads::Threads vendor::hash vendor::miniaudio vendor::stb vendor::sheredom)
 target_include_directories(mtmd PUBLIC  .)
 target_compile_features   (mtmd PRIVATE cxx_std_17)

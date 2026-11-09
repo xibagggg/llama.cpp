@@ -1371,7 +1371,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
         ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
-        if (t) {
+        if (t && !(t->flags & GGML_TENSOR_FLAG_NO_REPACK)) {
             return t;
         }
     }

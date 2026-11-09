@@ -1,4 +1,7 @@
 #include "clip.h"
+#if defined(OCR_SPACEMIT_EP)
+#include "ocr-ep.h"
+#endif
 #include "clip-impl.h"
 #include "clip-model.h"
 #include "clip-graph.h"
@@ -3859,6 +3862,13 @@ struct clip_model_loader {
     }
 
     static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+#if defined(OCR_SPACEMIT_EP)
+        if (ctx_clip.model.proj_type == PROJECTOR_TYPE_MINICPM_OCR_1_0 && ocr_ep_vision_enabled()) {
+            ctx_clip.is_allocated = true;
+            LOG_INF("%s: in-process EP vision selected; no GGML vision compute buffers reserved\n", __func__);
+            return;
+        }
+#endif
         support_info_graph info;
 
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
@@ -4612,6 +4622,25 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
+#if defined(OCR_SPACEMIT_EP)
+    if (ctx->model.proj_type == PROJECTOR_TYPE_MINICPM_OCR_1_0 && ocr_ep_vision_enabled()) {
+        try {
+            if (clip_n_mmproj_embd(ctx) != 1024 || imgs.entries.empty()) {
+                throw std::runtime_error("EP vision requires MiniCPM OCR 1024-dimensional features");
+            }
+            params->out_embd->clear();
+            std::vector<float> features;
+            for (const auto & image : imgs.entries) {
+                ocr_ep_encode_hwc(image.get_ro_buf().data(), image.nx(), image.ny(), features);
+                params->out_embd->insert(params->out_embd->end(), features.begin(), features.end());
+            }
+            return true;
+        } catch (const std::exception & error) {
+            LOG_ERR("%s: EP vision failed: %s\n", __func__, error.what());
+            return false;
+        }
+    }
+#endif
     int n_batch_cur = imgs.entries.size();
 
     // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames

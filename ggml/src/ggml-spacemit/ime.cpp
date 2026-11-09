@@ -6,6 +6,7 @@
 #include "ocr-down-diagnostic-v36.h"
 #include "ocr-fa-pack-v40.h"
 #include "ocr-im2col-f32.h"
+#include "ocr-ai-complete.h"
 #include "ocr-im2col-pack.h"
 #include "ocr-norm-affine-rvv.h"
 #include "ocr-fa-schedule.h"
@@ -1289,6 +1290,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
     }
 
     bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
+        if (ocr_ai_complete::forward(op, ctx.ith, ctx.nth)) return true;
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 if (op->src[0]->type == GGML_TYPE_F16 &&
@@ -2103,6 +2105,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
     }
 
     const auto * common = &ggml::cpu::riscv64_spacemit::rvv_impl;
+    if (ocr_ai_complete::supported(op)) return common;
     switch (op->op) {
         case GGML_OP_IM2COL:
             if(ocr_im2col_f32::supported(op))return common;
