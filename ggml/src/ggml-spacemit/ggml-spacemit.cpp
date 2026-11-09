@@ -214,7 +214,7 @@ static spacemit_op_code op_remap_to_spacemit(const ggml_tensor * t) {
 //
 // try_fuse_node contains ALL fusion matching and emission: Pattern 3 consumes
 // two nodes at different positions (the concat now, the ssm_conv when the loop
-// reaches it éˆ¥?opnode list order is execution order, so the halves keep their
+// reaches it â€?opnode list order is execution order, so the halves keep their
 // original node positions); `emitted` carries the pairing across the gap.
 
 // RMS_NORM followed by MUL (rms, weight) that can run as one fused RVV kernel.
@@ -425,7 +425,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
     }
 
     // Second half of Pattern 3, arriving here: an ssm_conv paired with an earlier concat.
-    // Emitted at its own position éˆ¥?opnode list order is execution order, and the graph
+    // Emitted at its own position â€?opnode list order is execution order, and the graph
     // allocator planned the ssm_conv output buffer on the original node order (see Pattern 3).
     if (emitted.count(n)) {
         nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_CONCAT);
@@ -575,7 +575,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
             cat.kernel_params[0] = (int32_t) col0;
             nodes.push_back(std::move(cat));
             // the ssm_conv half is emitted by try_fuse_node when the loop reaches its own
-            // node position (see the top of this function) éˆ¥?never here at the concat position
+            // node position (see the top of this function) â€?never here at the concat position
             emitted.insert(ssm);
             return true;
         }
@@ -1005,6 +1005,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared,
                       attention_work_queue, !use_ddr && shared_mem_size > 0 &&
                           scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+
+            ctx.diagnostic_subphase = op_progress ? &op_progress->lanes[ith].subphase : nullptr;
 
             size_t node_index = 0;
             for (const auto & node : opnodes) {

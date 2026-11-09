@@ -18,7 +18,7 @@
 namespace ocr_op_progress {
 struct alignas(128) lane {
     std::atomic<uint64_t> sequence{0},index{0},phase{0},op{0},tensor{0};
-    std::atomic<uint64_t> version{0};
+    std::atomic<uint64_t> version{0}, subphase{0};
 };
 struct storage { lane lanes[8]; };
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "worker telemetry must be lock free");
@@ -93,6 +93,7 @@ inline void record(storage * p,unsigned worker,uint64_t sequence,unsigned index,
     if(!p||worker>=8)return;
     auto & l=p->lanes[worker];
     l.version.fetch_add(1,std::memory_order_acq_rel);
+    l.subphase.store(0,std::memory_order_relaxed);
     l.sequence.store(sequence,std::memory_order_relaxed);
     l.index.store(index,std::memory_order_relaxed);
     l.op.store(op?uint64_t(op->op):0,std::memory_order_relaxed);

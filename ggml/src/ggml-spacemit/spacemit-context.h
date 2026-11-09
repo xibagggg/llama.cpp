@@ -23,6 +23,7 @@ struct context {
     size_t                  workspace_size = 0;
     spert::SharedBufferView shared        = {};
     bool                    check_tcm_view = false;
+    std::atomic<uint64_t> * diagnostic_subphase = nullptr;
     std::atomic<int64_t> * work_queue     = nullptr;
 
     // Valid only across adjacent PC8 nodes inside one graph launch. The graph
@@ -44,6 +45,7 @@ struct context {
         workspace_size = workspace_size_in;
         shared         = shared_in;
         check_tcm_view = check_tcm_view_in;
+        diagnostic_subphase = nullptr;
         work_queue     = work_queue_in;
     }
 
@@ -57,7 +59,12 @@ struct context {
         workspace_size = 0;
         shared         = {};
         check_tcm_view = false;
+        diagnostic_subphase = nullptr;
         work_queue     = nullptr;
+    }
+
+    void mark_subphase(uint64_t value) {
+        if (diagnostic_subphase) diagnostic_subphase->store(value, std::memory_order_release);
     }
 
     spert::Status sync() {

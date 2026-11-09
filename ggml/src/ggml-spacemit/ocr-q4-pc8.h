@@ -254,6 +254,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const bool reuse=reuse_enabled&&!PAD&&ctx.pc8_packed_source==input;
         static const bool trace_reuse=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_REUSE_TRACE");return p&&!std::strcmp(p,"1");}();
         if(reuse&&trace_reuse&&ctx.ith==0)GGML_LOG_INFO("ocr-pc8-reuse: K=%d M=%d\n",K,M);
+        ctx.mark_subphase(100); // activation quantization and packing
         if(!reuse)for(int g=ctx.ith;g<MP/4;g+=ctx.nth)for(int r=0;r<4;++r){
             if(g*4+r>=M){scales[g*4+r]=0;for(int k=0;k<K;k+=32)std::memset(packed+size_t(g)*4*K+k*4+r*32,0,32);continue;}
             auto vmax=__riscv_vfmv_v_f_f32m2(0,64);
@@ -267,7 +268,9 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 const auto q=__riscv_vncvt_x_x_w_i8mf4(__riscv_vfncvt_x_f_w_i16mf2(a,vl),vl);
                 __riscv_vse8_v_i8mf4(target,q,vl);}
         }
+        ctx.mark_subphase(101); // grid barrier before consuming packed input
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+        ctx.mark_subphase(102); // scratch setup
         const auto*ws=reinterpret_cast<const float*>(static_cast<const char*>(op->src[0]->data)+128);
         const auto*weights=reinterpret_cast<const int8_t*>(ws+NP);
         const int tiles=NP/32;
@@ -278,16 +281,21 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         std::memset(base,0xa5,128);std::memset(temp+temp_elements,0xa5,128);auto*out=static_cast<float*>((dst?dst:op)->data);
         for(int nb=ctx.ith;nb<tiles;nb+=simultaneous*ctx.nth){
             const int batch=std::min(simultaneous,(tiles-1-nb)/int(ctx.nth)+1);
+            ctx.mark_subphase(200 + uint64_t(nb) * 16); // weight panel copy
             for(int t=0;t<batch;++t){
                 std::memcpy(sw+size_t(t)*32*K,weights+size_t(nb+t*ctx.nth)*32*K,32*K);
+                ctx.mark_subphase(201 + uint64_t(nb) * 16); // panel permutation
                 if(prepack())prepack_panel(sw+size_t(t)*32*K,K);
             }
             for(int g=0;g<MP/4;){const int count=m8&&g+1<MP/4?8:4;
+                ctx.mark_subphase(0x100000000ull | (uint64_t(nb)<<24) | (uint64_t(g)<<4));
                 std::memcpy(sx,packed+size_t(g)*4*K,count*K);
                 for(int t=0;t<batch;++t){const int tile=nb+t*ctx.nth,cols=std::min(32,N-tile*32);
                 const auto*w=sw+size_t(t)*32*K;
+                ctx.mark_subphase(0x200000000ull | (uint64_t(tile)<<24) | (uint64_t(g)<<4));
                 if(prepack()) {if(count==8)kernel8_prepacked(sx,sx+4*K,w,temp,K);else kernel_prepacked(sx,w,temp,K);}
                 else {if(count==8)kernel8(sx,sx+4*K,w,temp,K);else kernel(sx,w,temp,K);}
+                ctx.mark_subphase(0x300000000ull | (uint64_t(tile)<<24) | (uint64_t(g)<<4));
                 if constexpr(GELU)for(int r=0;r<count;++r){
                     const int valid=r+g*4<M?cols:0;
                     std::memset(reinterpret_cast<float*>(temp)+r*32+valid,0,(32-valid)*sizeof(float));
@@ -311,6 +319,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 }}
                 g+=count/4;}
         }
+        ctx.mark_subphase(400); // scratch canaries
         for(int i=0;i<128;++i)GGML_ASSERT(base[i]==0xa5&&reinterpret_cast<uint8_t*>(temp+temp_elements)[i]==0xa5);
         // A previous output aliasing the input invalidates it, even if tensor
         // identity and shape match. This is a transient activation pack, never
