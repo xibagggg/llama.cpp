@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <stdexcept>
 
 struct spacemit_opnode;  // forward declaration (defined in spacemit-opnode.h)
 
@@ -21,6 +22,7 @@ struct context {
     void *                  workspace     = nullptr;
     size_t                  workspace_size = 0;
     spert::SharedBufferView shared        = {};
+    bool                    check_tcm_view = false;
     std::atomic<int64_t> * work_queue     = nullptr;
 
     // Valid only across adjacent PC8 nodes inside one graph launch. The graph
@@ -32,7 +34,7 @@ struct context {
 
     void reset(spert::Context & runtime_in, uint32_t ith_in, uint32_t nth_in,
                void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in,
-               std::atomic<int64_t> * work_queue_in = nullptr) {
+               std::atomic<int64_t> * work_queue_in = nullptr, bool check_tcm_view_in = false) {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
         runtime        = &runtime_in;
@@ -41,6 +43,7 @@ struct context {
         workspace      = workspace_in;
         workspace_size = workspace_size_in;
         shared         = shared_in;
+        check_tcm_view = check_tcm_view_in;
         work_queue     = work_queue_in;
     }
 
@@ -53,10 +56,22 @@ struct context {
         workspace      = nullptr;
         workspace_size = 0;
         shared         = {};
+        check_tcm_view = false;
         work_queue     = nullptr;
     }
 
-    spert::Status sync() { return runtime->sync(); }
+    spert::Status sync() {
+        auto check = [&] {
+            if (!check_tcm_view) return;
+            const auto current = runtime->shared_buffer();
+            if (current.data != shared.data || current.size < shared.size)
+                throw std::runtime_error("TCM view changed across a cooperative barrier");
+        };
+        check();
+        const auto status = runtime->sync();
+        check();
+        return status;
+    }
 };
 
 class tensor_traits_base {

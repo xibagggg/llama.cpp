@@ -960,7 +960,21 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     // Phase storage registers atexit and allocates several MiB. Initialize and
     // prefault it on the host, before any worker can enter record::begin().
     if(ocr_fa_phases_v50::enabled())(void)ocr_fa_phases_v50::storage::get();
-    auto * op_progress=ocr_op_progress::get();
+    ocr_op_progress::storage * op_progress = nullptr;
+    ggml::spacemit::scratch_mode scratch_mode;
+    const uint64_t progress_sequence = ocr_op_progress::next_sequence();
+    const size_t shared_mem_size = spert::backend_info().shared_mem_size;
+    try {
+        scratch_mode = ggml::spacemit::configured_scratch_mode();
+        if (scratch_mode == ggml::spacemit::scratch_mode::locked_ddr && shared_mem_size)
+            sess->ddr_scratch.prepare(n_threads, shared_mem_size);
+        op_progress = ocr_op_progress::get();
+        ocr_op_progress::catalog(op_progress, progress_sequence, graph->uid, opnodes);
+    } catch (const std::exception & error) {
+        if (op_hash_trace) std::fclose(op_hash_trace);
+        GGML_LOG_ERROR("ggml-spacemit: host scratch/progress setup failed: %s\n", error.what());
+        return GGML_STATUS_FAILED;
+    }
     auto * contexts = sess->contexts.data();
     // Keep first-use option parsing and diagnostic allocation off AI workers.
     spacemit_kernels::rvv::prepare_ocr_worker_state();
@@ -971,27 +985,31 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
         [&opnodes, workspace_size = sess->workspace_size, workspace, contexts,
-         shared_mem_size = spert::backend_info().shared_mem_size, graph_nodes = graph->n_nodes,
+         shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
-         attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,op_progress](spert::Context * runtime) {
-            // Match the old ggml-cpu/spacemit path: use the complete
-            // worker-local TCM buffer directly.  alloc_shared() is a
-            // dynamic sub-allocation API and is not equivalent here; it
-            // adds allocator bookkeeping and can select a different shared
-            // pool block layout than the original RVV kernels expect.
-            auto shared = shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{};
+         attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
+         op_progress, progress_sequence](spert::Context * runtime) {
+            const uint32_t ith = runtime->program_id(0);
+            ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
+            const bool use_ddr = scratch_mode == ggml::spacemit::scratch_mode::locked_ddr;
+            ggml::spacemit::tcm_lease lease(*runtime, shared_mem_size,
+                scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+            ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,11,nullptr);
+            auto shared = use_ddr ? ddr_scratch->lane(ith) :
+                (shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{});
             if (shared_mem_size > 0 && (!shared || shared.size < shared_mem_size)) {
                 throw std::runtime_error("ggml-spacemit: worker shared buffer unavailable");
             }
 
-            const uint32_t ith = runtime->program_id(0);
             auto & ctx = contexts[ith];
-            ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared, attention_work_queue);
+            ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared,
+                      attention_work_queue, !use_ddr && shared_mem_size > 0 &&
+                          scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
 
             size_t node_index = 0;
             for (const auto & node : opnodes) {
                 ggml_tensor * op = node.node;
-                ocr_op_progress::record(op_progress,ith,op_timing_sequence,unsigned(node_index),1,op);
+                ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index),1,op);
                 const uint64_t op_begin=op_timing?ocr_op_timing::now():0;
 
                 ggml_profile_log_spacemit_op_begin(op, (int) ith, (int) runtime->grid_dim(0));
@@ -1005,7 +1023,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 }
                 ggml_profile_log_spacemit_op_end(op, (int) ith, (int) runtime->grid_dim(0));
                 const uint64_t op_end=op_timing?ocr_op_timing::now():0;
-                ocr_op_progress::record(op_progress,ith,op_timing_sequence,unsigned(node_index),2,op);
+                ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index),2,op);
 
                 ++node_index;
 
@@ -1013,10 +1031,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 // the next one. A bounded pointer look-ahead is not sufficient:
                 // dependencies can be farther away or hidden behind aliases/views.
                 ctx.sync();
-                ocr_op_progress::record(op_progress,ith,op_timing_sequence,unsigned(node_index-1),3,op);
+                ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index-1),3,op);
                 if(op_timing)ocr_op_timing::record(ith,op_timing_sequence,unsigned(node_index-1),op,
                     int(node.opcode),op_begin,op_end,ocr_op_timing::now());
-                ocr_op_progress::record(op_progress,ith,op_timing_sequence,unsigned(node_index-1),4,op);
+                ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index-1),4,op);
 
                 if (op_hash_trace != nullptr &&
                     (node.extra_dsts.empty() ? ggml_spacemit_is_trace_checkpoint(node.dst(), graph_nodes)
