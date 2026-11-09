@@ -3743,6 +3743,28 @@ struct clip_model_loader {
                 GGML_ASSERT(false && "unknown projector type");
         }
 
+#if defined(OCR_SPACEMIT_EP)
+        if (model.proj_type == PROJECTOR_TYPE_MINICPM_OCR_1_0 && ocr_ep_vision_enabled()) {
+            // EP owns the visual weights. Keep GGUF tensor metadata for mtmd's
+            // preprocessing and embedding dimensions without a second weight copy.
+            size_t skipped_bytes = 0;
+            for (const auto * tensor : tensors_to_load) {
+                skipped_bytes += ggml_nbytes(tensor);
+            }
+            ctx_clip.mem_usage.clear();
+            if (progress_callback) {
+                progress_callback(0.0f, progress_callback_user_data);
+                if (!progress_callback(1.0f, progress_callback_user_data)) {
+                    throw std::runtime_error(string_format("%s: model loading cancelled by progress_callback\n", __func__));
+                }
+            }
+            LOG_INF("%s: EP vision retains GGUF metadata only; skipped %.2f MiB of duplicate weights\n",
+                    __func__, skipped_bytes / 1024.0 / 1024.0);
+            trace_load("ep-metadata-only");
+            return;
+        }
+#endif
+
         // load data
         {
             std::vector<uint8_t> read_buf;
