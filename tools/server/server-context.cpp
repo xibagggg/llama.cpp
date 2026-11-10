@@ -826,10 +826,15 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t ocr_vision_start = ggml_time_us();
     if (slot.media != nullptr) {
         res = slot.media->encode_mtmd_batch(mbatch.get());
     } else {
         res = mtmd_batch_encode(mbatch.get());
+    }
+    if (std::getenv("OCR_STAGE_TIMING")) {
+        SLT_INF(slot, "OCR_STAGE kind=vision_pipeline seconds=%.6f chunks=%d\n",
+                (ggml_time_us() - ocr_vision_start) / 1e6, n_added);
     }
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
@@ -900,6 +905,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 };
 
                 llama_pos new_n_past; // unused for now
+                const int64_t ocr_prefill_start = ggml_time_us();
                 res = mtmd_helper_decode_image_chunk(
                     mctx,
                     slot.ctx_tgt,
@@ -912,6 +918,10 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     cb,
                     &cb_data
                 );
+                if (std::getenv("OCR_STAGE_TIMING")) {
+                    SLT_INF(slot, "OCR_STAGE kind=image_prefill seconds=%.6f tokens=%zu\n",
+                            (ggml_time_us() - ocr_prefill_start) / 1e6, chunk->n_tokens());
+                }
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
                     return -1;
@@ -4303,9 +4313,19 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
+            const bool ocr_prompt = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
+            });
+            const int64_t ocr_forward_start = ocr_timing ? ggml_time_us() : 0;
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+            }
+            if (ocr_timing) {
+                SRV_INF("OCR_STAGE kind=text_forward phase=%s seconds=%.6f tokens=%zu result=%d\n",
+                        ocr_prompt ? "prefill" : "decode", (ggml_time_us() - ocr_forward_start) / 1e6,
+                        static_cast<size_t>(batch.view.size()), ret);
             }
         });
 
