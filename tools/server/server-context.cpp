@@ -4314,18 +4314,28 @@ private:
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
-            const bool ocr_prompt = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
-                return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
-            });
+            size_t ocr_prompt_tokens = 0;
+            size_t ocr_decode_tokens = 0;
+            if (ocr_timing) {
+                for (int32_t i = off; i < off + batch.view.size(); ++i) {
+                    if (batch.tokens[i].is_prompt) {
+                        ++ocr_prompt_tokens;
+                    } else {
+                        ++ocr_decode_tokens;
+                    }
+                }
+            }
+            const char * ocr_phase = ocr_prompt_tokens == 0 ? "decode" :
+                                    ocr_decode_tokens == 0 ? "prefill" : "mixed";
             const int64_t ocr_forward_start = ocr_timing ? ggml_time_us() : 0;
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
             if (ocr_timing) {
-                SRV_INF("OCR_STAGE kind=text_forward phase=%s seconds=%.6f tokens=%zu result=%d\n",
-                        ocr_prompt ? "prefill" : "decode", (ggml_time_us() - ocr_forward_start) / 1e6,
-                        static_cast<size_t>(batch.view.size()), ret);
+                SRV_INF("OCR_STAGE kind=text_forward phase=%s seconds=%.6f tokens=%zu result=%d prompt_tokens=%zu decode_tokens=%zu\n",
+                        ocr_phase, (ggml_time_us() - ocr_forward_start) / 1e6,
+                        static_cast<size_t>(batch.view.size()), ret, ocr_prompt_tokens, ocr_decode_tokens);
             }
         });
 
