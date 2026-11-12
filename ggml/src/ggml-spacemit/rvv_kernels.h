@@ -86,13 +86,17 @@ template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_
 
 template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
+// K == 1, one sequence: the state is read from and written to state_row (the cache row) instead of
+// src[5] / the state region of the op output
+void forward_gated_delta_net_inplace(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_row);
 // dim-0 concat of a contiguous src0 and a transposed src1 (channels contiguous), vectorized over rows;
 // writes columns >= col0 only
-bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0);
+bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0,
+                                        bool scalar_small = false);
 // ssm_conv, d_conv == 4, vectorized over channels
 bool forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
 // ssm_conv reading its concat(conv_states, transpose(qkv)) inputs directly (fused conv)
-bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
+bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst, bool scalar_small = false);
 // RMS_NORM followed by MUL with a weight row, written to the MUL's dst
 void forward_rms_norm_mul_f32(ggml::spacemit::context & ctx, const ggml_tensor * rms, ggml_tensor * mul);
 // Continuous F32 ADD followed by GELU, with scalar/row bias, written to GELU dst.

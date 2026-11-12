@@ -282,6 +282,228 @@ static bool matmul_add_fusion_enabled() {
     return value && strcmp(value, "1") == 0;
 }
 
+// GGML_SPACEMIT_CONV_FUSE: 0/unset off, 1 concat + ssm_conv fusion with the concat inputs kept alive
+// through graph_optimize, 2 additionally the scalar few-token kernels. Host thread only.
+static int conv_fuse_mode() {
+    const char * value = getenv("GGML_SPACEMIT_CONV_FUSE");
+    if (value == nullptr) {
+        return 0;
+    }
+    if (strcmp(value, "1") == 0) {
+        return 1;
+    }
+    if (strcmp(value, "2") == 0) {
+        return 2;
+    }
+    return 0;
+}
+
+static bool gdn_inplace_enabled() {
+    const char * value = getenv("GGML_SPACEMIT_GDN_INPLACE");
+    return value && strcmp(value, "1") == 0;
+}
+
+static bool byte_ranges_overlap(const void * a, size_t an, const void * b, size_t bn) {
+    const char * a0 = (const char *) a;
+    const char * b0 = (const char *) b;
+    return a0 < b0 + bn && b0 < a0 + an;
+}
+
+// In-place recurrent state update. Graph shape (build_rs + build_delta_net_fused + build_recurrent_attn):
+//   R = get_rows(states {state_elems, n_rs}, ids {1})         copy of the previous state out of the cache
+//   G = gated_delta_net(q, k, v, g, beta, view(R), K = 1)     output = [attention | new state]
+//   C = cpy(view(G, new state), view(states, row kv_head))    new state back into the cache
+// When the gathered row is the row C writes (single sequence), R and C only move 1 MiB per layer out of
+// the cache and back. G can then read and write the cache row directly and R / C have nothing to do.
+// This matcher proves at list-build time that nobody else reads R's copy or G's new-state region and
+// that the cache row is not written between R and G nor observed between G and C; the row identity
+// itself is checked at run time (ggml_spacemit_gdn_inplace_now), the row index being a graph input.
+static bool gdn_inplace_match(const ggml_cgraph * graph, int gi, ggml_tensor ** gather_out, ggml_tensor ** store_out) {
+    ggml_tensor * g = graph->nodes[gi];
+    if (g->op != GGML_OP_GATED_DELTA_NET || ggml_get_op_params_i32(g, 0) != 1 || g->type != GGML_TYPE_F32 ||
+        g->view_src != nullptr || g->data == nullptr || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    for (int j = 0; j < 6; ++j) {
+        if (g->src[j] == nullptr) {
+            return false;
+        }
+    }
+    const ggml_tensor * v        = g->src[2];
+    const int64_t       S_v      = v->ne[0];
+    const int64_t       H        = v->ne[1];
+    const int64_t       n_tokens = v->ne[2];
+    const int64_t       n_seqs   = v->ne[3];
+    if (n_seqs != 1 || g->src[3]->ne[0] == S_v) {
+        return false;  // one sequence, scalar gate only
+    }
+    const int64_t state_elems = S_v * S_v * H;
+    const int64_t attn_elems  = S_v * H * n_tokens * n_seqs;
+    const size_t  state_bytes = (size_t) state_elems * sizeof(float);
+    const size_t  attn_bytes  = (size_t) attn_elems * sizeof(float);
+    if (ggml_nelements(g) != attn_elems + state_elems || !ggml_is_contiguous(g)) {
+        return false;
+    }
+
+    // the state input: a plain window on the whole gathered copy
+    const ggml_tensor * s = g->src[5];
+    ggml_tensor *       r = s->view_src;
+    if (r == nullptr || r->op != GGML_OP_GET_ROWS || s->view_offs != 0 || s->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(s) || ggml_nelements(s) != state_elems) {
+        return false;
+    }
+    if (r->type != GGML_TYPE_F32 || r->view_src != nullptr || r->data == nullptr ||
+        (r->flags & GGML_TENSOR_FLAG_OUTPUT) || r->ne[0] != state_elems || ggml_nelements(r) != state_elems) {
+        return false;
+    }
+    const ggml_tensor * states = r->src[0];
+    const ggml_tensor * ids    = r->src[1];
+    if (states == nullptr || ids == nullptr || states->type != GGML_TYPE_F32 || states->data == nullptr ||
+        states->ne[0] != state_elems || states->nb[0] != sizeof(float) || states->nb[1] != state_bytes ||
+        states->ne[2] != 1 || states->ne[3] != 1 || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 ||
+        ids->data == nullptr) {
+        return false;
+    }
+
+    // readers of R and G
+    ggml_tensor * store     = nullptr;
+    int           store_idx = -1;
+    int           r_idx     = -1;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * t = graph->nodes[i];
+        if (t == r) {
+            r_idx = i;
+        }
+        if ((t->view_src == r || t->view_src == g) && (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        if (!op_is_compute(t)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * x = t->src[j];
+            if (x == nullptr) {
+                continue;
+            }
+            if (x == r || x->view_src == r) {
+                if (t != g || j != 5) {
+                    return false;  // the gathered copy has another reader (or a writer)
+                }
+            } else if (x == g) {
+                return false;  // reads the whole output including the new-state region
+            } else if (x->view_src == g) {
+                if (x->view_offs + ggml_nbytes(x) <= attn_bytes) {
+                    continue;  // attention output
+                }
+                // the only reader of the new state must be the store into the cache
+                if (store != nullptr || t->op != GGML_OP_CPY || j != 0 || x->view_offs != attn_bytes ||
+                    x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != state_elems) {
+                    return false;
+                }
+                store     = t;
+                store_idx = i;
+            }
+        }
+    }
+    if (store == nullptr || r_idx < 0 || !(r_idx < gi && gi < store_idx)) {
+        return false;
+    }
+    if (store->type != GGML_TYPE_F32 || store->data == nullptr || !ggml_is_contiguous(store) ||
+        ggml_nelements(store) != state_elems) {
+        return false;
+    }
+
+    const void * row = store->data;  // the cache row written by C
+    // nothing between R and G may write the cache row: G now reads it where R used to
+    for (int i = r_idx + 1; i < gi; ++i) {
+        ggml_tensor * t = graph->nodes[i];
+        if (!op_is_compute(t)) {
+            continue;
+        }
+        if (t->data == nullptr || byte_ranges_overlap(t->data, ggml_nbytes(t), row, state_bytes)) {
+            return false;
+        }
+    }
+    // C must be the next compute node after G: nobody may observe the cache row in between
+    for (int i = gi + 1; i < store_idx; ++i) {
+        if (op_is_compute(graph->nodes[i])) {
+            return false;
+        }
+    }
+    // G's own output and its other inputs must not live in the cache row
+    if (byte_ranges_overlap(g->data, ggml_nbytes(g), row, state_bytes)) {
+        return false;
+    }
+    for (int j = 0; j < 5; ++j) {
+        const ggml_tensor * in   = g->src[j];
+        const ggml_tensor * root = in->view_src ? in->view_src : in;
+        if (root->data == nullptr || byte_ranges_overlap(root->data, ggml_nbytes(root), row, state_bytes)) {
+            return false;
+        }
+    }
+
+    *gather_out = r;
+    *store_out  = store;
+    return true;
+}
+
+// Marks the {R, G, C} opnodes of every matching gated_delta_net. All three must be plain single-op
+// opnodes. Returns the number of layers marked.
+static int gdn_inplace_mark(const ggml_cgraph * graph, std::vector<spacemit_opnode> & nodes) {
+    int n_marked = 0;
+    for (int gi = 0; gi < graph->n_nodes; ++gi) {
+        ggml_tensor * g = graph->nodes[gi];
+        if (g->op != GGML_OP_GATED_DELTA_NET || !op_is_compute(g)) {
+            continue;
+        }
+        ggml_tensor * gather = nullptr;
+        ggml_tensor * store  = nullptr;
+        if (!gdn_inplace_match(graph, gi, &gather, &store)) {
+            continue;
+        }
+        ggml_tensor * const want[3] = {gather, g, store};
+        size_t              pos[3]  = {0, 0, 0};
+        int                 seen[3] = {0, 0, 0};
+        bool                ok      = true;
+        for (size_t k = 0; k < nodes.size() && ok; ++k) {
+            const spacemit_opnode & on = nodes[k];
+            for (int w = 0; w < 3; ++w) {
+                if (on.node == want[w]) {
+                    if (on.opcode != SPACEMIT_OP_INVALID || !on.fused.empty() || !on.extra_dsts.empty() ||
+                        on.packed_im2col != nullptr || on.elided_pad != nullptr ||
+                        on.prepared_attention != nullptr) {
+                        ok = false;
+                    }
+                    pos[w] = k;
+                    seen[w]++;
+                }
+                if (on.packed_im2col == want[w] || on.elided_pad == want[w] || on.prepared_attention == want[w]) {
+                    ok = false;
+                }
+                for (const ggml_tensor * f : on.fused) {
+                    if (f == want[w]) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        if (!ok || seen[0] != 1 || seen[1] != 1 || seen[2] != 1 || !(pos[0] < pos[1] && pos[1] + 1 == pos[2])) {
+            continue;
+        }
+        static const spacemit_op_code codes[3] = {SPACEMIT_OP_GDN_STATE_GATHER, SPACEMIT_OP_GDN_INPLACE,
+                                                  SPACEMIT_OP_GDN_STATE_STORE};
+        for (int w = 0; w < 3; ++w) {
+            spacemit_opnode & on = nodes[pos[w]];
+            on.opcode            = codes[w];
+            on.gdn_state[0]      = gather;
+            on.gdn_state[1]      = g;
+            on.gdn_state[2]      = store;
+        }
+        n_marked++;
+    }
+    return n_marked;
+}
+
 // concat(conv_states, transpose(qkv), dim 0) as built by build_conv_state: contiguous F32 rows, the
 // second input laid out transposed (column-major) so the fused kernel reads it column by column.
 static bool is_transposed_concat_f32(const ggml_tensor * t) {
@@ -343,7 +565,8 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci,
             }
             if (s == c) {
                 if (t->op == GGML_OP_SSM_CONV && j == 0 && t->src[1] && t->src[1]->ne[0] == 4 &&
-                    t->src[2] == c->src[1] && t->src[3] == c->src[0]) {
+                    ((t->src[2] == c->src[1] && t->src[3] == c->src[0]) ||
+                     (conv_fuse_mode() > 0 && t->src[2] == nullptr && t->src[3] == nullptr))) {
                     // the graph keeps the concat inputs alive until this node (build_ssm_conv)
                     if (ssm != nullptr) {
                         return false;  // more than one ssm_conv consumer
@@ -381,6 +604,37 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci,
     *ssm_out     = ssm;
     *ssm_idx_out = ssm_idx;
     *col0_out    = col0;
+    return true;
+}
+
+// The fused ssm_conv reads the concat inputs at its own (later) graph position. With the alloc deps
+// from graph_optimize their buffers stay allocated; verify on the final addresses that no compute
+// node in [concat, ssm_conv] writes into them. On failure both nodes simply stay unfused.
+static bool ssm_conv_concat_inputs_intact(const ggml_cgraph * graph, int ci, int ssm_idx) {
+    const ggml_tensor * c = graph->nodes[ci];
+    for (int k = 0; k < 2; ++k) {
+        const ggml_tensor * in   = c->src[k];
+        const ggml_tensor * root = in->view_src ? in->view_src : in;
+        if (root->data == nullptr) {
+            return false;
+        }
+        const char * r0 = (const char *) root->data;
+        const char * r1 = r0 + ggml_nbytes(root);
+        for (int i = ci; i <= ssm_idx; ++i) {
+            ggml_tensor * t = graph->nodes[i];
+            if (!op_is_compute(t)) {
+                continue;
+            }
+            if (t->data == nullptr) {
+                return false;
+            }
+            const char * t0 = (const char *) t->data;
+            const char * t1 = t0 + ggml_nbytes(t);
+            if (t0 < r1 && r0 < t1) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -431,6 +685,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
     // allocator planned the ssm_conv output buffer on the original node order (see Pattern 3).
     if (emitted.count(n)) {
         nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_CONCAT);
+        nodes.back().kernel_params[1] = conv_fuse_mode() >= 2;
         return true;
     }
 
@@ -572,9 +827,11 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         ggml_tensor * ssm     = nullptr;
         int           ssm_idx = -1;
         int64_t       col0    = 0;
-        if (ssm_conv_concat_fusable(graph, i, &ssm, &ssm_idx, &col0)) {
+        if (ssm_conv_concat_fusable(graph, i, &ssm, &ssm_idx, &col0) &&
+            (ssm->src[2] != nullptr || ssm_conv_concat_inputs_intact(graph, i, ssm_idx))) {
             spacemit_opnode cat(n, {}, SPACEMIT_OP_CONCAT_STATE);
             cat.kernel_params[0] = (int32_t) col0;
+            cat.kernel_params[1] = conv_fuse_mode() >= 2;
             nodes.push_back(std::move(cat));
             // the ssm_conv half is emitted by try_fuse_node when the loop reaches its own
             // node position (see the top of this function) â€?never here at the concat position
@@ -873,14 +1130,24 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             sess->cached_graph.nodes.emplace_back(n);
         }
 
+        const int n_gdn_inplace = gdn_inplace_enabled() ? gdn_inplace_mark(graph, sess->cached_graph.nodes) : 0;
+
         int n_fused = 0;
         int n_add_gelu = 0;
         int n_matmul_add = 0;
         int n_im2col_pack = 0;
         int n_norm_affine = 0;
         int n_residual_norm_affine = 0;
+        int n_conv_seen = 0;
+        int n_conv_fused = 0;
+        int n_conv_scalar = 0;
+        int n_gdn_seen = 0;
         for (const auto & node : sess->cached_graph.nodes) {
             n_add_gelu += node.opcode == SPACEMIT_OP_ADD_GELU;
+            n_conv_seen += node.node->op == GGML_OP_CONCAT;
+            n_conv_fused += node.opcode == SPACEMIT_OP_CONCAT_STATE;
+            n_conv_scalar += node.opcode == SPACEMIT_OP_CONCAT_STATE && node.kernel_params[1] != 0;
+            n_gdn_seen += node.node->op == GGML_OP_GATED_DELTA_NET;
             n_matmul_add += node.opcode == SPACEMIT_OP_MUL_MAT_ADD;
             n_im2col_pack += node.opcode == SPACEMIT_OP_IM2COL_MUL_MAT;
             n_norm_affine += node.opcode == SPACEMIT_OP_NORM_AFFINE;
@@ -891,6 +1158,12 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
         GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(),
                        (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
+        const char * recurrent_trace = getenv("GGML_SPACEMIT_RECURRENT_TRACE");
+        if (recurrent_trace && strcmp(recurrent_trace, "1") == 0 && n_gdn_seen > 0) {
+            GGML_LOG_INFO("ggml-spacemit: recurrent conv fused=%d/%d scalar=%d gdn in-place=%d/%d graph=%llu\n",
+                          n_conv_fused, n_conv_seen, n_conv_scalar, n_gdn_inplace, n_gdn_seen,
+                          (unsigned long long) graph->uid);
+        }
         const char * trace = getenv("GGML_SPACEMIT_ADD_GELU_TRACE");
         if (n_add_gelu > 0 && trace && strcmp(trace, "1") == 0) {
             GGML_LOG_INFO("ggml-spacemit: ADD+GELU fused=%d graph=%llu\n", n_add_gelu,
@@ -1109,6 +1382,27 @@ static void ggml_backend_spacemit_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static void ggml_backend_spacemit_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                                                 struct ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(backend);
+    if (params == nullptr || params->add_alloc_dep == nullptr || conv_fuse_mode() == 0) {
+        return;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * n = graph->nodes[i];
+        if (n->op != GGML_OP_CONCAT) {
+            continue;
+        }
+        ggml_tensor * ssm     = nullptr;
+        int           ssm_idx = -1;
+        int64_t       col0    = 0;
+        if (ssm_conv_concat_fusable(graph, i, &ssm, &ssm_idx, &col0) && ssm->src[2] == nullptr) {
+            params->add_alloc_dep(params->user_data, n->src[0], ssm);
+            params->add_alloc_dep(params->user_data, n->src[1], ssm);
+        }
+    }
+}
+
 static struct ggml_backend_i spacemit_backend_i = {
     /* .get_name                = */ ggml_backend_spacemit_name,
     /* .free                    = */ ggml_backend_spacemit_free,
@@ -1125,7 +1419,7 @@ static struct ggml_backend_i spacemit_backend_i = {
     /* .graph_compute           = */ ggml_backend_spacemit_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_spacemit_graph_optimize,
 };
 
 static ggml_guid_t ggml_backend_spacemit_guid() {

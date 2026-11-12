@@ -39,6 +39,9 @@ enum spacemit_op_code {
     SPACEMIT_OP_PC8_PAD_MUL_MAT,
     SPACEMIT_OP_PC8_MUL_MAT_BIAS,
     SPACEMIT_OP_OCR_CAST_KV_PACK,
+    SPACEMIT_OP_GDN_STATE_GATHER, // get_rows of the recurrent state, skipped when the update runs in place
+    SPACEMIT_OP_GDN_INPLACE,      // gated_delta_net updating the cache row in place
+    SPACEMIT_OP_GDN_STATE_STORE,  // cpy of the new state to the cache row, skipped when in place
 };
 
 #define SPACEMIT_OP_MAX_KERN_PARAMS 32
@@ -48,6 +51,8 @@ struct spacemit_opnode {
     ggml_tensor * packed_im2col = nullptr;
     ggml_tensor * elided_pad = nullptr;
     ggml_tensor * prepared_attention = nullptr;
+    // in-place recurrent state update: {state gather (GET_ROWS), GATED_DELTA_NET, state store (CPY)}
+    ggml_tensor * gdn_state[3] = {nullptr, nullptr, nullptr};
 
     std::vector<ggml_tensor *> fused;
 

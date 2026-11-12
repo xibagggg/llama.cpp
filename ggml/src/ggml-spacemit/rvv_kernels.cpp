@@ -4240,7 +4240,7 @@ static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1,
     gdn_transpose(D, D, S, D, s_out, D);
 }
 
-void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
+static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_rows) {
     const ggml_tensor * src_q     = op->src[0];
     const ggml_tensor * src_k     = op->src[1];
     const ggml_tensor * src_v     = op->src[2];
@@ -4264,8 +4264,11 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float *       attn_out_base  = (float *) op->data;
-    float *       state_out_base = attn_out_base + attn_score_elems;
-    const float * state_in_base  = (const float *) src_state->data;
+    // state_rows != nullptr: in-place update of the cache row (K == 1, one sequence). Every path below
+    // reads a state row completely before it stores it, so s_in == s_out is safe.
+    GGML_ASSERT(state_rows == nullptr || (K == 1 && n_seqs == 1));
+    float *       state_out_base = state_rows ? state_rows : attn_out_base + attn_score_elems;
+    const float * state_in_base  = state_rows ? state_rows : (const float *) src_state->data;
 
     const float scale = 1.0f / sqrtf((float) S_v);
     const bool  kda   = src_g->ne[0] == S_v;
@@ -4326,7 +4329,7 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
         float * s_out = K > 1 ? (fused ? state_work.data() : state_work_tp)
                               : state_out_base + (iv3 * H + iv1) * S_v * S_v;
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        if (!fused) {
+        if (!fused && s_out != s_in) {
             memcpy(s_out, s_in, (size_t) (S_v * S_v) * sizeof(float));
         }
         // In the fused form the first token is fused with the state copy: it
@@ -4410,6 +4413,14 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
             }
         }
     }
+}
+
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    forward_gated_delta_net_impl(ctx, op, nullptr);
+}
+
+void forward_gated_delta_net_inplace(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_row) {
+    forward_gated_delta_net_impl(ctx, op, state_row);
 }
 
 void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
@@ -5872,10 +5883,47 @@ void forward_rms_norm_mul_f32(ggml::spacemit::context & ctx, const ggml_tensor *
     }
 }
 
+// Scalar form of the fused ssm_conv for G adjacent channels starting at channel c. The G channels are
+// interleaved so their FP chains overlap on the in-order cores. One mul and three fused multiply-adds
+// per output, in the order of the vector path (bitwise identical).
+template <int G>
+static inline void ssm_conv_concat_scalar_f32(const char * wb, ptrdiff_t ws, const char * sb, ptrdiff_t ss,
+                                              const char * qb, ptrdiff_t ts, char * yb, ptrdiff_t ys, int64_t c,
+                                              int64_t n_t) {
+    float w[G][4];
+    float x[G][3];
+    for (int k = 0; k < G; ++k) {
+        const float * wp = (const float *) (wb + (c + k) * ws);
+        const float * sp = (const float *) (sb + (c + k) * ss);
+        w[k][0] = wp[0];
+        w[k][1] = wp[1];
+        w[k][2] = wp[2];
+        w[k][3] = wp[3];
+        x[k][0] = sp[0];
+        x[k][1] = sp[1];
+        x[k][2] = sp[2];
+    }
+    for (int64_t t = 0; t < n_t; ++t) {
+        const float * q = (const float *) (qb + t * ts) + c;
+        float *       y = (float *) (yb + t * ys) + c;
+        for (int k = 0; k < G; ++k) {
+            const float x3  = q[k];
+            float       acc = x[k][0] * w[k][0];
+            acc             = __builtin_fmaf(x[k][1], w[k][1], acc);
+            acc             = __builtin_fmaf(x[k][2], w[k][2], acc);
+            acc             = __builtin_fmaf(x3, w[k][3], acc);
+            y[k]            = acc;
+            x[k][0]         = x[k][1];
+            x[k][1]         = x[k][2];
+            x[k][2]         = x3;
+        }
+    }
+}
+
 // ssm_conv fused with its concat(conv_states, transpose(qkv)) input: reads the conv state (d_conv - 1
 // columns per channel) and the untransposed qkv rows directly, so every token is one contiguous load across
 // channels instead of a strided gather. Same arithmetic order as forward_ssm_conv_f32 (bitwise identical).
-bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst) {
+bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst, bool scalar_small) {
     const ggml_tensor * cat = dst->src[0];  // concat {d_conv - 1 + n_t, d_inner, n_s}
     const ggml_tensor * st  = cat->src[0];  // conv states {d_conv - 1, d_inner, n_s}
     const ggml_tensor * qk  = cat->src[1];  // transposed qkv view {n_t, d_inner, n_s}, channels contiguous
@@ -5892,6 +5940,30 @@ bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * ds
         dst->nb[0] != sizeof(float) || dst->ne[0] != nr || st->ne[1] != nr || qk->ne[1] != nr ||
         st->ne[2] != n_s || qk->ne[2] != n_s) {
         return false;
+    }
+
+    if (scalar_small && n_t <= 8) {
+        // Few tokens (decode): the strided vector loads of the weights and the state cost more than the
+        // whole scalar loop.
+        const int64_t sdr = (nr + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
+        const int64_t sc0 = sdr * (int64_t) ctx.ith;
+        const int64_t sc1 = std::min(sc0 + sdr, nr);
+        for (int64_t i3 = 0; i3 < n_s; ++i3) {
+            const char * wb = (const char *) src1->data;
+            const char * sb = (const char *) st->data + i3 * st->nb[2];
+            const char * qb = (const char *) qk->data + i3 * qk->nb[2];
+            char *       yb = (char *) dst->data + i3 * dst->nb[2];
+            int64_t      c  = sc0;
+            for (; c + 4 <= sc1; c += 4) {
+                ssm_conv_concat_scalar_f32<4>(wb, (ptrdiff_t) src1->nb[1], sb, (ptrdiff_t) st->nb[1], qb,
+                                              (ptrdiff_t) qk->nb[0], yb, (ptrdiff_t) dst->nb[1], c, n_t);
+            }
+            for (; c < sc1; ++c) {
+                ssm_conv_concat_scalar_f32<1>(wb, (ptrdiff_t) src1->nb[1], sb, (ptrdiff_t) st->nb[1], qb,
+                                              (ptrdiff_t) qk->nb[0], yb, (ptrdiff_t) dst->nb[1], c, n_t);
+            }
+        }
+        return true;
     }
 
     const ptrdiff_t ss = st->nb[1];  // channel stride of the conv state
@@ -5945,7 +6017,8 @@ bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * ds
 // of channels is loaded contiguously and written to the dst channel rows with a strided store.
 // Only columns >= col0 are written (col0 > 0 when SSM_CONV reads the inputs directly and only the
 // trailing columns are read back through views).
-bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0) {
+bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0,
+                                        bool scalar_small) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     const ggml_tensor * dst  = op;
@@ -5957,6 +6030,33 @@ bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tens
         nb11 != sizeof(float) || nb10 == sizeof(float) || ne01 != ne1 || ne11 != ne1 || ne02 != ne2 ||
         ne12 != ne2 || ne03 != ne3 || ne13 != ne3) {
         return false;
+    }
+
+    if (scalar_small && col0 > 0 && ne0 - col0 <= 4) {
+        // Only the trailing columns are read back (the conv state update): a handful of scalar copies
+        // per channel instead of strided vector loads / stores.
+        const int64_t sdc = (ne1 + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
+        const int64_t sc0 = sdc * (int64_t) ctx.ith;
+        const int64_t sc1 = std::min(sc0 + sdc, ne1);
+        const int64_t t0  = std::max<int64_t>(0, col0 - ne00);
+        for (int64_t i3 = 0; i3 < ne3; i3++) {
+            for (int64_t i2 = 0; i2 < ne2; i2++) {
+                const char * s0 = (const char *) src0->data + i2 * nb02 + i3 * nb03;
+                const char * s1 = (const char *) src1->data + i2 * nb12 + i3 * nb13;
+                char *       d  = (char *) op->data + i2 * nb2 + i3 * nb3;
+                for (int64_t c = sc0; c < sc1; ++c) {
+                    const float * sp = (const float *) (s0 + c * nb01);
+                    float *       dp = (float *) (d + c * nb1);
+                    for (int64_t i0 = col0; i0 < ne00; i0++) {
+                        dp[i0] = sp[i0];
+                    }
+                    for (int64_t t = t0; t < ne10; t++) {
+                        dp[ne00 + t] = *(const float *) (s1 + t * nb10 + c * nb11);
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     if(ocr_concat_tcm_v46::forward(ctx,op,col0))return true;

@@ -1,6 +1,7 @@
 #include "mtmd-image.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <vector>
 
@@ -492,9 +493,21 @@ private:
 //
 
 mtmd_image_preproc_out mtmd_image_preprocessor_llava_uhd::preprocess(const clip_image_u8 & img) const {
-    const clip_image_size original_size = img.get_size();
+    const clip_image_u8 * src = &img;
+    clip_image_u8 scaled;
+    if (const char * env = getenv("MTMD_OCR_IMAGE_SCALE")) {
+        const int pct = atoi(env);
+        if (pct >= 10 && pct < 100) {
+            const clip_image_size sz0 = img.get_size();
+            const clip_image_size sz = clip_image_size{
+                std::max(16, sz0.width * pct / 100), std::max(16, sz0.height * pct / 100)};
+            img_tool::resize(img, scaled, sz, hparams.image_resize_algo_rf, PAD_NONE);
+            src = &scaled;
+        }
+    }
+    const clip_image_size original_size = src->get_size();
     auto const inst = get_slice_instructions(original_size);
-    auto sliced = slice_image(img, inst);
+    auto sliced = slice_image(*src, inst);
 
     mtmd_image_preproc_out output;
     output.append_overview(hparams, sliced.overview, true);
@@ -566,7 +579,11 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_ll
     res.overview_size = best_size;
 
     {
-        const int max_slice_nums = hparams.max_slice_nums > 0 ? hparams.max_slice_nums : 9;
+        int max_slice_nums = hparams.max_slice_nums > 0 ? hparams.max_slice_nums : 9;
+        if (const char * env = getenv("MTMD_OCR_MAX_SLICE_NUMS")) {
+            const int v = atoi(env);
+            if (v > 0) max_slice_nums = v;
+        }
         const float log_ratio = log((float)original_width / original_height);
         const float ratio = (float)original_width * original_height / (slice_size * slice_size);
         const int multiple = fmin(ceil(ratio), max_slice_nums);
@@ -896,7 +913,15 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_mi
     const float ratio      = (float) original_size.width * original_size.height / (slice_size * slice_size);
     if (ratio <= 1.0f) {
         mtmd_image_preprocessor_llava_uhd::slice_instructions inst;
-        inst.overview_size = get_best_resize(original_size, slice_size, get_slice_align(), true);
+        int ov_scale = slice_size;
+        if (const char * env = getenv("MTMD_OCR_OVERVIEW_SCALE")) {
+            const int pct = atoi(env);
+            if (pct >= 10 && pct < 100) {
+                const int al = get_slice_align();
+                ov_scale = std::max(al, (slice_size * pct / 100) / al * al);
+            }
+        }
+        inst.overview_size = get_best_resize(original_size, ov_scale, get_slice_align(), true);
         inst.refined_size  = clip_image_size{0, 0};
         inst.grid_size     = clip_image_size{0, 0};
         return inst;

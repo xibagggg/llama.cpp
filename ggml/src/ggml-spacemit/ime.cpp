@@ -2060,6 +2060,22 @@ bool ggml_spacemit_can_fuse_pc8_pad(const ggml_tensor * op) {
     return ocr_q4_pc8::pad_supported(op)&&op->src[0]->extra==&ocr_q4_pc8::impl;
 }
 
+// In-place recurrent state update (see gdn_inplace_mark): true when the row gathered by the state
+// GET_ROWS is the cache row that the state CPY writes back. The row index is a graph input that is
+// rewritten before every compute, so this is evaluated at run time; all workers and all three
+// opnodes of one layer read the same values and take the same branch.
+static bool ggml_spacemit_gdn_inplace_now(const spacemit_opnode & node) {
+    const ggml_tensor * gather = node.gdn_state[0];
+    const ggml_tensor * store  = node.gdn_state[2];
+    if (gather == nullptr || store == nullptr) {
+        return false;
+    }
+    const ggml_tensor * states = gather->src[0];
+    const int64_t       row    = *(const int32_t *) gather->src[1]->data;
+    return row >= 0 && row < states->ne[1] &&
+           (const char *) states->data + row * (int64_t) states->nb[1] == (const char *) store->data;
+}
+
 bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_opnode & node) {
     if (ctx.ocr_prepared_attention != node.node) ctx.ocr_prepared_attention = nullptr;
     // Single-op opnodes with a special opcode: the two halves of the concat -> ssm_conv fusion.
@@ -2075,16 +2091,31 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
             const auto * traits=ggml_spacemit_get_tensor_traits(node.node);
             return traits&&traits->compute_forward_fused(ctx,node);
         }
+        case SPACEMIT_OP_GDN_STATE_GATHER:
+        case SPACEMIT_OP_GDN_STATE_STORE:
+            // nothing to do when the state is updated in place in the cache row
+            if (ggml_spacemit_gdn_inplace_now(node)) {
+                return true;
+            }
+            break;
+        case SPACEMIT_OP_GDN_INPLACE:
+            if (ggml_spacemit_gdn_inplace_now(node)) {
+                spacemit_kernels::rvv::forward_gated_delta_net_inplace(ctx, node.node,
+                                                                       (float *) node.gdn_state[2]->data);
+                return true;
+            }
+            break;
         case SPACEMIT_OP_CONCAT_STATE:
             // only the trailing columns read back through views (the conv state update)
             if (!spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, node.node,
-                                                                           (int64_t) node.kernel_params[0])) {
+                                                                           (int64_t) node.kernel_params[0],
+                                                                           node.kernel_params[1] != 0)) {
                 GGML_ABORT("fused concat state update: unsupported shape");
             }
             return true;
         case SPACEMIT_OP_SSM_CONV_CONCAT:
             // the concat only materialized its trailing columns; read its inputs directly
-            if (!spacemit_kernels::rvv::forward_ssm_conv_concat_f32(ctx, node.node)) {
+            if (!spacemit_kernels::rvv::forward_ssm_conv_concat_f32(ctx, node.node, node.kernel_params[1] != 0)) {
                 GGML_ABORT("fused ssm_conv: unsupported shape");
             }
             return true;
