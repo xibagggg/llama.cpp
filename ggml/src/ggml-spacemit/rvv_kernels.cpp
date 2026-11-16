@@ -4272,6 +4272,14 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
 
     const float scale = 1.0f / sqrtf((float) S_v);
     const bool  kda   = src_g->ne[0] == S_v;
+    if (std::getenv("GGML_SPACEMIT_GDN_DEBUG") && ctx.ith == 0) {
+        fprintf(stderr, "[gdn] S_v=%lld H=%lld T=%lld K=%lld kda=%d vlmax_m4=%lld vlmax_m8=%lld\n",
+                (long long) S_v, (long long) H, (long long) n_tokens, (long long) K, (int) kda,
+                (long long) __riscv_vsetvlmax_e32m4(), (long long) __riscv_vsetvlmax_e32m8());
+        fprintf(stderr, "[gdn] q.ne=[%lld,%lld,%lld,%lld] v.ne=[%lld,%lld,%lld,%lld]\n",
+                (long long) src_q->ne[0], (long long) src_q->ne[1], (long long) src_q->ne[2], (long long) src_q->ne[3],
+                (long long) src_v->ne[0], (long long) src_v->ne[1], (long long) src_v->ne[2], (long long) src_v->ne[3]);
+    }
 
     // prefill: chunkwise form (the token recurrence below handles the remaining cases)
     if (K == 1 && !kda && n_tokens >= 16 && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
@@ -6032,7 +6040,10 @@ bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tens
         return false;
     }
 
-    if (scalar_small && col0 > 0 && ne0 - col0 <= 4) {
+    // Only prefer the scalar tail when the new columns are NOT channel-contiguous. When nb11 is the
+    // element size the vector loop below is contiguous loads plus 20-byte-strided stores, which beats
+    // 4-byte scalar copies (the decode [3,6144]+[n_t,6144] concat: 222us -> ~25us per token step).
+    if (scalar_small && col0 > 0 && ne0 - col0 <= 4 && nb11 != sizeof(float)) {
         // Only the trailing columns are read back (the conv state update): a handful of scalar copies
         // per channel instead of strided vector loads / stores.
         const int64_t sdc = (ne1 + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
