@@ -442,3 +442,19 @@ if (GGML_SPACEMIT)
     set_tests_properties(test-paddle-vision-rope-no-cache PROPERTIES RUN_SERIAL TRUE LABELS spacemit ENVIRONMENT
         "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_VISION_ROPE_CACHE=0")
 endif()
+
+if (GGML_SPACEMIT)
+    llama_test(test-paddle-f16-ime2 NAME test-paddle-f16-ime2-kblock-1024 LABEL spacemit
+        ARGS --compare-reference "${paddle_f16_reference}")
+    set_tests_properties(test-paddle-f16-ime2-kblock-1024 PROPERTIES
+        ENVIRONMENT "${paddle_f16_env};GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=1024"
+        FIXTURES_REQUIRED paddle_f16_panel_reference RUN_SERIAL TRUE)
+endif()
+
+# Direct CPU/SPACEMIT F32-to-F16 permutation/view byte regression.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-strided-cast.cpp LINK ggml)
+    llama_test(test-paddle-strided-cast LABEL spacemit)
+    set(paddle_strided_cast_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_OCR_STRIDED_CAST=1")
+    set_tests_properties(test-paddle-strided-cast PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "${paddle_strided_cast_env}")
+endif()
