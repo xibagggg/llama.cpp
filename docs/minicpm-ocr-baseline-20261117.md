@@ -1,6 +1,6 @@
 # MiniCPM OCR K3 基线：2026-11-17
 
-本版本保存已在 Bianbu K3 设备验证的 MiniCPM OCR llama 工作树，以及重建所需的配置。配套 SDK 为 `model-zoo-ocr`。两库使用同名分支 `codex/minicpm-ocr-baseline-20261117` 和同名标签 `minicpm-ocr-baseline-20261117`；复现时须同时检出该标签，并记录两库各自的完整 commit SHA。同名标签关联两库的版本，不表示两库 commit SHA 相同。
+本版本保存已在 Bianbu K3 设备验证的 MiniCPM OCR llama 工作树，以及重建所需的配置。配套 SDK 为 `model-zoo-ocr`。两库使用同名分支 `perf/minicpm` 和同名标签 `minicpm-ocr-baseline-20261117`；复现时须同时检出该标签，并记录两库各自的完整 commit SHA。同名标签关联两库的版本，不表示两库 commit SHA 相同。
 
 SDK 的完整运行方法、质量检查和九项性能指标见其 `docs/minicpm-benchmark.md`。本文记录 llama 构建及源码依据。原始测量及构建产物留在设备的 `/home/bianbu/minicpm/model-zoo-ocr/output/`；模型、二进制和临时备份不随源码提交。
 
