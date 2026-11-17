@@ -1388,8 +1388,9 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 char line[1024];
                 while (std::fgets(line, sizeof(line), maps)) {
                     unsigned long long start = 0, end = 0, offset = 0;
-                    if (std::sscanf(line, "%llx-%llx %*s %llx", &start, &end, &offset) == 3 &&
-                        std::strstr(line, "/dev/tcm") && address >= start && address < end &&
+                    char mapped_path[512]{};
+                    if (std::sscanf(line, "%llx-%llx %*s %llx %*s %*s %511s", &start, &end, &offset, mapped_path) == 4 &&
+                        !std::strcmp(mapped_path, "/dev/tcm") && address >= start && address < end &&
                         view.size <= end - address) {
                         hardware_tcm = true;
                         map_start = uintptr_t(start); map_end = uintptr_t(end); map_offset = offset;
@@ -1398,7 +1399,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 }
                 std::fclose(maps);
             }
-            GGML_LOG_INFO("spacemit-tcm-trace: graph=%llu nodes=%zu lane=%u cpu=%d scratch=%p bytes=%zu hardware_tcm=%d map=%p-%p device_offset=0x%llx\n",
+            std::fprintf(stderr, "spacemit-tcm-trace: graph=%llu nodes=%zu lane=%u cpu=%d scratch=%p bytes=%zu hardware_tcm=%d map=%p-%p device_offset=0x%llx\n",
                           static_cast<unsigned long long>(progress_sequence), opnodes.size(), lane,
                           tcm_cpus[lane], view.data, view.size, int(hardware_tcm),
                           reinterpret_cast<void *>(map_start), reinterpret_cast<void *>(map_end), map_offset);
