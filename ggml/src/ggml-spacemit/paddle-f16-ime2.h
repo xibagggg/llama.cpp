@@ -16,7 +16,7 @@ inline bool enabled() {
     return value;
 }
 // Diagnostic opt-in: number of this worker's W32 panels resident in TCM.
-// K4304 falls back to one panel because of the per-worker TCM capacity.
+// K4304 and K4608 fall back to one panel because of TCM capacity.
 inline int requested_panels() {
     static const int value=[] {
         const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_PANEL_TILES");
@@ -33,13 +33,29 @@ inline bool m16_enabled() {
     }();
     return value;
 }
+// Independent opt-in for Paddle's two F16 patch-merge projector matrices.
+// K4608 keeps M8/N32 with one shared high/residual A staging area.
+inline bool projector_enabled() {
+    static const bool value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_PROJECTOR");
+        return p&&!std::strcmp(p,"1");
+    }();
+    return value;
+}
 inline bool selected(const ggml_tensor *w) {
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
-        w->ne[2] != 1 || w->ne[3] != 1 || std::strncmp(w->name,"v.blk.",6)) return false;
-    const bool shape = (w->ne[0] == 1152 && (w->ne[1] == 1152 || w->ne[1] == 4304)) ||
-                       (w->ne[0] == 4304 && w->ne[1] == 1152);
+        w->ne[2] != 1 || w->ne[3] != 1) return false;
+    const bool vision = !std::strncmp(w->name,"v.blk.",6) &&
+        ((w->ne[0] == 1152 && (w->ne[1] == 1152 || w->ne[1] == 4304)) ||
+         (w->ne[0] == 4304 && w->ne[1] == 1152));
+    const bool projector = projector_enabled() && w->ne[0] == 4608 &&
+        ((!std::strcmp(w->name,"mm.1.weight") && w->ne[1] == 4608) ||
+         (!std::strcmp(w->name,"mm.2.weight") && w->ne[1] == 1024));
     static const auto info=spert::backend_info();
-    return shape && info.core_arch_id==0xa064 && info.vlen==128 && info.shared_mem_size>=346624;
+    // K4608: W32 294912B + shared A8 73728B + FP32 scratch/guards 2304B.
+    const size_t minimum_shared = projector ? 370944 : 346624;
+    return (vision || projector) && info.core_arch_id==0xa064 && info.vlen==128 &&
+           info.shared_mem_size>=minimum_shared;
 }
 inline size_t nbytes(const ggml_tensor *w) {return 128+GGML_PAD(size_t(w->ne[1]),32)*size_t(w->ne[0])*2;}
 inline float scale_for(float maximum) {
@@ -223,7 +239,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const size_t weight_bytes=size_t(tile_n)*K*2;
         const size_t activation_bytes=size_t(8)*K*2;
         // M16 is admitted only where both high and residual A16 staging plus
-        // W32 and FP32 temporaries fit. K4304 keeps the original M8 path.
+        // W32 and FP32 temporaries fit. K4304/K4608 retain M8 staging.
         const bool m16=m16_enabled()&&K==1152&&
             ctx.shared.size>=weight_bytes+4*activation_bytes+4352;
         const int staged_groups=m16?2:1;

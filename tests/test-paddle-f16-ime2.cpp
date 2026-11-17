@@ -64,6 +64,7 @@ int main(int argc, char ** argv) {
         }
     }
     setenv("GGML_SPACEMIT_PADDLE_F16_IME2", "1", 1);
+    setenv("GGML_SPACEMIT_PADDLE_F16_PROJECTOR", "1", 1);
     ggml_backend_load_all();
     auto dev=ggml_backend_dev_by_name("SPACEMIT0");
     if (!dev) return 2;
@@ -72,13 +73,13 @@ int main(int argc, char ** argv) {
     std::mt19937 rng(176);
     std::uniform_real_distribution<float> dist(-1.f,1.f);
     bool ok=true;
-    for (auto shape : {std::pair<int,int>{1152,1152},{1152,4304},{4304,1152}}) {
+    for (auto shape : {std::pair<int,int>{1152,1152},{1152,4304},{4304,1152},{4608,4608},{4608,1024}}) {
         for (int m : {1,7,8,9,17,33,216}) {
             const int k=shape.first,n=shape.second;
             ggml_init_params params{32*1024*1024,nullptr,true};
             auto ctx=ggml_init(params);
             auto w=ggml_new_tensor_2d(ctx,GGML_TYPE_F16,k,n);
-            ggml_set_name(w,"v.blk.0.attn_q.weight");
+            ggml_set_name(w,k==4608?(n==4608?"mm.1.weight":"mm.2.weight"):"v.blk.0.attn_q.weight");
             ggml_set_param(w);
             auto x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,m);
             ggml_set_input(x);
