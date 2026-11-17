@@ -122,6 +122,9 @@ int main() {
         cases.push_back({type,128,17,true,false,false,true});
         cases.push_back({type,72,17,true,true,false,true,true});
     }
+    const char *dump_path=std::getenv("PADDLE_VISION_ROPE_DUMP");
+    FILE *dump=dump_path&&*dump_path?std::fopen(dump_path,"wb"):nullptr;
+    if(dump_path&&*dump_path&&!dump)return 4;
     bool ok=selector_regression(ai);
     for(const auto & c:cases) {
         std::vector<float> ref,out;
@@ -131,10 +134,12 @@ int main() {
             const double err=double(out[i])-ref[i];sqerr+=err*err;sqref+=double(ref[i])*ref[i];maxabs=std::max(maxabs,std::abs(err));
             identical+=!std::memcmp(&out[i],&ref[i],sizeof(float));
         }
+        if(dump&&std::fwrite(out.data(),sizeof(float),out.size(),dump)!=out.size())pass=false;
         const double relative=std::sqrt(sqerr/std::max(sqref,1e-30));
         pass=pass&&relative<(c.type==GGML_TYPE_F32?2e-6:8e-4)&&maxabs<(c.type==GGML_TYPE_F32?2e-5:0.008);
         ok=ok&&pass;
         std::printf("type=%s D=%d N=%d view=%d inplace=%d yarn=%d ff=%d four_axes=%d relative_l2=%.9g maxabs=%.9g identical=%zu/%zu %s\n",ggml_type_name(c.type),c.d,c.n,c.view,c.inplace,c.yarn,c.factors,c.four_axes,relative,maxabs,identical,out.size(),pass?"PASS":"FAIL");
     }
+    if(dump&&std::fclose(dump))ok=false;
     ggml_backend_free(ai);ggml_backend_free(cpu);return ok?0:1;
 }

@@ -9,6 +9,7 @@
 #include "ocr-down-vector-v44.h"
 #include "ocr-concat-tcm-v46.h"
 #include "ocr-worker-events.h"
+#include "paddle-vision-rope-layout.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -5470,6 +5471,42 @@ void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+// Same F32 values and separate mul/sub/add sequence as the existing D72
+// prepared-table path. Table coefficients use ordinary contiguous loads, and
+// each token keeps its c/s vectors while rotating all heads. No approximation,
+// narrowing, graph lifetime change or shared-table mutation is introduced.
+static bool forward_vision_rope_planar(ggml::spacemit::context & ctx,ggml_tensor *op) {
+    if(!ctx.prepared_vision_rope||!paddle_vision_rope::planar_enabled()||
+       op->type!=GGML_TYPE_F32||op->src[0]->type!=GGML_TYPE_F32||
+       op->ne[0]!=72||op->src[0]->nb[0]!=sizeof(float)||op->nb[0]!=sizeof(float))return false;
+    const size_t vl=__riscv_vsetvl_e32m2(36);
+    GGML_ASSERT(vl==36); // This K3-only backend exposes VLEN1024.
+    const auto *src0=op->src[0];
+    const int64_t tokens=op->ne[2]*op->ne[3];
+    const int64_t begin=tokens*ctx.ith/ctx.nth,end=tokens*(ctx.ith+1)/ctx.nth;
+    for(int64_t token=begin;token<end;++token) {
+        const int64_t i2=token%op->ne[2],i3=token/op->ne[2];
+        const float *table=ctx.prepared_vision_rope+size_t(i2)*72;
+        const auto c=__riscv_vle32_v_f32m2(table,vl);
+        const auto s=__riscv_vle32_v_f32m2(table+36,vl);
+        for(int64_t head=0;head<op->ne[1];++head) {
+            const float *src=reinterpret_cast<const float*>(static_cast<const char*>(src0->data)+
+                i3*src0->nb[3]+i2*src0->nb[2]+head*src0->nb[1]);
+            float *dst=reinterpret_cast<float*>(static_cast<char*>(op->data)+
+                i3*op->nb[3]+i2*op->nb[2]+head*op->nb[1]);
+            const auto x0=__riscv_vle32_v_f32m2(src,vl);
+            const auto x1=__riscv_vle32_v_f32m2(src+36,vl);
+            const auto y0=__riscv_vfsub_vv_f32m2(__riscv_vfmul_vv_f32m2(x0,c,vl),
+                __riscv_vfmul_vv_f32m2(x1,s,vl),vl);
+            const auto y1=__riscv_vfadd_vv_f32m2(__riscv_vfmul_vv_f32m2(x0,s,vl),
+                __riscv_vfmul_vv_f32m2(x1,c,vl),vl);
+            __riscv_vse32_v_f32m2(dst,y0,vl);
+            __riscv_vse32_v_f32m2(dst+36,y1,vl);
+        }
+    }
+    return true;
+}
+
 template <typename T>
 static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0         = op->src[0];
@@ -5498,6 +5535,9 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     if (is_vision) {
         GGML_ASSERT(int64_t(n_dims) * 2 == op->ne[0]);
         GGML_ASSERT(ggml_get_op_params_i32(op, 15) == 0);
+        if constexpr(std::is_same_v<T,float>) {
+            if(forward_vision_rope_planar(ctx,op))return;
+        }
     }
 
     // YaRN correction dims

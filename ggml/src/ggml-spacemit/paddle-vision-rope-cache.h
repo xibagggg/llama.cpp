@@ -3,6 +3,7 @@
 // is rebuilt from current input values every call and never aliases op scratch.
 #include "ggml.h"
 #include "spacemit-opnode.h"
+#include "paddle-vision-rope-layout.h"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,7 @@ inline bool overlaps(const ggml_tensor * a,const ggml_tensor * b) {
 }
 struct entry {
     const ggml_tensor * positions;
+    bool planar;
     std::vector<float> values;
 };
 struct launch_tables {
@@ -46,6 +48,7 @@ struct launch_tables {
         const char * trace=std::getenv("GGML_SPACEMIT_VISION_ROPE_TRACE");
         if(trace&&!std::strcmp(trace,"1"))std::fprintf(stderr,"paddle-vision-rope: host enabled=%d nodes=%zu\n",int(table_enabled()),ops.size());
         if(!table_enabled())return;
+        const bool planar=planar_enabled(); // initialize on the host
         nodes.resize(ops.size(),nullptr);
         for(size_t i=0;i<ops.size();++i) {
             const auto * op=ops[i].node;
@@ -57,6 +60,9 @@ struct launch_tables {
             }
             if(!ops[i].fused.empty()||!policy(op))continue;
             const auto * pos=op->src[1];
+            const bool use_planar=planar&&op->type==GGML_TYPE_F32&&
+                op->src[0]&&op->src[0]->type==GGML_TYPE_F32&&
+                op->src[0]->nb[0]==sizeof(float)&&op->nb[0]==sizeof(float);
             bool immutable=true;
             // Reject graph writes, including aliased views/CPY targets. Raw
             // graph nodes include intermediate destinations hidden by fusion.
@@ -67,11 +73,11 @@ struct launch_tables {
                 }
             }
             if(!immutable)continue;
-            for(const auto & e:entries)if(e.positions==pos)nodes[i]=e.values.data();
+            for(const auto & e:entries)if(e.positions==pos&&e.planar==use_planar)nodes[i]=e.values.data();
             if(nodes[i])continue;
             const int64_t n=op->ne[2];
             if(n<=0||uint64_t(n)>SIZE_MAX/(72*sizeof(float)))continue;
-            entries.push_back({pos,std::vector<float>(size_t(n)*72)});
+            entries.push_back({pos,use_planar,std::vector<float>(size_t(n)*72)});
             auto & table=entries.back().values;
             const auto * ids=static_cast<const int32_t*>(pos->data);
             const float theta_scale=powf(10000.0f,-2.0f/36);
@@ -82,8 +88,14 @@ struct launch_tables {
                     // the original per-pair FP32 theta multiplication order.
                     if(pair==18)theta_h=float(ids[n+row]);
                     const float theta=pair<18?theta_t:theta_h;
-                    table[size_t(row)*72+2*pair]=cosf(theta);
-                    table[size_t(row)*72+2*pair+1]=sinf(theta);
+                    const float c=cosf(theta),s=sinf(theta);
+                    if(use_planar) {
+                        table[size_t(row)*72+pair]=c;
+                        table[size_t(row)*72+36+pair]=s;
+                    } else {
+                        table[size_t(row)*72+2*pair]=c;
+                        table[size_t(row)*72+2*pair+1]=s;
+                    }
                     theta_t*=theta_scale;theta_h*=theta_scale;
                 }
             }
