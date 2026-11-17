@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -1276,6 +1277,12 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     (void)ocr_fa_schedule::configured_rows(ggml_fa_tile_config::Q);
     (void)ocr_fa_schedule::separate_barrier_enabled();
     ocr_quant_phases::prepare_on_host();
+    // Workers only publish their actual scratch views. Diagnostic I/O and
+    // /proc parsing stay on the host after the launch has synchronized.
+    const char * tcm_trace_option = std::getenv("GGML_SPACEMIT_TCM_TRACE");
+    const bool tcm_trace = tcm_trace_option && !std::strcmp(tcm_trace_option, "1");
+    std::array<spert::SharedBufferView, 8> tcm_views{};
+    std::array<int, 8> tcm_cpus{};
     spacemit_host_trace("graph-launch-begin");
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
@@ -1283,7 +1290,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
          attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
-         op_progress, progress_sequence](spert::Context * runtime) {
+         op_progress, progress_sequence, tcm_trace, &tcm_views, &tcm_cpus](spert::Context * runtime) {
             const uint32_t ith = runtime->program_id(0);
             if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
                 throw std::runtime_error("inference worker is outside AI cores 8-15");
@@ -1303,6 +1310,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                       attention_work_queue, !use_ddr && shared_mem_size > 0 &&
                           scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
 
+            if (tcm_trace && ith < tcm_views.size()) {
+                tcm_views[ith] = shared;
+                tcm_cpus[ith] = sched_getcpu();
+            }
             ctx.diagnostic_subphase = op_progress ? &op_progress->lanes[ith].subphase : nullptr;
 
             size_t node_index = 0;
@@ -1365,6 +1376,34 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     spacemit_host_trace("graph-launch-end");
     const spert::Status status = fut.sync();
     spacemit_host_trace("graph-sync-end");
+    if (tcm_trace) {
+        for (uint32_t lane = 0; lane < n_threads && lane < tcm_views.size(); ++lane) {
+            const auto view = tcm_views[lane];
+            const uintptr_t address = reinterpret_cast<uintptr_t>(view.data);
+            bool hardware_tcm = false;
+            uintptr_t map_start = 0, map_end = 0;
+            unsigned long long map_offset = 0;
+            FILE * maps = std::fopen("/proc/self/maps", "r");
+            if (maps) {
+                char line[1024];
+                while (std::fgets(line, sizeof(line), maps)) {
+                    unsigned long long start = 0, end = 0, offset = 0;
+                    if (std::sscanf(line, "%llx-%llx %*s %llx", &start, &end, &offset) == 3 &&
+                        std::strstr(line, "/dev/tcm") && address >= start && address < end &&
+                        view.size <= end - address) {
+                        hardware_tcm = true;
+                        map_start = uintptr_t(start); map_end = uintptr_t(end); map_offset = offset;
+                        break;
+                    }
+                }
+                std::fclose(maps);
+            }
+            GGML_LOG_INFO("spacemit-tcm-trace: graph=%llu nodes=%zu lane=%u cpu=%d scratch=%p bytes=%zu hardware_tcm=%d map=%p-%p device_offset=0x%llx\n",
+                          static_cast<unsigned long long>(progress_sequence), opnodes.size(), lane,
+                          tcm_cpus[lane], view.data, view.size, int(hardware_tcm),
+                          reinterpret_cast<void *>(map_start), reinterpret_cast<void *>(map_end), map_offset);
+        }
+    }
     spacemit_kernels::rvv::drain_ocr_worker_events();
 
     if (op_hash_trace != nullptr) {

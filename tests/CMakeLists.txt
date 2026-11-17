@@ -381,9 +381,34 @@ endif()
 # K3 numerical regression for the opt-in Paddle vision IME2 kernel.
 if (GGML_SPACEMIT)
     llama_build(test-paddle-f16-ime2.cpp LINK ggml)
-    llama_test(test-paddle-f16-ime2 LABEL spacemit)
-    set_tests_properties(test-paddle-f16-ime2 PROPERTIES ENVIRONMENT
-        "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    set(paddle_f16_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    set(paddle_f16_reference "${CMAKE_CURRENT_BINARY_DIR}/paddle-f16-ime2-panel-reference.bin")
+    # A fresh process is needed for each panel count because the kernel caches
+    # its environment setting. The fixture always regenerates the full output.
+    llama_test(test-paddle-f16-ime2 LABEL spacemit ARGS --write-reference "${paddle_f16_reference}")
+    set_tests_properties(test-paddle-f16-ime2 PROPERTIES
+        ENVIRONMENT "${paddle_f16_env};GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=1;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0"
+        FIXTURES_SETUP paddle_f16_panel_reference RUN_SERIAL TRUE)
+    foreach(paddle_f16_panels RANGE 2 4)
+        set(paddle_f16_test "test-paddle-f16-ime2-panels-${paddle_f16_panels}")
+        llama_test(test-paddle-f16-ime2 NAME "${paddle_f16_test}" LABEL spacemit
+            ARGS --compare-reference "${paddle_f16_reference}")
+        set_tests_properties("${paddle_f16_test}" PROPERTIES
+            ENVIRONMENT "${paddle_f16_env};GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=${paddle_f16_panels};GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0"
+            FIXTURES_REQUIRED paddle_f16_panel_reference RUN_SERIAL TRUE)
+    endforeach()
+    # Wider activation packing and M16 scheduling must preserve the same bits.
+    # K4304 retains its supported fallback when these switches are requested.
+    foreach(paddle_f16_m16 RANGE 0 1)
+        foreach(paddle_f16_panels IN ITEMS 1 4)
+            set(paddle_f16_test "test-paddle-f16-ime2-pack64-m16-${paddle_f16_m16}-panels-${paddle_f16_panels}")
+            llama_test(test-paddle-f16-ime2 NAME "${paddle_f16_test}" LABEL spacemit
+                ARGS --compare-reference "${paddle_f16_reference}")
+            set_tests_properties("${paddle_f16_test}" PROPERTIES
+                ENVIRONMENT "${paddle_f16_env};GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=${paddle_f16_panels};GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=${paddle_f16_m16}"
+                FIXTURES_REQUIRED paddle_f16_panel_reference RUN_SERIAL TRUE)
+        endforeach()
+    endforeach()
 endif()
 
 if (GGML_SPACEMIT)

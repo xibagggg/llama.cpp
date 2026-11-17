@@ -15,6 +15,24 @@ inline bool enabled() {
     static const bool value=[] {const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_IME2");return p&&!std::strcmp(p,"1");}();
     return value;
 }
+// Diagnostic opt-in: number of this worker's W32 panels resident in TCM.
+// K4304 falls back to one panel because of the per-worker TCM capacity.
+inline int requested_panels() {
+    static const int value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_PANEL_TILES");
+        return p?std::max(1,std::min(4,std::atoi(p))):1;
+    }();
+    return value;
+}
+// Diagnostic opt-in. M16 shares weight vector loads across two packed A8 groups.
+// Each group retains its own high/residual scale and original K accumulation order.
+inline bool m16_enabled() {
+    static const bool value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_M16");
+        return p&&!std::strcmp(p,"1");
+    }();
+    return value;
+}
 inline bool selected(const ggml_tensor *w) {
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
         w->ne[2] != 1 || w->ne[3] != 1 || std::strncmp(w->name,"v.blk.",6)) return false;
@@ -51,6 +69,82 @@ __attribute__((noinline)) static void kernel32(const _Float16 *x,const _Float16 
       :[x]"+&r"(x),[w]"+&r"(w),[w1]"+&r"(w1),[w2]"+&r"(w2),[w3]"+&r"(w3),[blocks]"+&r"(blocks)
       :[c]"r"(c)
       :"t0","v2","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","memory");
+}
+// Two existing M8 packs share W loads. FP32 output never narrows to F16.
+__attribute__((noinline)) static void kernel16(
+    const _Float16 *x0, const _Float16 *x1, const _Float16 *w,
+    float *c0, float *c1, int K) {
+    const _Float16 *w1=w+8*K, *w2=w+16*K, *w3=w+24*K;
+    int blocks=K/8;
+    asm volatile(
+      "vsetvli t0,zero,e32,m8,ta,ma\n\t"
+      "vmv.v.i v16,0\n\tvmv.v.i v24,0\n\t"
+      "vsetvli t0,zero,e16,m1,ta,ma\n\t"
+      "1:\n\t"
+      "vle16.v v2,(%[x0])\n\tvle16.v v3,(%[x1])\n\t"
+      "vle16.v v8,(%[w])\n\tvle16.v v9,(%[w1])\n\t"
+      "vle16.v v10,(%[w2])\n\tvle16.v v11,(%[w3])\n\t"
+      "smt.vfwmadot v16,v2,v8\n\tsmt.vfwmadot v24,v3,v8\n\t"
+      "smt.vfwmadot v18,v2,v9\n\tsmt.vfwmadot v26,v3,v9\n\t"
+      "smt.vfwmadot v20,v2,v10\n\tsmt.vfwmadot v28,v3,v10\n\t"
+      "smt.vfwmadot v22,v2,v11\n\tsmt.vfwmadot v30,v3,v11\n\t"
+      "addi %[x0],%[x0],128\n\taddi %[x1],%[x1],128\n\t"
+      "addi %[w],%[w],128\n\taddi %[w1],%[w1],128\n\t"
+      "addi %[w2],%[w2],128\n\taddi %[w3],%[w3],128\n\t"
+      "addi %[blocks],%[blocks],-1\n\tbnez %[blocks],1b\n\t"
+      "vsetvli t0,zero,e32,m2,ta,ma\n\t"
+      "vse32.v v16,(%[c0])\n\taddi t0,%[c0],256\n\tvse32.v v18,(t0)\n\t"
+      "addi t0,%[c0],512\n\tvse32.v v20,(t0)\n\t"
+      "addi t0,%[c0],768\n\tvse32.v v22,(t0)\n\t"
+      "vse32.v v24,(%[c1])\n\taddi t0,%[c1],256\n\tvse32.v v26,(t0)\n\t"
+      "addi t0,%[c1],512\n\tvse32.v v28,(t0)\n\t"
+      "addi t0,%[c1],768\n\tvse32.v v30,(t0)\n\t"
+      : [x0]"+&r"(x0), [x1]"+&r"(x1), [w]"+&r"(w), [w1]"+&r"(w1),
+        [w2]"+&r"(w2), [w3]"+&r"(w3), [blocks]"+&r"(blocks)
+      : [c0]"r"(c0), [c1]"r"(c1)
+      : "t0", "v2", "v3", "v8", "v9", "v10", "v11",
+        "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+        "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
+}
+// Diagnostic opt-in. The 64-wide path preserves the original per-value
+// high/residual arithmetic and changes only vector width and packed stores.
+inline bool wide_activation_pack() {
+    static const bool value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH");
+        return p&&!std::strcmp(p,"64");
+    }();
+    return value;
+}
+inline void pack_activation64(const float *x,_Float16 *px,_Float16 *pl,
+                              float scale,int group,int M,int K) {
+    // For lane i, half-index=(i/8)*64+i%8 in the existing K8/M8 layout.
+    // Maximum byte index is 910, so u16 offsets are sufficient.
+    const auto ids=__riscv_vid_v_u16m1(64);
+    const auto offsets=__riscv_vsll_vx_u16m1(__riscv_vadd_vv_u16m1(
+        __riscv_vsll_vx_u16m1(__riscv_vsrl_vx_u16m1(ids,3,64),6,64),
+        __riscv_vand_vx_u16m1(ids,7,64),64),1,64);
+    for(int r=0;r<8;++r)for(int k=0;k<K;k+=64) {
+        const size_t vl=std::min(64,K-k);
+        const size_t off=size_t(group)*8*K+size_t(k)*8+r*8;
+        if(group*8+r>=M) {
+            const auto zero=__riscv_vfmv_v_f_f16m1(0,vl);
+            __riscv_vsuxei16_v_f16m1(px+off,offsets,zero,vl);
+            __riscv_vsuxei16_v_f16m1(pl+off,offsets,zero,vl);
+            continue;
+        }
+        const auto a=__riscv_vfmul_vf_f32m2(
+            __riscv_vle32_v_f32m2(x+size_t(group*8+r)*K+k,vl),scale,vl);
+        auto h=__riscv_vfncvt_f_f_w_f16m1(a,vl);
+        auto h32=__riscv_vfwcvt_f_f_v_f32m2(h,vl);
+        const auto small=__riscv_vmflt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(h32,vl),0x1p-14f,vl);
+        h32=__riscv_vfmerge_vfm_f32m2(h32,0.0f,small,vl);
+        h=__riscv_vfncvt_f_f_w_f16m1(h32,vl);
+        const auto lo=__riscv_vfncvt_f_f_w_f16m1(
+            __riscv_vfmul_vf_f32m2(__riscv_vfsub_vv_f32m2(a,h32,vl),4096.0f,vl),vl);
+        // All indices are distinct, so unordered stores retain exact layout.
+        __riscv_vsuxei16_v_f16m1(pl+off,offsets,lo,vl);
+        __riscv_vsuxei16_v_f16m1(px+off,offsets,h,vl);
+    }
 }
 inline bool supported(const ggml_tensor *op) {
     return op&&op->op==GGML_OP_MUL_MAT&&selected(op->src[0])&&op->src[1]&&
@@ -102,6 +196,10 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             }
             const float maximum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m2_f32m1(vmax,__riscv_vfmv_v_f_f32m1(0,1),64));
             const float scale=scale_for(maximum);scales[g]=scale;
+            if(wide_activation_pack()) {
+                pack_activation64(x,px,pl,scale,g,M,K);
+                continue;
+            }
             for(int k=0;k<K;k+=8)for(int r=0;r<8;++r) {
                 const size_t off=size_t(g)*8*K+k*8+r*8;
                 if(g*8+r>=M){std::memset(px+off,0,16);std::memset(pl+off,0,16);continue;}
@@ -122,29 +220,66 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const auto *pw=reinterpret_cast<const _Float16*>(static_cast<const char*>(op->src[0]->data)+128);
         float wscale;std::memcpy(&wscale,op->src[0]->data,4);
         auto *base=static_cast<uint8_t*>(ctx.shared.data);
-        auto *sw=reinterpret_cast<_Float16*>(base+128),*sx=sw+tile_n*K;
-        auto *temp=reinterpret_cast<float*>(sx+8*K),*low=temp+256;
-        std::memset(base,0xa5,128);std::memset(low+256,0xa5,128);
+        const size_t weight_bytes=size_t(tile_n)*K*2;
+        const size_t activation_bytes=size_t(8)*K*2;
+        // M16 is admitted only where both high and residual A16 staging plus
+        // W32 and FP32 temporaries fit. K4304 keeps the original M8 path.
+        const bool m16=m16_enabled()&&K==1152&&
+            ctx.shared.size>=weight_bytes+4*activation_bytes+4352;
+        const int staged_groups=m16?2:1;
+        const int tile_floats=m16?512:256;
+        const size_t staged_bytes=size_t(staged_groups)*activation_bytes;
+        const size_t scratch_bytes=size_t(2)*tile_floats*sizeof(float)+256;
+        const size_t fixed_bytes=2*staged_bytes+scratch_bytes;
+        const int capacity=ctx.shared.size>fixed_bytes?int((ctx.shared.size-fixed_bytes)/weight_bytes):0;
+        const int panels=std::max(1,std::min(requested_panels(),capacity));
+        const bool resident_low=m16||panels>1;
+        auto *sw=reinterpret_cast<_Float16*>(base+128),*sx=sw+size_t(panels)*tile_n*K;
+        auto *sl=resident_low?sx+size_t(staged_groups)*8*K:sx;
+        auto *temp=reinterpret_cast<float*>(sx+size_t(resident_low?2:1)*staged_groups*8*K),*low=temp+tile_floats;
+        GGML_ASSERT(ctx.shared.size>=size_t(panels)*weight_bytes+(resident_low?2:1)*staged_bytes+scratch_bytes);
+        std::memset(base,0xa5,128);std::memset(low+tile_floats,0xa5,128);
         auto *out=static_cast<float*>(op->data);
-        for(int nb=int(ctx.ith);nb<(N+tile_n-1)/tile_n;nb+=int(ctx.nth)) {
-            std::memcpy(sw,pw+size_t(nb)*tile_n*K,size_t(tile_n)*K*2);
-            for(int g=0;g<groups;++g) {
-                std::memcpy(sx,px+size_t(g)*8*K,8*K*2);
-                {
-                    kernel32(sx,sw,temp,K);
-                    std::memcpy(sx,pl+size_t(g)*8*K,8*K*2);
-                    kernel32(sx,sw,low,K);
-                    for(int i=0;i<256;++i)temp[i]+=low[i]*(1.0f/4096);
-                    const float inverse=1/(wscale*scales[g]);
-                    for(int i=0;i<256;++i)temp[i]*=inverse;
-                    const int first_n=nb*tile_n;
-                    for(int o=0;o<4&&first_n+o*8<N;++o)for(int r=0;r<8&&g*8+r<M;++r)
-                        std::memcpy(out+size_t(g*8+r)*N+first_n+o*8,temp+o*64+r*8,
-                                    size_t(std::min(8,N-first_n-o*8))*4);
+        const int ntiles=(N+tile_n-1)/tile_n;
+        // Group this worker's existing strided panels. This keeps the same
+        // output ownership and avoids the load imbalance of global N96/N128.
+        for(int first_nb=int(ctx.ith);first_nb<ntiles;first_nb+=panels*int(ctx.nth)) {
+            const int active=std::min(panels,1+(ntiles-1-first_nb)/int(ctx.nth));
+            for(int p=0;p<active;++p) {
+                const int nb=first_nb+p*int(ctx.nth);
+                std::memcpy(sw+size_t(p)*tile_n*K,pw+size_t(nb)*tile_n*K,weight_bytes);
+            }
+            for(int g=0;g<groups;) {
+                // The final odd A8 group uses kernel32. Never read a second
+                // group beyond the allocated packed high/residual workspace.
+                const int batch_groups=m16&&g+1<groups?2:1;
+                const size_t copy_bytes=size_t(batch_groups)*activation_bytes;
+                std::memcpy(sx,px+size_t(g)*8*K,copy_bytes);
+                if(resident_low)std::memcpy(sl,pl+size_t(g)*8*K,copy_bytes);
+                for(int p=0;p<active;++p) {
+                    const auto *weights=sw+size_t(p)*tile_n*K;
+                    if(batch_groups==2)kernel16(sx,sx+8*K,weights,temp,temp+256,K);
+                    else kernel32(sx,weights,temp,K);
+                    if(!resident_low)std::memcpy(sl,pl+size_t(g)*8*K,copy_bytes);
+                    if(batch_groups==2)kernel16(sl,sl+8*K,weights,low,low+256,K);
+                    else kernel32(sl,weights,low,K);
+                    const int first_n=(first_nb+p*int(ctx.nth))*tile_n;
+                    for(int group=0;group<batch_groups;++group) {
+                        auto *result=temp+group*256;
+                        const auto *residual=low+group*256;
+                        for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
+                        const float inverse=1/(wscale*scales[g+group]);
+                        for(int i=0;i<256;++i)result[i]*=inverse;
+                        for(int o=0;o<4&&first_n+o*8<N;++o)
+                            for(int r=0;r<8&&(g+group)*8+r<M;++r)
+                                std::memcpy(out+size_t((g+group)*8+r)*N+first_n+o*8,result+o*64+r*8,
+                                            size_t(std::min(8,N-first_n-o*8))*4);
+                    }
                 }
+                g+=batch_groups;
             }
         }
-        for(int i=0;i<128;++i)GGML_ASSERT(base[i]==0xa5&&reinterpret_cast<uint8_t*>(low+256)[i]==0xa5);
+        for(int i=0;i<128;++i)GGML_ASSERT(base[i]==0xa5&&reinterpret_cast<uint8_t*>(low+tile_floats)[i]==0xa5);
         return true;
     }
 };
