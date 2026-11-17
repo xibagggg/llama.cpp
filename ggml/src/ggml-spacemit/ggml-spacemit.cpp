@@ -37,6 +37,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-profile.h"
+#include "paddle-f16-phases.h"
 #include "ocr-op-timing.h"
 #include "ocr-op-progress.h"
 #include "ocr-pc8-options.h"
@@ -1307,6 +1308,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     // Phase storage registers atexit and allocates several MiB. Initialize and
     // prefault it on the host, before any worker can enter record::begin().
     if(ocr_fa_phases_v50::enabled())(void)ocr_fa_phases_v50::storage::get();
+    if(paddle_f16_phases::enabled())(void)paddle_f16_phases::storage::get();
     ocr_op_progress::storage * op_progress = nullptr;
     ggml::spacemit::scratch_mode scratch_mode;
     const uint64_t progress_sequence = ocr_op_progress::next_sequence();

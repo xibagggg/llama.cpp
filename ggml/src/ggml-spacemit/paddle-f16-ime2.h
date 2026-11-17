@@ -6,6 +6,7 @@
 #include "spacemit-opnode.h"
 #include "rvv_kernels.h"
 #include "paddle-f16-kblock-plan.h"
+#include "paddle-f16-phases.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -376,7 +377,15 @@ struct traits final:ggml::spacemit::tensor_traits_base {
     }
     bool compute(ggml::spacemit::context &ctx,ggml_tensor *op,ggml_tensor *dst,
                  const ggml_tensor *bias,bool gelu)const {
+        return paddle_f16_phases::enabled()?compute_impl<true>(ctx,op,dst,bias,gelu):
+                                           compute_impl<false>(ctx,op,dst,bias,gelu);
+    }
+    template<bool PROFILE>
+    bool compute_impl(ggml::spacemit::context &ctx,ggml_tensor *op,ggml_tensor *dst,
+                      const ggml_tensor *bias,bool gelu)const {
         if(!supported(op))return false;
+        paddle_f16_phases::record timer;
+        if constexpr(PROFILE)timer.begin(ctx,op);
         const int K=int(op->src[0]->ne[0]),N=int(op->ne[0]),M=int(op->ne[1]),groups=(M+7)/8;
         constexpr int tile_n=32;
         size_t size=0;work_size(ctx.nth,op,size);
@@ -415,7 +424,9 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 __riscv_vse16_v_f16m1(px+off,h,8);
             }
         }
+        if constexpr(PROFILE)timer.tick(0);
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+        if constexpr(PROFILE)timer.tick(1);
         const auto *pw=reinterpret_cast<const _Float16*>(static_cast<const char*>(op->src[0]->data)+128);
         float wscale;std::memcpy(&wscale,op->src[0]->data,4);
         auto *base=static_cast<uint8_t*>(ctx.shared.data);
@@ -439,6 +450,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             auto *partial_low=partial+size_t(4)*groups*256;
             auto *out=static_cast<float*>(dst->data);
             const int ntiles=(N+tile_n-1)/tile_n;
+            if constexpr(PROFILE){timer.r.kblock=block_k;timer.r.panels=panel_count;timer.tick(9);}
             // Preserve the existing strided N32 ownership: with N1152/six
             // workers, each lane handles four plus two, or three plus three.
             for(int first_nb=int(ctx.ith);first_nb<ntiles;first_nb+=panel_count*int(ctx.nth)) {
@@ -455,6 +467,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                                         pw+size_t(nb*tile_n+o*8)*K+size_t(k0)*8,
                                         size_t(8)*kb*2);
                     }
+                    if constexpr(PROFILE)timer.tick(2);
                     for(int g=0;g<groups;g+=2) {
                         const int batch_groups=std::min(2,groups-g);
                         for(int j=0;j<batch_groups;++j) {
@@ -463,6 +476,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                             std::memcpy(kl+size_t(j)*8*kb,
                                         pl+size_t(g+j)*8*K+size_t(k0)*8,size_t(8)*kb*2);
                         }
+                        if constexpr(PROFILE)timer.tick(3);
                         for(int p=0;p<active;++p) {
                             auto *ph=high+p*panel_floats,*lo=low+p*panel_floats;
                             auto *save=partial+(size_t(p)*groups+g)*256;
@@ -472,6 +486,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                                 std::memcpy(lo,save_low,size_t(batch_groups)*256*sizeof(float));
                             }
                             const auto *w=kw+size_t(p)*tile_n*kb;
+                            if constexpr(PROFILE)timer.tick(4);
                             if(batch_groups==2) {
                                 kernel16_continue(kx,kx+8*kb,w,ph,ph+256,kb,k0!=0);
                                 kernel16_continue(kl,kl+8*kb,w,lo,lo+256,kb,k0!=0);
@@ -479,9 +494,11 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                                 kernel32_continue(kx,w,ph,kb,k0!=0);
                                 kernel32_continue(kl,w,lo,kb,k0!=0);
                             }
+                            if constexpr(PROFILE)timer.tick(5);
                             if(k0+kb<K) {
                                 std::memcpy(save,ph,size_t(batch_groups)*256*sizeof(float));
                                 std::memcpy(save_low,lo,size_t(batch_groups)*256*sizeof(float));
+                                if constexpr(PROFILE)timer.tick(6);
                                 continue;
                             }
                             const int first_n=(first_nb+p*int(ctx.nth))*tile_n;
@@ -491,7 +508,9 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                                 for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                                 const float inverse=1/(wscale*scales[g+j]);
                                 for(int i=0;i<256;++i)result[i]*=inverse;
+                                if constexpr(PROFILE)timer.tick(7);
                                 store_result_tile(out,result,M,N,(g+j)*8,first_n,bias_data,gelu);
+                                if constexpr(PROFILE)timer.tick(8);
                             }
                         }
                     }
@@ -499,6 +518,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             }
             for(int i=0;i<128;++i)
                 GGML_ASSERT(base[i]==0xa5&&reinterpret_cast<uint8_t*>(low+panel_count*panel_floats)[i]==0xa5);
+            if constexpr(PROFILE)timer.finish();
             return true;
         }
         const size_t weight_bytes=size_t(tile_n)*K*2;
@@ -522,6 +542,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         std::memset(base,0xa5,128);std::memset(low+tile_floats,0xa5,128);
         auto *out=static_cast<float*>(dst->data);
         const int ntiles=(N+tile_n-1)/tile_n;
+        if constexpr(PROFILE){timer.r.panels=panels;timer.tick(9);}
         // Group this worker's existing strided panels. This keeps the same
         // output ownership and avoids the load imbalance of global N96/N128.
         for(int first_nb=int(ctx.ith);first_nb<ntiles;first_nb+=panels*int(ctx.nth)) {
@@ -530,6 +551,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 const int nb=first_nb+p*int(ctx.nth);
                 std::memcpy(sw+size_t(p)*tile_n*K,pw+size_t(nb)*tile_n*K,weight_bytes);
             }
+            if constexpr(PROFILE)timer.tick(2);
             for(int g=0;g<groups;) {
                 // The final odd A8 group uses kernel32. Never read a second
                 // group beyond the allocated packed high/residual workspace.
@@ -537,13 +559,17 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 const size_t copy_bytes=size_t(batch_groups)*activation_bytes;
                 std::memcpy(sx,px+size_t(g)*8*K,copy_bytes);
                 if(resident_low)std::memcpy(sl,pl+size_t(g)*8*K,copy_bytes);
+                if constexpr(PROFILE)timer.tick(3);
                 for(int p=0;p<active;++p) {
                     const auto *weights=sw+size_t(p)*tile_n*K;
                     if(batch_groups==2)kernel16(sx,sx+8*K,weights,temp,temp+256,K);
                     else kernel32(sx,weights,temp,K);
+                    if constexpr(PROFILE)timer.tick(5);
                     if(!resident_low)std::memcpy(sl,pl+size_t(g)*8*K,copy_bytes);
+                    if constexpr(PROFILE)timer.tick(3);
                     if(batch_groups==2)kernel16(sl,sl+8*K,weights,low,low+256,K);
                     else kernel32(sl,weights,low,K);
+                    if constexpr(PROFILE)timer.tick(5);
                     const int first_n=(first_nb+p*int(ctx.nth))*tile_n;
                     for(int group=0;group<batch_groups;++group) {
                         auto *result=temp+group*256;
@@ -551,13 +577,16 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                         for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                         const float inverse=1/(wscale*scales[g+group]);
                         for(int i=0;i<256;++i)result[i]*=inverse;
+                        if constexpr(PROFILE)timer.tick(7);
                         store_result_tile(out,result,M,N,(g+group)*8,first_n,bias_data,gelu);
+                        if constexpr(PROFILE)timer.tick(8);
                     }
                 }
                 g+=batch_groups;
             }
         }
         for(int i=0;i<128;++i)GGML_ASSERT(base[i]==0xa5&&reinterpret_cast<uint8_t*>(low+tile_floats)[i]==0xa5);
+        if constexpr(PROFILE)timer.finish();
         return true;
     }
 };
