@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <optional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -44,6 +46,7 @@
 #include "ocr-pv-pipeline.h"
 #include "ocr-quant-phases.h"
 #include "ocr-fa-schedule.h"
+#include "spacemit-tcm-ownership-linux.h"
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -1255,10 +1258,28 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     if(ocr_fa_phases_v50::enabled())(void)ocr_fa_phases_v50::storage::get();
     ocr_op_progress::storage * op_progress = nullptr;
     ggml::spacemit::scratch_mode scratch_mode;
+    // PINNED_TCM pins a SPERT allocation, but does not verify its backing or
+    // register v2 ownership. Keep the extra protocol verification opt-in.
+    const bool tcm_ownership_enabled = [] {
+        const char * value = std::getenv("GGML_SPACEMIT_TCM_OWNERSHIP");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    ggml::spacemit::tcm_ownership::catalog tcm_catalog;
+    ggml::spacemit::tcm_ownership::launch_state tcm_result;
     const uint64_t progress_sequence = ocr_op_progress::next_sequence();
     const size_t shared_mem_size = spert::backend_info().shared_mem_size;
     try {
         scratch_mode = ggml::spacemit::configured_scratch_mode();
+        if (tcm_ownership_enabled) {
+            if (n_threads <= 0 || size_t(n_threads) > ggml::spacemit::tcm_ownership::max_lanes)
+                throw std::runtime_error("TCM ownership worker count exceeds supported lane capacity");
+            if (scratch_mode != ggml::spacemit::scratch_mode::pinned_tcm)
+                throw std::runtime_error("TCM ownership requires GGML_SPACEMIT_SHARED_MODE=PINNED_TCM");
+            const auto error = ggml::spacemit::tcm_ownership::prepare_platform_catalog(tcm_catalog, shared_mem_size);
+            if (error != ggml::spacemit::tcm_ownership::error::ok)
+                throw std::runtime_error(std::string("real TCM catalog: ") +
+                    ggml::spacemit::tcm_ownership::name(error));
+        }
         if (scratch_mode == ggml::spacemit::scratch_mode::locked_ddr && shared_mem_size)
             sess->ddr_scratch.prepare(n_threads, shared_mem_size);
         op_progress = ocr_op_progress::get();
@@ -1284,19 +1305,45 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
          attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
-         op_progress, progress_sequence](spert::Context * runtime) {
+         op_progress, progress_sequence,
+         tcm_values = tcm_ownership_enabled ? &tcm_catalog : nullptr,
+         tcm_state = &tcm_result](spert::Context * runtime) {
             const uint32_t ith = runtime->program_id(0);
-            if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
-                throw std::runtime_error("inference worker is outside AI cores 8-15");
-            ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
             const bool use_ddr = scratch_mode == ggml::spacemit::scratch_mode::locked_ddr;
-            ggml::spacemit::tcm_lease lease(*runtime, shared_mem_size,
-                scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
-            ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,11,nullptr);
-            auto shared = use_ddr ? ddr_scratch->lane(ith) :
-                (shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{});
-            if (shared_mem_size > 0 && (!shared || shared.size < shared_mem_size)) {
-                throw std::runtime_error("ggml-spacemit: worker shared buffer unavailable");
+            // optional stores the nonmovable pool lease on the worker stack.
+            // In ownership mode a scratch preparation failure must still join
+            // the collective barrier instead of stranding the other lanes.
+            std::optional<ggml::spacemit::tcm_lease> pool_lease;
+            spert::SharedBufferView shared{};
+            auto preparation = ggml::spacemit::tcm_ownership::error::ok;
+            try {
+                if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
+                    throw std::runtime_error("inference worker is outside AI cores 8-15");
+                ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
+                pool_lease.emplace(*runtime, shared_mem_size,
+                    scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+                ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,11,nullptr);
+                shared = use_ddr ? ddr_scratch->lane(ith) :
+                    (shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{});
+                if (shared_mem_size > 0 && (!shared || shared.size < shared_mem_size))
+                    throw std::runtime_error("ggml-spacemit: worker shared buffer unavailable");
+            } catch (...) {
+                if (!tcm_values) throw;
+                preparation = ggml::spacemit::tcm_ownership::error::scratch_unavailable;
+            }
+
+            ggml::spacemit::tcm_ownership::lease ownership(tcm_values, tcm_state, ith);
+            if (tcm_values) {
+                // All lanes publish preparation/claim errors before the same
+                // barrier, then collectively leave before the first operator.
+                // SPERT remains responsible for runtime/barrier cancellation.
+                ownership.acquire(shared.data, shared.size, preparation);
+                if (runtime->sync() != spert::Status::Ok)
+                    tcm_state->fail(ggml::spacemit::tcm_ownership::error::barrier_failed);
+                if (tcm_state->failed()) {
+                    ownership.release();
+                    return;
+                }
             }
 
             auto & ctx = contexts[ith];
@@ -1356,6 +1403,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 }
             }
 
+            ownership.release();
             ctx.clear();
 #ifdef GGML_BUILD_PROFILE
             ggml_profile_flush_tls();
@@ -1375,7 +1423,27 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         std::fclose(op_hash_trace);
     }
 
-    if (status != spert::Status::Ok) {
+    if (tcm_ownership_enabled) {
+        static std::atomic<bool> reported{false};
+        const char * diagnostics = std::getenv("GGML_SPACEMIT_TCM_DIAGNOSTICS");
+        if (tcm_result.failed() || (diagnostics && std::strcmp(diagnostics, "1") == 0) ||
+            !reported.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_INFO("ggml-spacemit: real TCM ownership graph=%llu runtime=%s error=%s\n",
+                static_cast<unsigned long long>(graph->uid),
+                ggml::spacemit::tcm_ownership::platform_version(),
+                ggml::spacemit::tcm_ownership::name(static_cast<ggml::spacemit::tcm_ownership::error>(
+                    tcm_result.first_error.load(std::memory_order_acquire))));
+            for (int i = 0; i < n_threads; ++i) {
+                const auto & lane = tcm_result.lanes[size_t(i)];
+                GGML_LOG_INFO("ggml-spacemit: TCM lane=%d cpu=%d tid=%d block=%d ptr=%p bytes=%zu "
+                    "claimed=%d released=%d acquire_error=%s release_error=%s\n", i,
+                    lane.cpu, lane.tid, lane.id, lane.data, lane.size, int(lane.claimed), int(lane.released),
+                    ggml::spacemit::tcm_ownership::name(lane.acquire_error),
+                    ggml::spacemit::tcm_ownership::name(lane.release_error));
+            }
+        }
+    }
+    if (status != spert::Status::Ok || tcm_result.failed()) {
         return GGML_STATUS_FAILED;
     }
     return GGML_STATUS_SUCCESS;
