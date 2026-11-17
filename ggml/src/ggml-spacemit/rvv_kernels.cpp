@@ -5537,7 +5537,9 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
         const int64_t i2 = (ir / op->ne[1]) % op->ne[2];
         const int64_t i1 = ir % op->ne[1];
 
-        if (i2 != last_i2) {
+        if (is_vision && ctx.prepared_vision_rope) {
+            cache = const_cast<float *>(ctx.prepared_vision_rope + size_t(i2) * op->ne[0]);
+        } else if (i2 != last_i2) {
             if (!mrope_used) {
                 // Standard / YaRN rope
                 float theta = (float) pos[i2];

@@ -24,6 +24,7 @@
 #include "spacemit-session.h"
 #include "spacemit-kernels.h"
 #include "spacemit-opnode.h"
+#include "paddle-vision-rope-cache.h"
 #include "spacemit-context.h"
 #include "ocr-norm-affine.h"
 
@@ -1189,6 +1190,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                           (unsigned long long)graph->uid);
     }
     const auto & opnodes = sess->cached_graph.nodes;
+    // Fresh tables from current positions: no graph-UID or address-only cache.
+    const paddle_vision_rope::launch_tables vision_rope_tables(graph,opnodes);
 
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
     size_t workspace_size = 0;
@@ -1286,7 +1289,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     spacemit_host_trace("graph-launch-begin");
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
-        [&opnodes, workspace_size = sess->workspace_size, workspace, contexts,
+        [&opnodes, &vision_rope_tables, workspace_size = sess->workspace_size, workspace, contexts,
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
          attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
@@ -1319,6 +1322,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             size_t node_index = 0;
             for (const auto & node : opnodes) {
                 ggml_tensor * op = node.node;
+                ctx.prepared_vision_rope = vision_rope_tables.get(node_index);
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index),1,op);
                 const uint64_t op_begin=op_timing?ocr_op_timing::now():0;
 

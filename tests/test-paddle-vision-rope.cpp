@@ -25,6 +25,9 @@ static bool run(ggml_backend_t backend, const config & c, std::vector<float> & o
     int sections[4]={q,q,q,q};
     auto y=c.inplace?ggml_rope_multi_inplace(ctx,x,pos,ff,c.d/2,sections,GGML_ROPE_TYPE_VISION,32768,10000.0f,c.yarn?0.7f:1.0f,c.yarn?0.5f:0.0f,c.yarn?1.2f:1.0f,32.0f,1.0f)
                     :ggml_rope_multi(ctx,x,pos,ff,c.d/2,sections,GGML_ROPE_TYPE_VISION,32768,10000.0f,c.yarn?0.7f:1.0f,c.yarn?0.5f:0.0f,c.yarn?1.2f:1.0f,32.0f,1.0f);
+    // Two consumers of the same position policy exercise table reuse while
+    // their activation values differ. The reference executes both rotations.
+    y=ggml_rope_multi(ctx,y,pos,ff,c.d/2,sections,GGML_ROPE_TYPE_VISION,32768,10000.0f,c.yarn?0.7f:1.0f,c.yarn?0.5f:0.0f,c.yarn?1.2f:1.0f,32.0f,1.0f);
     ggml_set_input(base);ggml_set_input(pos);if(ff)ggml_set_input(ff);ggml_set_output(y);
     if (!ggml_backend_supports_op(backend,y)) {
         std::fprintf(stderr,"backend=%s does not support VISION RoPE\n",ggml_backend_name(backend));
@@ -49,10 +52,17 @@ static bool run(ggml_backend_t backend, const config & c, std::vector<float> & o
         for(int i=0;i<c.d/2;++i)factors[i]=0.9f+0.01f*(i%21);
         ggml_backend_tensor_set(ff,factors.data(),0,factors.size()*sizeof(float));
     }
-    bool ok=ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS;
     std::vector<unsigned char> raw(ggml_nbytes(y));
+    bool ok=true;
+    out.clear();out.reserve(size_t(c.d)*H*c.n*B*2);
+    // Reuse this graph, allocation and position address with changed contents.
+    // Inplace input must also be restored before the second independent run.
+    for(int replay=0;replay<2;++replay) {
+    for(int axis=0;axis<4;++axis)for(int i=0;i<c.n;++i)ids[axis*c.n+i]=(i*17+axis*419+replay*773)%32768;
+    ggml_backend_tensor_set(pos,ids.data(),0,ids.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(base,c.type==GGML_TYPE_F32?static_cast<const void*>(f32.data()):static_cast<const void*>(f16.data()),0,nel*esize);
+    ok=ok&&ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS;
     if(ok)ggml_backend_tensor_get(y,raw.data(),0,raw.size());
-    out.clear();out.reserve(size_t(c.d)*H*c.n*B);
     for(int b=0;b<B;++b)for(int n=0;n<c.n;++n)for(int h=0;h<H;++h)for(int d=0;d<c.d;++d) {
         const auto offset=b*y->nb[3]+n*y->nb[2]+h*y->nb[1]+d*esize;
         float value;
@@ -60,6 +70,9 @@ static bool run(ggml_backend_t backend, const config & c, std::vector<float> & o
         else{ggml_fp16_t v;std::memcpy(&v,raw.data()+offset,2);value=ggml_fp16_to_fp32(v);}
         out.push_back(value);ok=ok&&std::isfinite(value);
     }
+    }
+    const auto half=out.size()/2;
+    ok=ok&&!std::equal(out.begin(),out.begin()+half,out.begin()+half);
     ggml_backend_buffer_free(buffer);ggml_free(ctx);return ok;
 }
 

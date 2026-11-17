@@ -32,12 +32,14 @@ struct context {
     // Produced by the immediately preceding cast-pair node only. Never persists
     // across a graph launch or an intervening workspace-writing operation.
     const ggml_tensor * ocr_prepared_attention = nullptr;
+    const float * prepared_vision_rope = nullptr;
 
     void reset(spert::Context & runtime_in, uint32_t ith_in, uint32_t nth_in,
                void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in,
                std::atomic<int64_t> * work_queue_in = nullptr, bool check_tcm_view_in = false) {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
+        prepared_vision_rope = nullptr;
         runtime        = &runtime_in;
         ith            = ith_in;
         nth            = nth_in;
@@ -52,6 +54,7 @@ struct context {
     void clear() {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
+        prepared_vision_rope = nullptr;
         runtime        = nullptr;
         ith            = 0;
         nth            = 0;
