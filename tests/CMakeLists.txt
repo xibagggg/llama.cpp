@@ -811,3 +811,12 @@ if (GGML_SPACEMIT)
     llama_test(test-paddle-qkv-content-cache NAME test-paddle-qkv-content-cache-on LABEL spacemit ARGS --compare-reference "${paddle_qkv_content_cache_reference}")
     set_tests_properties(test-paddle-qkv-content-cache-on PROPERTIES ENVIRONMENT "${paddle_qkv_content_cache_env};GGML_SPACEMIT_PADDLE_F16_QKV_CONTENT_CACHE=1;GGML_SPACEMIT_PADDLE_F16_QKV_CACHE_TRACE=1" FIXTURES_REQUIRED paddle_qkv_content_cache_reference RUN_SERIAL TRUE)
 endif()
+
+# Candidate-only numerical screen.  Keep this block out of the default build
+# until the board test has passed and the candidate is promoted.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-f16-f16-patch.cpp LINK ggml)
+    llama_test(test-paddle-f16-f16-patch LABEL spacemit)
+    set_tests_properties(test-paddle-f16-f16-patch PROPERTIES RUN_SERIAL TRUE ENVIRONMENT
+        "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_PADDLE_F16_F16_PATCH=1")
+endif()

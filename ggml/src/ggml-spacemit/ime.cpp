@@ -28,6 +28,7 @@
 #include "vec.h"
 #include "ocr-q4-f16.h"
 #include "paddle-f16-ime2.h"
+#include "paddle-f16-f16-patch.h"
 #include "paddle-pos-resize.h"
 #include "ocr-q4-pc8.h"
 
@@ -1237,6 +1238,10 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
         }
         switch (op->op) {
             case GGML_OP_MUL_MAT:
+                if (paddle_f16_f16_patch::selected(op)) {
+                    size = paddle_f16_f16_patch::work_bytes(op);
+                    return true;
+                }
                 if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32) {
                     const auto * traits = ggml_get_type_traits_cpu(op->src[0]->type);
                     if (traits && traits->vec_dot) {
@@ -1300,6 +1305,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
         if (ocr_ai_complete::forward(op, ctx.ith, ctx.nth)) return true;
         switch (op->op) {
             case GGML_OP_MUL_MAT:
+                if (paddle_f16_f16_patch::forward(ctx, op)) return true;
                 if (op->src[0]->type == GGML_TYPE_F16 &&
                     op->src[1]->type == GGML_TYPE_F32 &&
                     op->src[0]->nb[0] == sizeof(_Float16) &&
@@ -2165,6 +2171,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             if(ocr_im2col_f32::supported(op))return common;
             break;
         case GGML_OP_MUL_MAT:
+            if (paddle_f16_f16_patch::selected(op)) return common;
             if (op->src[0] && op->src[1] &&
                 // GGML collapses [K,1,1,1] to 1-D; packed Q4/Q8 weights
                 // still require their matrix trait. Do not widen higher-rank gates.
