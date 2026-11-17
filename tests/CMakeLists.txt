@@ -389,6 +389,16 @@ endif()
 if (GGML_SPACEMIT)
     llama_build(test-paddle-attention.cpp LINK ggml)
     llama_test(test-paddle-attention LABEL spacemit)
+    set(paddle_attention_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
     set_tests_properties(test-paddle-attention PROPERTIES ENVIRONMENT
-        "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+        "${paddle_attention_env};GGML_SPACEMIT_OCR_FA_FULL_KV=0")
+    add_test(NAME test-paddle-attention-fullkv-two-pass COMMAND $<TARGET_FILE:test-paddle-attention>)
+    set_tests_properties(test-paddle-attention-fullkv-two-pass PROPERTIES ENVIRONMENT
+        "${paddle_attention_env};GGML_SPACEMIT_OCR_FA_FULL_KV=2")
+    # N64/65 must not alias an undersized probability buffer as K64 scratch.
+    add_test(NAME test-paddle-attention-fullkv-head-cache COMMAND $<TARGET_FILE:test-paddle-attention>)
+    set_tests_properties(test-paddle-attention-fullkv-head-cache PROPERTIES ENVIRONMENT
+        "${paddle_attention_env};GGML_SPACEMIT_OCR_FA_FULL_KV=1;GGML_SPACEMIT_OCR_FA_HEAD_K_TCM=1;GGML_SPACEMIT_OCR_FA_FULL_PACK=1;GGML_SPACEMIT_OCR_FA_ALL_K_TCM=0")
+    set_tests_properties(test-paddle-attention test-paddle-attention-fullkv-two-pass
+        test-paddle-attention-fullkv-head-cache PROPERTIES LABELS spacemit RUN_SERIAL TRUE)
 endif()

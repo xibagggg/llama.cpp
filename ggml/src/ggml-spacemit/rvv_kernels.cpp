@@ -1852,7 +1852,12 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
         vd*padded*sizeof(_Float16)+passes*512*sizeof(float)+(cache?cached_key_bytes:0);};
     // Cache complete K tiles with V, leaving the final K tile transient in
     // the not-yet-written P buffer. Q16 fits without enlarging the TCM grant.
-    const bool head_cache=all_key_cache||(head_option&&passes==1&&ocr_fa_fullkv::direct_pack_enabled()&&bytes_for(16,true)<=ctx.shared.size);
+    // Uncached QK tiles temporarily use P before softmax writes it. Small
+    // crops must still reserve enough room for the full K64 copy and result;
+    // otherwise that scratch would overwrite the live V weights after P.
+    const bool head_cache=all_key_cache||(head_option&&passes==1&&
+        size_t(16)*padded*sizeof(_Float16)>=qk_bytes&&
+        ocr_fa_fullkv::direct_pack_enabled()&&bytes_for(16,true)<=ctx.shared.size);
     const int Q=head_cache?16:ocr_fa_fullkv::query32_enabled()&&bytes_for(32,false)<=ctx.shared.size?32:16;
     const size_t needed=all_key_cache?all_key_bytes:bytes_for(Q,head_cache);
     if(needed>ctx.shared.size||ir0<0||ir1>n*16)return false;
