@@ -377,3 +377,18 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# K3 numerical regression for the opt-in Paddle vision IME2 kernel.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-f16-ime2.cpp LINK ggml)
+    llama_test(test-paddle-f16-ime2 LABEL spacemit)
+    set_tests_properties(test-paddle-f16-ime2 PROPERTIES ENVIRONMENT
+        "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+endif()
+
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-attention.cpp LINK ggml)
+    llama_test(test-paddle-attention LABEL spacemit)
+    set_tests_properties(test-paddle-attention PROPERTIES ENVIRONMENT
+        "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+endif()

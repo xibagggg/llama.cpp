@@ -1,5 +1,11 @@
 #include "models.h"
 
+void llama_model_paddleocr::load_arch_tensors(llama_model_loader & ml) {
+    llama_model_ernie4_5::load_arch_tensors(ml);
+    // GET_ROWS must read the original quantized rows, not an IME matrix layout.
+    tok_embd->flags |= GGML_TENSOR_FLAG_NO_REPACK;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_paddleocr::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }

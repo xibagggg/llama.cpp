@@ -27,6 +27,7 @@
 #include "spine_mem_pool.h"
 #include "vec.h"
 #include "ocr-q4-f16.h"
+#include "paddle-f16-ime2.h"
 #include "ocr-q4-pc8.h"
 
 #include <fcntl.h>
@@ -1808,6 +1809,7 @@ static const tensor_traits_common               rvv_impl;
 }  // namespace ggml::cpu::riscv64_spacemit
 
 const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
+    if(paddle_f16_ime2::selected(cur))return &paddle_f16_ime2::impl;
     if(ocr_q4_pc8::selected(cur))return &ocr_q4_pc8::impl;
     if(ocr_q4_f16::selected(cur))return &ocr_q4_f16::impl;
     switch (cur->type) {
@@ -1958,6 +1960,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
 }
 
 size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    if(paddle_f16_ime2::selected(tensor))return paddle_f16_ime2::nbytes(tensor);
     if(ocr_q4_pc8::selected(tensor))return ocr_q4_pc8::nbytes(tensor);
     if(ocr_q4_f16::selected(tensor))return ocr_q4_f16::nbytes(tensor);
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {

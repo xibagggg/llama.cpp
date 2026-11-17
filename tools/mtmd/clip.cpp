@@ -1986,6 +1986,12 @@ struct clip_model_loader {
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
 
+                        // CLI limits count merged image tokens, not raw ViT patches.
+                        hparams.set_limit_image_tokens();
+                        if (hparams.custom_image_max_tokens > 0 && hparams.custom_image_min_tokens <= 0) {
+                            hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+                        }
+
                         hparams.set_warmup_n_tokens(28*28); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_DEEPSEEKOCR:

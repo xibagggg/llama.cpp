@@ -2050,7 +2050,8 @@ struct llama_model_ernie4_5_moe : public llama_model_ernie4_5 {
 
 struct llama_model_paddleocr : public llama_model_ernie4_5 {
     llama_model_paddleocr(const struct llama_model_params & params) : llama_model_ernie4_5(params) {}
-    // reuse load_arch_hparams and load_arch_tensors from llama_model_ernie4_5
+    // Reuse ERNIE hyperparameters, but keep embedding rows addressable.
+    void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);

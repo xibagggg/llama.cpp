@@ -21,7 +21,7 @@ inline bool eligible(const ggml_tensor *op){
     if(!enabled||!op||op->op!=GGML_OP_FLASH_ATTN_EXT||!op->src[0]||!op->src[1]||!op->src[2])return false;
     const auto *q=op->src[0],*k=op->src[1],*v=op->src[2];
     return q->type==GGML_TYPE_F32&&k->type==GGML_TYPE_F16&&v->type==GGML_TYPE_F16&&
-        q->ne[0]==72&&k->ne[0]==72&&v->ne[0]==72&&q->ne[1]>=GGML_FA_TILE_Q&&q->ne[1]<=4096&&
+        q->ne[0]==72&&k->ne[0]==72&&v->ne[0]==72&&q->ne[1]>=GGML_FA_TILE_Q&&q->ne[1]<=16384&&
         q->ne[1]==k->ne[1]&&q->ne[1]==v->ne[1]&&q->ne[2]==16&&k->ne[2]==16&&v->ne[2]==16&&
         q->ne[3]==1&&k->ne[3]==1&&v->ne[3]==1&&k->nb[0]==2&&v->nb[0]==2;
 }
