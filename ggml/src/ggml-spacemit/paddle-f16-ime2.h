@@ -3,6 +3,7 @@
 // FP32 activations use a scaled high/residual split and FP32 accumulation.
 // Enabled explicitly; all other shapes retain the existing RVV implementation.
 #include "spacemit-context.h"
+#include "paddle-f16-pipeline.h"
 #include "spacemit-opnode.h"
 #include "rvv_kernels.h"
 #include "paddle-f16-kblock-plan.h"
@@ -82,6 +83,7 @@ inline size_t kblock_lane_bytes(const ggml_tensor *op) {
 }
 inline bool selected(const ggml_tensor *w) {
     (void)output64_enabled(); // Resolve the process-wide option while loading weights on the host.
+    (void)paddle_f16_pipeline::enabled();
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
         w->ne[2] != 1 || w->ne[3] != 1) return false;
     const bool vision = !std::strncmp(w->name,"v.blk.",6) &&
@@ -129,6 +131,10 @@ __attribute__((noinline)) static void kernel32(const _Float16 *x,const _Float16 
 __attribute__((noinline)) static void kernel16(
     const _Float16 *x0, const _Float16 *x1, const _Float16 *w,
     float *c0, float *c1, int K) {
+    if(paddle_f16_pipeline::enabled()) {
+        paddle_f16_pipeline::core16(x0,x1,w,c0,c1,K,0);
+        return;
+    }
     const _Float16 *w1=w+8*K, *w2=w+16*K, *w3=w+24*K;
     int blocks=K/8;
     asm volatile(
@@ -192,6 +198,10 @@ __attribute__((noinline)) static void kernel32_continue(const _Float16 *x,const 
 __attribute__((noinline)) static void kernel16_continue(
     const _Float16 *x0, const _Float16 *x1, const _Float16 *w,
     float *c0, float *c1, int K, int accumulate) {
+    if(paddle_f16_pipeline::enabled()) {
+        paddle_f16_pipeline::core16(x0,x1,w,c0,c1,K,accumulate);
+        return;
+    }
     const _Float16 *w1=w+8*K, *w2=w+16*K, *w3=w+24*K;
     int blocks=K/8;
     asm volatile(
