@@ -92,13 +92,18 @@ spine_env_info::spine_env_info() {
                perfer_core_arch_id == spine_core_arch_id::core_arch_x100;
     use_ime2 = perfer_core_arch_id == spine_core_arch_id::core_arch_a100;
 
-    // num_cores from env, fallback to spert backend_info
+    // This K3 deployment is stable with at most six AI workers. Reject an
+    // unsafe explicit request before creating the graph-compute stream.
     const char * workers_str = getenv("GGML_SPACEMIT_WORKERS");
     if (workers_str) {
-        num_cores = atoi(workers_str);
-        if (num_cores <= 0) num_cores = 1;
+        char * end = nullptr;
+        const long requested = strtol(workers_str, &end, 10);
+        if (!end || *end || requested < 1 || requested > 6) {
+            GGML_ABORT("GGML_SPACEMIT_WORKERS must be between 1 and 6 on this K3 deployment\n");
+        }
+        num_cores = int(requested);
     } else {
-        num_cores = (int) info.num_cores;
+        num_cores = std::min(6, (int) info.num_cores);
         if (num_cores <= 0) num_cores = 1;
     }
 

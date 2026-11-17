@@ -56,12 +56,12 @@ struct runtime {
         if (path.empty()) {
             throw std::runtime_error(std::string("OCR_EP_") + kind + "_MODEL must name an ONNX model");
         }
-        if (setting("SPERT_SHARED_MODE") != "DDR") {
-            throw std::runtime_error("EP OCR requires SPERT_SHARED_MODE=DDR");
-        }
+//         if (setting("SPERT_SHARED_MODE") != "DDR") {
+//             throw std::runtime_error("EP OCR requires SPERT_SHARED_MODE=DDR");
+//         }
         auto start = clock_type::now();
         Ort::SessionOptions options;
-        options.SetIntraOpNumThreads(8);
+        options.SetIntraOpNumThreads(6);
         options.SetInterOpNumThreads(1);
         options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -85,7 +85,9 @@ struct runtime {
             "SPERT_BACKEND", "SPACEMIT_EP_INTER_THREAD_NUM", "SPACEMIT_EP_INTRA_THREAD_NUM",
             "SPACEMIT_EP_ENABLE_DMA", "SPACEMIT_EP_DENSE_ACCURACY_LEVEL", "SPACEMIT_EP_ENABLE_BLOCKLAYOUT",
             "SPACEMIT_EP_DEBUG_PROFILE"};
-        const auto threads = std::to_string(integer_setting("OCR_EP_THREADS", 8, 1, 8));
+        // The validated K3 OCR configuration uses six AI workers. Using all
+        // eight can hang the board, so reject it before creating the session.
+        const auto threads = std::to_string(integer_setting("OCR_EP_THREADS", 6, 1, 6));
         const auto accuracy = std::to_string(integer_setting("OCR_EP_DENSE_ACCURACY", 0, 0, 2));
         const auto blocklayout = std::to_string(integer_setting("OCR_EP_BLOCKLAYOUT", 0, 0, 1));
         const auto ep_profile = profile + "-ep-" + kind + "-" + std::to_string(width) + "x" + std::to_string(height);

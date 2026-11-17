@@ -45,6 +45,12 @@
 
 namespace spacemit_kernels::rvv {
 
+namespace {
+// Published by the dispatching host before the worker launch. Workers do not
+// read the environment or initialize a function-local static for this option.
+std::atomic<bool> ocr_concat_decode_segmented_enabled{false};
+}
+
 void prepare_ocr_worker_state() {
     // Resolve these guards/environment reads on the dispatching host thread,
     // in this TU (ocr_fa_x8_enabled has internal linkage). No RVV/IME work here.
@@ -75,6 +81,11 @@ void prepare_ocr_worker_state() {
     (void)ocr_pv_ime2::mode();
     (void)ocr_fa_x8_enabled();
     (void)ocr_fa_group_v45::mode();
+    static const bool concat_decode_segmented = [] {
+        const char * option = std::getenv("GGML_SPACEMIT_OCR_CONCAT_DECODE_SEGMENTED");
+        return option && std::strcmp(option, "1") == 0;
+    }();
+    ocr_concat_decode_segmented_enabled.store(concat_decode_segmented, std::memory_order_relaxed);
 }
 
 void drain_ocr_worker_events() {
@@ -95,6 +106,10 @@ void drain_ocr_worker_events() {
                 GGML_LOG_INFO("ocr-fa-group-v45: active qk=%d pv=%d\n",int(v.a),int(v.b));break;
             case kind::pv:
                 GGML_LOG_INFO("ocr-pv-ime2: active passes=%d FP32 probability split, FP32 accumulation\n",int(v.a));break;
+            case kind::concat_segmented:
+                GGML_LOG_INFO("ocr-concat-segmented: active channels=%llu workers=%llu\n",
+                    (unsigned long long)v.a, (unsigned long long)v.b);
+                break;
             case kind::count: break;
         }
     });
@@ -6020,6 +6035,74 @@ bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * ds
     return true;
 }
 
+// Decode-only state concat: the three old-state fields and the new QKV field
+// form one contiguous four-float output row. Materializing the unused first
+// field as well lets segmented loads/stores replace the strided field copies.
+// No floating-point arithmetic is performed, so all copied bits are preserved.
+static bool forward_concat_decode_segmented_f32(ggml::spacemit::context & ctx, ggml_tensor * op,
+                                                int64_t col0) {
+    if (!ocr_concat_decode_segmented_enabled.load(std::memory_order_relaxed) || col0 != 1 ||
+        !op || !op->src[0] || !op->src[1] || ctx.nth == 0 || ctx.ith >= ctx.nth) {
+        return false;
+    }
+    const ggml_tensor * state = op->src[0];
+    const ggml_tensor * qkv   = op->src[1];
+    const int64_t channels   = op->ne[1];
+    if (ggml_get_op_params_i32(op, 0) != 0 || op->type != GGML_TYPE_F32 ||
+        state->type != GGML_TYPE_F32 || qkv->type != GGML_TYPE_F32 ||
+        op->ne[0] != 4 || state->ne[0] != 3 || qkv->ne[0] != 1 || channels <= 0 ||
+        state->ne[1] != channels || qkv->ne[1] != channels ||
+        op->ne[2] != 1 || op->ne[3] != 1 || state->ne[2] != 1 || state->ne[3] != 1 ||
+        qkv->ne[2] != 1 || qkv->ne[3] != 1 ||
+        op->nb[0] != sizeof(float) || op->nb[1] != 4 * sizeof(float) ||
+        state->nb[0] != sizeof(float) || state->nb[1] != 3 * sizeof(float) ||
+        qkv->nb[1] != sizeof(float) || qkv->nb[0] != size_t(channels) * sizeof(float) ||
+        !op->data || !state->data || !qkv->data) {
+        return false;
+    }
+    const uintptr_t out = reinterpret_cast<uintptr_t>(op->data);
+    const size_t out_bytes = ggml_nbytes(op);
+    if (out % alignof(float) != 0) {
+        return false;
+    }
+    // The full output row is written, so conservatively reject any overlap
+    // with either source, including a source view's physical row gaps.
+    for (const ggml_tensor * source : {state, qkv}) {
+        const uintptr_t in = reinterpret_cast<uintptr_t>(source->data);
+        const size_t in_bytes = ggml_nbytes(source);
+        const bool disjoint = out < in ? in - out >= out_bytes : out - in >= in_bytes;
+        if (in % alignof(float) != 0 || !disjoint) {
+            return false;
+        }
+    }
+    const int64_t dc = (channels + int64_t(ctx.nth) - 1) / int64_t(ctx.nth);
+    const int64_t c1 = std::min(dc * int64_t(ctx.ith + 1), channels);
+    for (int64_t c = dc * int64_t(ctx.ith); c < c1;) {
+        const float * old_row = static_cast<const float *>(state->data) + 3 * c;
+        const float * new_row = static_cast<const float *>(qkv->data) + c;
+        float * out_row = static_cast<float *>(op->data) + 4 * c;
+        size_t vl;
+        // EMUL=2: three loaded fields occupy v8/v10/v12 (v8..v13),
+        // QKV occupies v14..v15, and the four-field store uses v8..v15.
+        // NFIELDS * EMUL = 8 is legal; every group starts at an even register.
+        // Keep vsetvli inside the asm so no compiler VL state is assumed.
+        asm volatile(
+            "vsetvli %[vl], %[remaining], e32, m2, ta, ma\n\t"
+            "vlseg3e32.v v8, (%[old_row])\n\t"
+            "vle32.v v14, (%[new_row])\n\t"
+            "vsseg4e32.v v8, (%[out_row])\n\t"
+            : [vl] "=&r" (vl)
+            : [remaining] "r" (size_t(c1 - c)), [old_row] "r" (old_row),
+              [new_row] "r" (new_row), [out_row] "r" (out_row)
+            : "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "memory");
+        c += int64_t(vl);
+    }
+    if (ctx.ith == 0)
+        ocr_worker_events::publish(ocr_worker_events::kind::concat_segmented,
+                                  {uint64_t(channels), uint64_t(ctx.nth)});
+    return true;
+}
+
 // f32 concat along dim 0 where src1 is a transposed view (nb10 != 4, nb11 == 4), e.g. the delta-net
 // conv_input = concat(conv_states, transpose(qkv_mixed)). Threads split dim 1 (channels); each token's run
 // of channels is loaded contiguously and written to the dst channel rows with a strided store.
@@ -6038,6 +6121,10 @@ bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tens
         nb11 != sizeof(float) || nb10 == sizeof(float) || ne01 != ne1 || ne11 != ne1 || ne02 != ne2 ||
         ne12 != ne2 || ne03 != ne3 || ne13 != ne3) {
         return false;
+    }
+
+    if (forward_concat_decode_segmented_f32(ctx, op, col0)) {
+        return true;
     }
 
     // Only prefer the scalar tail when the new columns are NOT channel-contiguous. When nb11 is the

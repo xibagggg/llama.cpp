@@ -1293,7 +1293,10 @@ private:
 
         // In dedicated multi-ASR mode llama-server owns only the model. The
         // sole llama_context is created and scheduled by multi-ASR below.
+        const bool ocr_model_init_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
+        const int64_t ocr_llm_init_start = ocr_model_init_timing ? ggml_time_us() : 0;
         llama_init = common_init_from_params(params_base, use_multi_asr);
+        const int64_t ocr_llm_init_us = ocr_model_init_timing ? ggml_time_us() - ocr_llm_init_start : 0;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1308,6 +1311,11 @@ private:
         if (ctx_tgt == nullptr && !use_multi_asr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (ocr_model_init_timing) {
+            SRV_INF("OCR_METRIC kind=llm_model_init seconds=%.6f shared_prefill_decode=1\n",
+                    ocr_llm_init_us / 1e6);
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1404,8 +1412,11 @@ private:
                 }
             }
 
+            const int64_t ocr_vision_init_start = ocr_model_init_timing ? ggml_time_us() : 0;
+            int64_t ocr_vision_init_us = 0;
             try {
                 media_init = server_media_context::init(ctx_tgt, model_tgt, vocab, params_base, mparams, std::move(media_worker_init));
+                ocr_vision_init_us = ocr_model_init_timing ? ggml_time_us() - ocr_vision_init_start : 0;
             } catch (const std::exception & e) {
                 SRV_ERR("failed to load media backend: %s\n", e.what());
                 return false;
@@ -1415,6 +1426,9 @@ private:
             if (media == nullptr) {
                 SRV_ERR("%s", "media backend was requested but no backend was initialized\n");
                 return false;
+            }
+            if (ocr_model_init_timing) {
+                SRV_INF("OCR_METRIC kind=vision_model_init seconds=%.6f\n", ocr_vision_init_us / 1e6);
             }
             SRV_INF("loaded media backend '%s'\n", media->backend_name());
 
