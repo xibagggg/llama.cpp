@@ -741,3 +741,28 @@ if (GGML_SPACEMIT)
         endforeach()
     endforeach()
 endif()
+
+# Exact K8 order and continuation for the opt-in M16 software pipeline.
+if (GGML_SPACEMIT)
+    set(paddle_actstore64_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    foreach(paddle_actstore64_kind IN ITEMS ime2 bias)
+        set(paddle_actstore64_binary "test-paddle-f16-${paddle_actstore64_kind}")
+        set(paddle_actstore64_ref "${CMAKE_CURRENT_BINARY_DIR}/paddle-actstore64-${paddle_actstore64_kind}-reference.bin")
+        set(paddle_actstore64_reference "test-paddle-actstore64-${paddle_actstore64_kind}-reference")
+        llama_test(${paddle_actstore64_binary} NAME "${paddle_actstore64_reference}" LABEL spacemit ARGS --write-reference "${paddle_actstore64_ref}")
+        set_tests_properties("${paddle_actstore64_reference}" PROPERTIES RUN_SERIAL TRUE
+            ENVIRONMENT "${paddle_actstore64_env};GGML_SPACEMIT_PADDLE_F16_ACT_STORE64=0;GGML_SPACEMIT_PADDLE_F16_PIPELINE16=0;GGML_SPACEMIT_PADDLE_F16_OUTPUT64=0;GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=0;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=1;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0"
+            FIXTURES_SETUP "paddle_actstore64_${paddle_actstore64_kind}_reference")
+        foreach(paddle_actstore64_mode IN ITEMS m16 kblock1440)
+            set(paddle_actstore64_kblock 0)
+            if (paddle_actstore64_mode STREQUAL "kblock1440")
+                set(paddle_actstore64_kblock 1440)
+            endif()
+            set(paddle_actstore64_name "test-paddle-actstore64-${paddle_actstore64_kind}-${paddle_actstore64_mode}")
+            llama_test(${paddle_actstore64_binary} NAME "${paddle_actstore64_name}" LABEL spacemit ARGS --compare-reference "${paddle_actstore64_ref}")
+            set_tests_properties("${paddle_actstore64_name}" PROPERTIES RUN_SERIAL TRUE
+                ENVIRONMENT "${paddle_actstore64_env};GGML_SPACEMIT_PADDLE_F16_ACT_STORE64=1;GGML_SPACEMIT_PADDLE_F16_PIPELINE16=1;GGML_SPACEMIT_PADDLE_F16_OUTPUT64=1;GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=1;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=${paddle_actstore64_kblock}"
+                FIXTURES_REQUIRED "paddle_actstore64_${paddle_actstore64_kind}_reference")
+        endforeach()
+    endforeach()
+endif()

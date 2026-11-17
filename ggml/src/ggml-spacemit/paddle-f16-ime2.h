@@ -20,6 +20,15 @@ inline bool enabled() {
     static const bool value=[] {const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_IME2");return p&&!std::strcmp(p,"1");}();
     return value;
 }
+// Independent opt-in: preserve all packed F16 bits while storing four
+// consecutive half lanes together as one aligned eight-byte element.
+inline bool activation_store64_enabled() {
+    static const bool value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_ACT_STORE64");
+        return p&&!std::strcmp(p,"1");
+    }();
+    return value;
+}
 // Independent opt-in: merge high/residual, scale and bias once per N8/M8
 // vector tile and scatter directly to the existing FP32 destination. Each
 // output retains its original arithmetic order and no value is narrowed.
@@ -84,6 +93,7 @@ inline size_t kblock_lane_bytes(const ggml_tensor *op) {
 inline bool selected(const ggml_tensor *w) {
     (void)output64_enabled(); // Resolve the process-wide option while loading weights on the host.
     (void)paddle_f16_pipeline::enabled();
+    (void)activation_store64_enabled();
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
         w->ne[2] != 1 || w->ne[3] != 1) return false;
     const bool vision = !std::strncmp(w->name,"v.blk.",6) &&
@@ -260,13 +270,24 @@ inline void pack_activation64(const float *x,_Float16 *px,_Float16 *pl,
     const auto offsets=__riscv_vsll_vx_u16m1(__riscv_vadd_vv_u16m1(
         __riscv_vsll_vx_u16m1(__riscv_vsrl_vx_u16m1(ids,3,64),6,64),
         __riscv_vand_vx_u16m1(ids,7,64),64),1,64);
+    const auto ids64=__riscv_vid_v_u64m1(16);
+    const auto offsets64=__riscv_vsll_vx_u64m1(__riscv_vadd_vv_u64m1(
+        __riscv_vsll_vx_u64m1(__riscv_vsrl_vx_u64m1(ids64,1,16),4,16),
+        __riscv_vand_vx_u64m1(ids64,1,16),16),3,16);
     for(int r=0;r<8;++r)for(int k=0;k<K;k+=64) {
         const size_t vl=std::min(64,K-k);
+        GGML_ASSERT(vl%4==0);
         const size_t off=size_t(group)*8*K+size_t(k)*8+r*8;
         if(group*8+r>=M) {
             const auto zero=__riscv_vfmv_v_f_f16m1(0,vl);
-            __riscv_vsuxei16_v_f16m1(px+off,offsets,zero,vl);
-            __riscv_vsuxei16_v_f16m1(pl+off,offsets,zero,vl);
+            if(activation_store64_enabled()) {
+                const auto bits=__riscv_vreinterpret_v_u16m1_u64m1(__riscv_vreinterpret_v_f16m1_u16m1(zero));
+                __riscv_vsuxei64_v_u64m1(reinterpret_cast<uint64_t*>(px+off),offsets64,bits,vl/4);
+                __riscv_vsuxei64_v_u64m1(reinterpret_cast<uint64_t*>(pl+off),offsets64,bits,vl/4);
+            } else {
+                __riscv_vsuxei16_v_f16m1(px+off,offsets,zero,vl);
+                __riscv_vsuxei16_v_f16m1(pl+off,offsets,zero,vl);
+            }
             continue;
         }
         const auto a=__riscv_vfmul_vf_f32m2(
@@ -279,8 +300,17 @@ inline void pack_activation64(const float *x,_Float16 *px,_Float16 *pl,
         const auto lo=__riscv_vfncvt_f_f_w_f16m1(
             __riscv_vfmul_vf_f32m2(__riscv_vfsub_vv_f32m2(a,h32,vl),4096.0f,vl),vl);
         // All indices are distinct, so unordered stores retain exact layout.
-        __riscv_vsuxei16_v_f16m1(pl+off,offsets,lo,vl);
-        __riscv_vsuxei16_v_f16m1(px+off,offsets,h,vl);
+        if(activation_store64_enabled()) {
+            // Lane j holds the unmodified bits of F16 lanes 4*j..4*j+3.
+            // Byte offset=(j/2)*128+(j%2)*8 in the original K8/M8 pack.
+            __riscv_vsuxei64_v_u64m1(reinterpret_cast<uint64_t*>(pl+off),offsets64,
+                __riscv_vreinterpret_v_u16m1_u64m1(__riscv_vreinterpret_v_f16m1_u16m1(lo)),vl/4);
+            __riscv_vsuxei64_v_u64m1(reinterpret_cast<uint64_t*>(px+off),offsets64,
+                __riscv_vreinterpret_v_u16m1_u64m1(__riscv_vreinterpret_v_f16m1_u16m1(h)),vl/4);
+        } else {
+            __riscv_vsuxei16_v_f16m1(pl+off,offsets,lo,vl);
+            __riscv_vsuxei16_v_f16m1(px+off,offsets,h,vl);
+        }
     }
 }
 inline bool supported(const ggml_tensor *op) {
