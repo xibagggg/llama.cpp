@@ -3,6 +3,7 @@
 // FP32 activations use a scaled high/residual split and FP32 accumulation.
 // Enabled explicitly; all other shapes retain the existing RVV implementation.
 #include "spacemit-context.h"
+#include "spacemit-opnode.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -262,6 +263,48 @@ inline bool supported(const ggml_tensor *op) {
         op->src[1]->ne[0]==op->src[0]->ne[0]&&op->src[1]->ne[2]==1&&op->src[1]->ne[3]==1&&
         ggml_is_contiguous(op->src[1])&&ggml_is_contiguous(op);
 }
+// Bias fusion is deliberately limited to the already selected, physically
+// repacked F16 matrix path. The graph matcher additionally checks use/output/view
+// ownership before it elides the intermediate matrix result.
+inline bool bias_supported(const ggml_tensor *op,const ggml_tensor *add) {
+    if(!supported(op)||!add||add->op!=GGML_OP_ADD||add->src[0]!=op||
+       add->type!=GGML_TYPE_F32||!ggml_are_same_shape(op,add)||!ggml_is_contiguous(add))return false;
+    const auto *bias=add->src[1];
+    return bias&&bias->op==GGML_OP_NONE&&bias->src[0]==nullptr&&bias->type==GGML_TYPE_F32&&
+        bias->ne[0]==op->ne[0]&&bias->ne[1]==1&&bias->ne[2]==1&&bias->ne[3]==1&&
+        ggml_is_contiguous(bias)&&ggml_can_repeat(bias,op);
+}
+inline bool byte_ranges_overlap(const void *a,size_t an,const void *b,size_t bn) {
+    const auto ap=reinterpret_cast<uintptr_t>(a),bp=reinterpret_cast<uintptr_t>(b);
+    return ap<=bp?bp-ap<an:ap-bp<bn;
+}
+inline bool bias_storage_safe(const ggml_tensor *op,const ggml_tensor *add) {
+    if(!bias_supported(op,add)||!add->data||!add->src[1]->data||!op->src[0]->data)return false;
+    // Activations are fully packed before the existing all-worker barrier, so
+    // their allocation may be reused by the destination. Bias and packed model
+    // weights remain live throughout all stores and must never overlap it.
+    return !byte_ranges_overlap(add->data,ggml_nbytes(add),add->src[1]->data,ggml_nbytes(add->src[1]))&&
+        !byte_ranges_overlap(add->data,ggml_nbytes(add),op->src[0]->data,nbytes(op->src[0]));
+}
+inline void store_result_tile(float *out,const float *result,int M,int N,
+                              int first_m,int first_n,const float *bias) {
+    for(int o=0;o<4&&first_n+o*8<N;++o) {
+        const size_t columns=size_t(std::min(8,N-first_n-o*8));
+        for(int r=0;r<8&&first_m+r<M;++r) {
+            auto *dst=out+size_t(first_m+r)*N+first_n+o*8;
+            const auto *src=result+o*64+r*8;
+            if(!bias) {
+                std::memcpy(dst,src,columns*sizeof(float));
+            } else {
+                // Separate FP32 addition after the unchanged residual merge and
+                // inverse scale. No FMA, narrower value or altered K reduction.
+                const auto value=__riscv_vle32_v_f32m2(src,columns);
+                const auto offset=__riscv_vle32_v_f32m2(bias+first_n+o*8,columns);
+                __riscv_vse32_v_f32m2(dst,__riscv_vfadd_vv_f32m2(value,offset,columns),columns);
+            }
+        }
+    }
+}
 struct traits final:ggml::spacemit::tensor_traits_base {
     bool work_size(int nth,const ggml_tensor *op,size_t &size)const override {
         if(!supported(op))return false;
@@ -288,6 +331,16 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         return 0;
     }
     bool compute_forward(ggml::spacemit::context &ctx,ggml_tensor *op)const override {
+        return compute(ctx,op,op,nullptr);
+    }
+    bool compute_forward_fused(ggml::spacemit::context &ctx,const spacemit_opnode &node)const override {
+        if(node.opcode!=SPACEMIT_OP_PADDLE_F16_BIAS||node.fused.size()!=1||
+           !node.extra_dsts.empty()||node.packed_im2col||node.elided_pad||
+           !bias_storage_safe(node.node,node.fused[0])||node.node->src[0]->extra!=this)return false;
+        return compute(ctx,node.node,node.fused[0],node.fused[0]->src[1]);
+    }
+    bool compute(ggml::spacemit::context &ctx,ggml_tensor *op,ggml_tensor *dst,
+                 const ggml_tensor *bias)const {
         if(!supported(op))return false;
         const int K=int(op->src[0]->ne[0]),N=int(op->ne[0]),M=int(op->ne[1]),groups=(M+7)/8;
         constexpr int tile_n=32;
@@ -297,6 +350,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         auto *pl=px+size_t(groups)*8*K;
         auto *scales=reinterpret_cast<float*>(static_cast<char*>(ctx.workspace)+GGML_PAD(size_t(groups)*8*K*4,64));
         const auto *x=static_cast<const float*>(op->src[1]->data);
+        const auto *bias_data=bias?static_cast<const float*>(bias->data):nullptr;
         for(int g=int(ctx.ith);g<groups;g+=int(ctx.nth)) {
             auto vmax=__riscv_vfmv_v_f_f32m2(0,64);
             for(int r=0;r<8&&g*8+r<M;++r)for(int k=0;k<K;k+=64) {
@@ -347,7 +401,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 static_cast<char*>(ctx.workspace)+activation_workspace_bytes(op)+
                 size_t(ctx.ith)*kblock_lane_bytes(op));
             auto *partial_low=partial+size_t(panel_count)*groups*256;
-            auto *out=static_cast<float*>(op->data);
+            auto *out=static_cast<float*>(dst->data);
             const int ntiles=(N+tile_n-1)/tile_n;
             // Preserve the existing strided N32 ownership: with N1152/six
             // workers, each lane handles four panels then its final two.
@@ -401,10 +455,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                                 for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                                 const float inverse=1/(wscale*scales[g+j]);
                                 for(int i=0;i<256;++i)result[i]*=inverse;
-                                for(int o=0;o<4&&first_n+o*8<N;++o)
-                                    for(int r=0;r<8&&(g+j)*8+r<M;++r)
-                                        std::memcpy(out+size_t((g+j)*8+r)*N+first_n+o*8,
-                                                    result+o*64+r*8,size_t(std::min(8,N-first_n-o*8))*4);
+                                store_result_tile(out,result,M,N,(g+j)*8,first_n,bias_data);
                             }
                         }
                     }
@@ -433,7 +484,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         auto *temp=reinterpret_cast<float*>(sx+size_t(resident_low?2:1)*staged_groups*8*K),*low=temp+tile_floats;
         GGML_ASSERT(ctx.shared.size>=size_t(panels)*weight_bytes+(resident_low?2:1)*staged_bytes+scratch_bytes);
         std::memset(base,0xa5,128);std::memset(low+tile_floats,0xa5,128);
-        auto *out=static_cast<float*>(op->data);
+        auto *out=static_cast<float*>(dst->data);
         const int ntiles=(N+tile_n-1)/tile_n;
         // Group this worker's existing strided panels. This keeps the same
         // output ownership and avoids the load imbalance of global N96/N128.
@@ -464,10 +515,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                         for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                         const float inverse=1/(wscale*scales[g+group]);
                         for(int i=0;i<256;++i)result[i]*=inverse;
-                        for(int o=0;o<4&&first_n+o*8<N;++o)
-                            for(int r=0;r<8&&(g+group)*8+r<M;++r)
-                                std::memcpy(out+size_t((g+group)*8+r)*N+first_n+o*8,result+o*64+r*8,
-                                            size_t(std::min(8,N-first_n-o*8))*4);
+                        store_result_tile(out,result,M,N,(g+group)*8,first_n,bias_data);
                     }
                 }
                 g+=batch_groups;

@@ -28,6 +28,7 @@
 #include "vec.h"
 #include "ocr-q4-f16.h"
 #include "paddle-f16-ime2.h"
+#include "paddle-pos-resize.h"
 #include "ocr-q4-pc8.h"
 
 #include <fcntl.h>
@@ -1230,6 +1231,10 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
 class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
+        if (paddle_pos_resize::supported(op)) {
+            size = paddle_pos_resize::work_bytes(n_threads);
+            return size != 0;
+        }
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32) {
@@ -1291,6 +1296,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
     }
 
     bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
+        if (paddle_pos_resize::supported(op)) return paddle_pos_resize::forward(ctx, op);
         if (ocr_ai_complete::forward(op, ctx.ith, ctx.nth)) return true;
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -2063,6 +2069,12 @@ bool ggml_spacemit_can_fuse_pc8_pad(const ggml_tensor * op) {
     return ocr_q4_pc8::pad_supported(op)&&op->src[0]->extra==&ocr_q4_pc8::impl;
 }
 
+bool ggml_spacemit_can_fuse_paddle_f16_bias(const ggml_tensor * op, const ggml_tensor * add) {
+    return op && op->src[0] && op->src[0]->extra == &paddle_f16_ime2::impl &&
+           paddle_f16_ime2::bias_supported(op, add) &&
+           paddle_f16_ime2::bias_storage_safe(op, add);
+}
+
 // In-place recurrent state update (see gdn_inplace_mark): true when the row gathered by the state
 // GET_ROWS is the cache row that the state CPY writes back. The row index is a graph input that is
 // rewritten before every compute, so this is evaluated at run time; all workers and all three
@@ -2090,6 +2102,7 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
             return true;
         case SPACEMIT_OP_PC8_PAD_MUL_MAT:
         case SPACEMIT_OP_PC8_MUL_MAT_BIAS:
+        case SPACEMIT_OP_PADDLE_F16_BIAS:
         case SPACEMIT_OP_IM2COL_MUL_MAT: {
             const auto * traits=ggml_spacemit_get_tensor_traits(node.node);
             return traits&&traits->compute_forward_fused(ctx,node);
@@ -2139,6 +2152,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
     }
 
     const auto * common = &ggml::cpu::riscv64_spacemit::rvv_impl;
+    if (paddle_pos_resize::supported(op)) return common;
     if (ocr_ai_complete::supported(op)) return common;
     switch (op->op) {
         case GGML_OP_IM2COL:

@@ -20,6 +20,7 @@
 #include "ggml-impl.h"
 #include "ggml-spacemit.h"
 #include "ocr-ai-complete.h"
+#include "paddle-pos-resize.h"
 
 #include "spacemit-session.h"
 #include "spacemit-kernels.h"
@@ -285,6 +286,11 @@ static bool add_gelu_fusion_enabled() {
 
 static bool matmul_add_fusion_enabled() {
     const char * value = getenv("GGML_SPACEMIT_MUL_MAT_ADD");
+    return value && strcmp(value, "1") == 0;
+}
+
+static bool paddle_f16_bias_fusion_enabled() {
+    const char * value = getenv("GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE");
     return value && strcmp(value, "1") == 0;
 }
 
@@ -706,6 +712,22 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         }
     }
     ggml_tensor * next_node = (next_idx >= 0) ? graph->nodes[next_idx] : nullptr;
+
+    // Keep full-K high/residual arithmetic and add row bias only at writeback.
+    // The helper requires the physical Paddle trait and safe constant storage;
+    // shape alone never admits an ordinary F16 matrix to this fused path.
+    if (paddle_f16_bias_fusion_enabled() && next_node &&
+        ggml_spacemit_can_fuse_paddle_f16_bias(n, next_node)) {
+        const int idxs[2] = { i, next_idx };
+        const enum ggml_op ops[2] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+        if (ggml_can_fuse_ext(graph, idxs, ops, 2)) {
+            spacemit_opnode fused(n, {}, SPACEMIT_OP_PADDLE_F16_BIAS);
+            fused.add_fused(next_node);
+            nodes.push_back(std::move(fused));
+            i = next_idx;
+            return true;
+        }
+    }
 
     // PC8 INT32 epilogue applies the separate F32 bias add before writeback.
     // Keep the ordinary ggml use/output/view guards and constant row bias only.
@@ -1141,6 +1163,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         int n_fused = 0;
         int n_add_gelu = 0;
         int n_matmul_add = 0;
+        int n_paddle_f16_bias = 0;
         int n_im2col_pack = 0;
         int n_norm_affine = 0;
         int n_residual_norm_affine = 0;
@@ -1155,6 +1178,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             n_conv_scalar += node.opcode == SPACEMIT_OP_CONCAT_STATE && node.kernel_params[1] != 0;
             n_gdn_seen += node.node->op == GGML_OP_GATED_DELTA_NET;
             n_matmul_add += node.opcode == SPACEMIT_OP_MUL_MAT_ADD;
+            n_paddle_f16_bias += node.opcode == SPACEMIT_OP_PADDLE_F16_BIAS;
             n_im2col_pack += node.opcode == SPACEMIT_OP_IM2COL_MUL_MAT;
             n_norm_affine += node.opcode == SPACEMIT_OP_NORM_AFFINE;
             n_residual_norm_affine += node.opcode == SPACEMIT_OP_RESIDUAL_NORM_AFFINE;
@@ -1179,6 +1203,11 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         if (n_matmul_add > 0 && matmul_add_trace && strcmp(matmul_add_trace, "1") == 0) {
             GGML_LOG_INFO("ggml-spacemit: Q4_0 MUL_MAT+BIAS fused=%d graph=%llu\n", n_matmul_add,
                           (unsigned long long) graph->uid);
+        }
+        const char * paddle_f16_bias_trace = getenv("GGML_SPACEMIT_PADDLE_F16_BIAS_TRACE");
+        if (paddle_f16_bias_trace && strcmp(paddle_f16_bias_trace, "1") == 0) {
+            GGML_LOG_INFO("ggml-spacemit: PADDLE_F16 GEMM+BIAS fused=%d graph=%llu\n",
+                          n_paddle_f16_bias, (unsigned long long) graph->uid);
         }
         const char * pack_trace=getenv("GGML_SPACEMIT_IM2COL_PACK_TRACE");
         const char * norm_trace = getenv("GGML_SPACEMIT_NORM_AFFINE_TRACE");
@@ -1558,6 +1587,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
 
+    if (paddle_pos_resize::supported(op)) return true;
     if (ocr_ai_complete::supported(op)) return true;
     bool supp = false;
     switch (op->op) {

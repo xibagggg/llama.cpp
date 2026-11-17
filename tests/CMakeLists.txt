@@ -458,3 +458,61 @@ if (GGML_SPACEMIT)
     set(paddle_strided_cast_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_OCR_STRIDED_CAST=1")
     set_tests_properties(test-paddle-strided-cast PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "${paddle_strided_cast_env}")
 endif()
+
+# Independent F16 GEMM+bias regression: trace-proven positive/negative matches,
+# every output byte, changed activations/biases and real vision geometries.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-f16-bias.cpp LINK ggml)
+    set(paddle_f16_bias_reference "${CMAKE_CURRENT_BINARY_DIR}/paddle-f16-bias-reference.bin")
+    set(paddle_f16_bias_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    llama_test(test-paddle-f16-bias NAME test-paddle-f16-bias-reference LABEL spacemit
+        ARGS --write-reference "${paddle_f16_bias_reference}")
+    set_tests_properties(test-paddle-f16-bias-reference PROPERTIES
+        ENVIRONMENT "${paddle_f16_bias_env};GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=0;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=1;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0"
+        FIXTURES_SETUP paddle_f16_bias_reference RUN_SERIAL TRUE)
+    foreach(paddle_f16_bias_mode IN ITEMS base m16 kblock1024)
+        set(paddle_f16_bias_options "GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=1;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0")
+        if (NOT paddle_f16_bias_mode STREQUAL "base")
+            set(paddle_f16_bias_options "GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0")
+        endif()
+        if (paddle_f16_bias_mode STREQUAL "kblock1024")
+            set(paddle_f16_bias_options "GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=1024")
+        endif()
+        set(paddle_f16_bias_test "test-paddle-f16-bias-${paddle_f16_bias_mode}")
+        llama_test(test-paddle-f16-bias NAME "${paddle_f16_bias_test}" LABEL spacemit
+            ARGS --compare-reference "${paddle_f16_bias_reference}")
+        set_tests_properties("${paddle_f16_bias_test}" PROPERTIES
+            ENVIRONMENT "${paddle_f16_bias_env};GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=1;${paddle_f16_bias_options}"
+            FIXTURES_REQUIRED paddle_f16_bias_reference RUN_SERIAL TRUE)
+    endforeach()
+endif()
+
+# Same-backend F32 byte regression for the independently selected elementwise fusions.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-elementwise-fusion.cpp LINK ggml)
+    set(paddle_elementwise_reference "${CMAKE_CURRENT_BINARY_DIR}/paddle-elementwise-fusion-reference.bin")
+    llama_test(test-paddle-elementwise-fusion LABEL spacemit ARGS --write-reference "${paddle_elementwise_reference}")
+    set_tests_properties(test-paddle-elementwise-fusion PROPERTIES RUN_SERIAL TRUE
+        ENVIRONMENT "${paddle_f16_env};GGML_SPACEMIT_NORM_AFFINE=0;GGML_SPACEMIT_ADD_GELU=0"
+        FIXTURES_SETUP paddle_elementwise_reference)
+    foreach(paddle_elementwise_pair IN ITEMS "1,0" "0,1" "1,1")
+        string(REPLACE "," ";" paddle_elementwise_values "${paddle_elementwise_pair}")
+        list(GET paddle_elementwise_values 0 paddle_elementwise_norm)
+        list(GET paddle_elementwise_values 1 paddle_elementwise_gelu)
+        set(paddle_elementwise_name "test-paddle-elementwise-fusion-n${paddle_elementwise_norm}-g${paddle_elementwise_gelu}")
+        llama_test(test-paddle-elementwise-fusion NAME "${paddle_elementwise_name}" LABEL spacemit
+            ARGS --compare-reference "${paddle_elementwise_reference}")
+        set_tests_properties("${paddle_elementwise_name}" PROPERTIES RUN_SERIAL TRUE
+            ENVIRONMENT "${paddle_f16_env};GGML_SPACEMIT_NORM_AFFINE=${paddle_elementwise_norm};GGML_SPACEMIT_ADD_GELU=${paddle_elementwise_gelu}"
+            FIXTURES_REQUIRED paddle_elementwise_reference)
+    endforeach()
+endif()
+
+# Narrow position interpolation: actual CPU/SPACEMIT byte comparison and off gate.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-pos-resize.cpp LINK ggml)
+    llama_test(test-paddle-pos-resize LABEL spacemit)
+    add_test(NAME test-paddle-pos-resize-disabled COMMAND $<TARGET_FILE:test-paddle-pos-resize> --disabled)
+    set(paddle_pos_resize_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    set_tests_properties(test-paddle-pos-resize test-paddle-pos-resize-disabled PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "${paddle_pos_resize_env}")
+endif()

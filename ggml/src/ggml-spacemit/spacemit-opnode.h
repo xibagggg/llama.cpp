@@ -42,6 +42,7 @@ enum spacemit_op_code {
     SPACEMIT_OP_GDN_STATE_GATHER, // get_rows of the recurrent state, skipped when the update runs in place
     SPACEMIT_OP_GDN_INPLACE,      // gated_delta_net updating the cache row in place
     SPACEMIT_OP_GDN_STATE_STORE,  // cpy of the new state to the cache row, skipped when in place
+    SPACEMIT_OP_PADDLE_F16_BIAS,  // selected F16 GEMM with its final F32 row-bias ADD
 };
 
 #define SPACEMIT_OP_MAX_KERN_PARAMS 32
