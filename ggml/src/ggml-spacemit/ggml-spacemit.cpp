@@ -1152,6 +1152,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     // Serialize hardware use across backend handles. Streams are graph-scoped
     // by default; the opt-in persistent mode retains its CC grant per session.
     std::lock_guard<std::mutex> stream_lock(sess->stream_mutex);
+    // Any early return/exception/runtime failure expires all cached groups.
+    paddle_qkv_content_cache::completion qkv_completion(sess->qkv_content_cache);
 
     GGML_LOG_DEBUG("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
@@ -1269,6 +1271,16 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         spacemit_host_trace("workspace-alloc-end", workspace_size);
     }
     auto * workspace = static_cast<uint8_t *>(sess->workspace);
+    paddle_qkv_content_cache::view * qkv_content_view=nullptr;
+    const bool qkv_content_trace=paddle_qkv_content_cache::trace_enabled();
+    if(paddle_qkv_content_cache::enabled()) {
+        for(const auto & node:opnodes) {
+            if(!ggml_spacemit_can_cache_paddle_qkv(node.node))continue;
+            if(sess->qkv_content_cache.prepare(int(node.node->ne[1]),1152,n_threads,qkv_content_trace))
+                qkv_content_view=sess->qkv_content_cache.get();
+            break;
+        }
+    }
 
     spert::StreamConfig stream_cfg;
     stream_cfg.n_cores = (uint32_t) sess->num_cores;
@@ -1343,6 +1355,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
         [&opnodes, &vision_rope_tables, workspace_size = sess->workspace_size, workspace, contexts,
+         qkv_content_view,
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
          attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
@@ -1370,6 +1383,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 tcm_views[ith] = shared;
                 tcm_cpus[ith] = sched_getcpu();
             }
+            ctx.qkv_content_cache=qkv_content_view;
             ctx.diagnostic_subphase = op_progress ? &op_progress->lanes[ith].subphase : nullptr;
 
             size_t node_index = 0;
@@ -1433,6 +1447,13 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     spacemit_host_trace("graph-launch-end");
     const spert::Status status = fut.sync();
     spacemit_host_trace("graph-sync-end");
+    const bool qkv_content_guards_ok=!qkv_content_view||sess->qkv_content_cache.guards_ok();
+    if(qkv_content_view) {
+        if(qkv_content_trace)sess->qkv_content_cache.trace();
+        if(!qkv_content_guards_ok) {
+            GGML_LOG_ERROR("ggml-spacemit: QKV content cache guard changed\n");
+        }
+    }
     if (tcm_trace) {
         for (uint32_t lane = 0; lane < n_threads && lane < tcm_views.size(); ++lane) {
             const auto view = tcm_views[lane];
@@ -1471,9 +1492,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         std::fclose(op_hash_trace);
     }
 
-    if (status != spert::Status::Ok) {
+    if (status != spert::Status::Ok || !qkv_content_guards_ok) {
         return GGML_STATUS_FAILED;
     }
+    qkv_completion.commit();
     return GGML_STATUS_SUCCESS;
 }
 

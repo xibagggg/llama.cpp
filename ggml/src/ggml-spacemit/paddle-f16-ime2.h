@@ -3,6 +3,7 @@
 // FP32 activations use a scaled high/residual split and FP32 accumulation.
 // Enabled explicitly; all other shapes retain the existing RVV implementation.
 #include "spacemit-context.h"
+#include "paddle-qkv-content-cache.h"
 #include "paddle-f16-pipeline.h"
 #include "spacemit-opnode.h"
 #include "rvv_kernels.h"
@@ -132,6 +133,8 @@ inline size_t kblock_lane_bytes(const ggml_tensor *op) {
 }
 inline bool selected(const ggml_tensor *w) {
     (void)output64_enabled(); // Resolve the process-wide option while loading weights on the host.
+    (void)paddle_qkv_content_cache::enabled();
+    (void)paddle_qkv_content_cache::trace_enabled();
     (void)paddle_f16_pipeline::enabled();
     (void)activation_store64_enabled();
     (void)tcm_copy64_enabled();
@@ -510,9 +513,24 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         auto *px=static_cast<_Float16*>(ctx.workspace);
         auto *pl=px+size_t(groups)*8*K;
         auto *scales=reinterpret_cast<float*>(static_cast<char*>(ctx.workspace)+GGML_PAD(size_t(groups)*8*K*4,64));
+        // Cache memory is owned by this backend session and disjoint from
+        // ordinary workspace. Complete current F32 bytes are compared for each
+        // A8 group on EVERY call; address/UID equality never establishes a hit.
+        auto *cache=ctx.qkv_content_cache;
+        if(!cache||K!=1152||N!=1152||
+           !paddle_qkv_content_cache::weight_name(op->src[0]->name)||
+           !cache->matches(M,K,int(ctx.nth)))cache=nullptr;
+        if(cache) {
+            GGML_ASSERT(cache->pack_bytes==activation_workspace_bytes(op));
+            px=static_cast<_Float16*>(cache->packed);
+            pl=px+size_t(groups)*8*K;
+            scales=reinterpret_cast<float*>(static_cast<char*>(cache->packed)+GGML_PAD(size_t(groups)*8*K*4,64));
+        }
+        const uint32_t pack_rounding=cache?paddle_qkv_content_cache::rounding_mode():0;
         const auto *x=static_cast<const float*>(op->src[1]->data);
         const auto *bias_data=bias?static_cast<const float*>(bias->data):nullptr;
         for(int g=int(ctx.ith);g<groups;g+=int(ctx.nth)) {
+            if(cache&&cache->hit(g,x,pack_rounding,ctx.ith))continue;
             auto vmax=__riscv_vfmv_v_f_f32m2(0,64);
             for(int r=0;r<8&&g*8+r<M;++r)for(int k=0;k<K;k+=64) {
                 const size_t vl=std::min(64,K-k);
@@ -523,6 +541,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             const float scale=scale_for(maximum);scales[g]=scale;
             if(wide_activation_pack()) {
                 pack_activation64(x,px,pl,scale,g,M,K);
+                if(cache)cache->publish(g,x,pack_rounding,ctx.ith);
                 continue;
             }
             for(int k=0;k<K;k+=8)for(int r=0;r<8;++r) {
@@ -540,6 +559,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 }
                 __riscv_vse16_v_f16m1(px+off,h,8);
             }
+            if(cache)cache->publish(g,x,pack_rounding,ctx.ith);
         }
         if constexpr(PROFILE)timer.tick(0);
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);

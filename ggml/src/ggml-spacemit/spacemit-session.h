@@ -4,6 +4,7 @@
 #include "spacemit-opnode.h"
 #include "spacemit-context.h"
 #include "spacemit-resident-scratch.h"
+#include "paddle-qkv-content-cache.h"
 
 #include <cstdint>
 #include <mutex>
@@ -25,6 +26,10 @@ struct spacemit_session {
 
     // Opt-in diagnostic sequence for no-callback operator output hashes.
     uint64_t op_hash_trace_sequence = 0;
+
+    // Separate DDR owner; survives graph splits, never ordinary workspace.
+    // Every hit validates complete current source bytes, shape and rounding.
+    paddle_qkv_content_cache::owner qkv_content_cache;
 
     void * workspace = nullptr;
     size_t workspace_size = 0;

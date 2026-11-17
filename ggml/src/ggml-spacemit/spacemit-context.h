@@ -11,6 +11,8 @@
 
 struct spacemit_opnode;  // forward declaration (defined in spacemit-opnode.h)
 
+namespace paddle_qkv_content_cache { struct view; }
+
 namespace ggml::spacemit {
 
 inline constexpr size_t cache_line_size_f32 = 64 / sizeof(float);
@@ -33,6 +35,7 @@ struct context {
     // across a graph launch or an intervening workspace-writing operation.
     const ggml_tensor * ocr_prepared_attention = nullptr;
     const float * prepared_vision_rope = nullptr;
+    paddle_qkv_content_cache::view * qkv_content_cache = nullptr;
 
     void reset(spert::Context & runtime_in, uint32_t ith_in, uint32_t nth_in,
                void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in,
@@ -40,6 +43,7 @@ struct context {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
         prepared_vision_rope = nullptr;
+        qkv_content_cache = nullptr;
         runtime        = &runtime_in;
         ith            = ith_in;
         nth            = nth_in;
@@ -55,6 +59,7 @@ struct context {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
         prepared_vision_rope = nullptr;
+        qkv_content_cache = nullptr;
         runtime        = nullptr;
         ith            = 0;
         nth            = 0;

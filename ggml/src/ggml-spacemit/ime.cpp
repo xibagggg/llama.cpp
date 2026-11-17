@@ -2503,3 +2503,11 @@ bool ggml_spacemit_compute_forward(ggml::spacemit::context & ctx, ggml_tensor * 
     const auto * traits = ggml_spacemit_get_tensor_traits(op);
     return traits != nullptr && traits->compute_forward(ctx, op);
 }
+
+// Host graph preparation uses the same real repack trait and exact shape/name
+// gate as the kernel. Ordinary F16 matrices never reserve or consume the cache.
+bool ggml_spacemit_can_cache_paddle_qkv(const ggml_tensor * op) {
+    return paddle_f16_ime2::supported(op) && op->src[0]->extra==&paddle_f16_ime2::impl &&
+        op->src[0]->ne[0]==1152 && op->ne[0]==1152 && op->ne[1]>0 &&
+        op->ne[1]<=INT32_MAX && paddle_qkv_content_cache::weight_name(op->src[0]->name);
+}
