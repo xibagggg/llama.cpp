@@ -27,6 +27,7 @@
 #else
 #    include <riscv_vector.h>
 #    include "ocr-fa-x8-v39.h"
+#    include "paddle-llm-fa-x8.h"
 #    include "ocr-qk-ime2-v53.h"
 #    include "ocr-pv-ime2.h"
 #    include "ocr-fa-fullkv.h"
@@ -75,6 +76,7 @@ void prepare_ocr_worker_state() {
     (void)ocr_pv_pipeline::tail_enabled();
     (void)ocr_pv_ime2::mode();
     (void)ocr_fa_x8_enabled();
+    (void)paddle_llm_fa_x8::enabled();
     (void)ocr_fa_group_v45::mode();
 }
 
@@ -2194,7 +2196,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                         if(ik[DK*KV_TILE_SZ]!=(_Float16)0&&ocr_qk_ime2_v53::qk(KQ,qpacked,ik,KV_TILE_SZ,tile_rows,max_active_kv,qk_scratch))tq=tile_rows;
                     }
                 }
-                if(tq==0&&ocr_fa_x8_enabled()&&DK==72&&DV==72){
+                if(tq==0&&((ocr_fa_x8_enabled()&&DK==72&&DV==72)||(paddle_llm_fa_x8::eligible(DK,DV)&&KV_TILE_SZ<=__riscv_vsetvlmax_e16m1()))){
                     if(ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::x8,{uint64_t(mask!=nullptr)});
                     if(packed_kv&&ocr_fa_group_v45::mode()){
                         if(ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::group,
@@ -2309,7 +2311,7 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                         }
                     }
                 }
-                if(ocr_fa_x8_enabled()&&DK==72&&DV==72){
+                if((ocr_fa_x8_enabled()&&DK==72&&DV==72)||(paddle_llm_fa_x8::eligible(DK,DV)&&KV_TILE_SZ<=__riscv_vsetvlmax_e16m1())){
                     if(packed_kv&&ocr_fa_group_v45::pv_group()>8){
                         const int group=ocr_fa_group_v45::pv_group();
                         for(;tq+group<=tile_rows;tq+=group){
