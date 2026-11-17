@@ -2075,6 +2075,12 @@ bool ggml_spacemit_can_fuse_paddle_f16_bias(const ggml_tensor * op, const ggml_t
            paddle_f16_ime2::bias_storage_safe(op, add);
 }
 
+bool ggml_spacemit_can_fuse_paddle_f16_bias_gelu(const ggml_tensor * op,const ggml_tensor * add,
+                                             const ggml_tensor * gelu) {
+    return op&&op->src[0]&&op->src[0]->extra==&paddle_f16_ime2::impl&&
+           paddle_f16_ime2::bias_gelu_supported(op,add,gelu);
+}
+
 // In-place recurrent state update (see gdn_inplace_mark): true when the row gathered by the state
 // GET_ROWS is the cache row that the state CPY writes back. The row index is a graph input that is
 // rewritten before every compute, so this is evaluated at run time; all workers and all three

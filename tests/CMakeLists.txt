@@ -603,3 +603,32 @@ if (GGML_SPACEMIT)
         ENVIRONMENT "${paddle_f16_bias_env};GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=1;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=1440"
         FIXTURES_REQUIRED paddle_f16_bias_reference RUN_SERIAL TRUE)
 endif()
+# Strict independent three-node F16 GEMM+bias+GELU byte regression.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-f16-bias-gelu.cpp LINK ggml)
+    set(paddle_f16_bias_gelu_reference "${CMAKE_CURRENT_BINARY_DIR}/paddle-f16-bias-gelu-reference.bin")
+    set(paddle_f16_bias_gelu_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    llama_test(test-paddle-f16-bias-gelu NAME test-paddle-f16-bias-gelu-reference LABEL spacemit
+        ARGS --write-reference "${paddle_f16_bias_gelu_reference}")
+    set_tests_properties(test-paddle-f16-bias-gelu-reference PROPERTIES
+        ENVIRONMENT "${paddle_f16_bias_gelu_env};GGML_SPACEMIT_PADDLE_F16_GELU_FUSE=0;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=1;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0"
+        FIXTURES_SETUP paddle_f16_bias_gelu_reference RUN_SERIAL TRUE)
+    foreach(paddle_f16_bias_gelu_mode IN ITEMS base m16 kblock1024 kblock1440)
+        set(paddle_f16_bias_gelu_options "GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=1;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0")
+        if (NOT paddle_f16_bias_gelu_mode STREQUAL "base")
+            set(paddle_f16_bias_gelu_options "GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0")
+        endif()
+        if (paddle_f16_bias_gelu_mode STREQUAL "kblock1024")
+            string(REPLACE "KBLOCK=0" "KBLOCK=1024" paddle_f16_bias_gelu_options "${paddle_f16_bias_gelu_options}")
+        endif()
+        if (paddle_f16_bias_gelu_mode STREQUAL "kblock1440")
+            string(REPLACE "KBLOCK=0" "KBLOCK=1440" paddle_f16_bias_gelu_options "${paddle_f16_bias_gelu_options}")
+        endif()
+        set(paddle_f16_bias_gelu_test "test-paddle-f16-bias-gelu-${paddle_f16_bias_gelu_mode}")
+        llama_test(test-paddle-f16-bias-gelu NAME "${paddle_f16_bias_gelu_test}" LABEL spacemit
+            ARGS --compare-reference "${paddle_f16_bias_gelu_reference}")
+        set_tests_properties("${paddle_f16_bias_gelu_test}" PROPERTIES
+            ENVIRONMENT "${paddle_f16_bias_gelu_env};GGML_SPACEMIT_PADDLE_F16_GELU_FUSE=1;${paddle_f16_bias_gelu_options}"
+            FIXTURES_REQUIRED paddle_f16_bias_gelu_reference RUN_SERIAL TRUE)
+    endforeach()
+endif()

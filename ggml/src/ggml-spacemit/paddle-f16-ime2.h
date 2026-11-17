@@ -4,6 +4,7 @@
 // Enabled explicitly; all other shapes retain the existing RVV implementation.
 #include "spacemit-context.h"
 #include "spacemit-opnode.h"
+#include "rvv_kernels.h"
 #include "paddle-f16-kblock-plan.h"
 #include <algorithm>
 #include <cmath>
@@ -281,16 +282,42 @@ inline bool byte_ranges_overlap(const void *a,size_t an,const void *b,size_t bn)
     const auto ap=reinterpret_cast<uintptr_t>(a),bp=reinterpret_cast<uintptr_t>(b);
     return ap<=bp?bp-ap<an:ap-bp<bn;
 }
-inline bool bias_storage_safe(const ggml_tensor *op,const ggml_tensor *add) {
-    if(!bias_supported(op,add)||!add->data||!add->src[1]->data||!op->src[0]->data)return false;
+inline bool bias_storage_safe(const ggml_tensor *op,const ggml_tensor *add,
+                              const ggml_tensor *dst=nullptr) {
+    if(!dst)dst=add;
+    if(!bias_supported(op,add)||!dst||!dst->data||!add->src[1]->data||!op->src[0]->data)return false;
     // Activations are fully packed before the existing all-worker barrier, so
     // their allocation may be reused by the destination. Bias and packed model
     // weights remain live throughout all stores and must never overlap it.
-    return !byte_ranges_overlap(add->data,ggml_nbytes(add),add->src[1]->data,ggml_nbytes(add->src[1]))&&
-        !byte_ranges_overlap(add->data,ggml_nbytes(add),op->src[0]->data,nbytes(op->src[0]));
+    return !byte_ranges_overlap(dst->data,ggml_nbytes(dst),add->src[1]->data,ggml_nbytes(add->src[1]))&&
+        !byte_ranges_overlap(dst->data,ggml_nbytes(dst),op->src[0]->data,nbytes(op->src[0]));
 }
-inline void store_result_tile(float *out,const float *result,int M,int N,
-                              int first_m,int first_n,const float *bias) {
+inline bool bias_gelu_supported(const ggml_tensor *op,const ggml_tensor *add,const ggml_tensor *gelu) {
+    return bias_supported(op,add)&&gelu&&gelu->op==GGML_OP_UNARY&&
+        ggml_get_unary_op(gelu)==GGML_UNARY_OP_GELU&&gelu->src[0]==add&&
+        gelu->type==GGML_TYPE_F32&&ggml_are_same_shape(op,gelu)&&ggml_is_contiguous(gelu)&&
+        bias_storage_safe(op,add,gelu);
+}
+inline void store_result_tile(float *out,float *result,int M,int N,
+                              int first_m,int first_n,const float *bias,bool gelu) {
+    if(gelu) {
+        GGML_ASSERT(bias);
+        // Finish the separate FP32 bias addition in the existing TCM result.
+        // The store/reload here deliberately preserves the unfused ADD's F32
+        // rounding. GELU uses the existing RVV approximation and operation order.
+        // Invalid padded rows/columns are never copied to the output.
+        for(int o=0;o<4&&first_n+o*8<N;++o) {
+            const size_t columns=size_t(std::min(8,N-first_n-o*8));
+            const auto offset=__riscv_vle32_v_f32m2(bias+first_n+o*8,columns);
+            for(int r=0;r<8&&first_m+r<M;++r) {
+                auto *p=result+o*64+r*8;
+                __riscv_vse32_v_f32m2(p,__riscv_vfadd_vv_f32m2(
+                    __riscv_vle32_v_f32m2(p,columns),offset,columns),columns);
+            }
+        }
+        spacemit_kernels::rvv::forward_gelu_f32_tile(result,256);
+        bias=nullptr;
+    }
     for(int o=0;o<4&&first_n+o*8<N;++o) {
         const size_t columns=size_t(std::min(8,N-first_n-o*8));
         for(int r=0;r<8&&first_m+r<M;++r) {
@@ -334,16 +361,21 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         return 0;
     }
     bool compute_forward(ggml::spacemit::context &ctx,ggml_tensor *op)const override {
-        return compute(ctx,op,op,nullptr);
+        return compute(ctx,op,op,nullptr,false);
     }
     bool compute_forward_fused(ggml::spacemit::context &ctx,const spacemit_opnode &node)const override {
-        if(node.opcode!=SPACEMIT_OP_PADDLE_F16_BIAS||node.fused.size()!=1||
+        if(node.opcode!=SPACEMIT_OP_PADDLE_F16_BIAS||
+           (node.fused.size()!=1&&node.fused.size()!=2)||
            !node.extra_dsts.empty()||node.packed_im2col||node.elided_pad||
-           !bias_storage_safe(node.node,node.fused[0])||node.node->src[0]->extra!=this)return false;
-        return compute(ctx,node.node,node.fused[0],node.fused[0]->src[1]);
+           !node.node->src[0]||node.node->src[0]->extra!=this)return false;
+        const bool gelu=node.fused.size()==2;
+        auto *dst=node.fused.back();
+        if(gelu?!bias_gelu_supported(node.node,node.fused[0],dst):
+                !bias_storage_safe(node.node,node.fused[0]))return false;
+        return compute(ctx,node.node,dst,node.fused[0]->src[1],gelu);
     }
     bool compute(ggml::spacemit::context &ctx,ggml_tensor *op,ggml_tensor *dst,
-                 const ggml_tensor *bias)const {
+                 const ggml_tensor *bias,bool gelu)const {
         if(!supported(op))return false;
         const int K=int(op->src[0]->ne[0]),N=int(op->ne[0]),M=int(op->ne[1]),groups=(M+7)/8;
         constexpr int tile_n=32;
@@ -459,7 +491,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                                 for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                                 const float inverse=1/(wscale*scales[g+j]);
                                 for(int i=0;i<256;++i)result[i]*=inverse;
-                                store_result_tile(out,result,M,N,(g+j)*8,first_n,bias_data);
+                                store_result_tile(out,result,M,N,(g+j)*8,first_n,bias_data,gelu);
                             }
                         }
                     }
@@ -519,7 +551,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                         for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                         const float inverse=1/(wscale*scales[g+group]);
                         for(int i=0;i<256;++i)result[i]*=inverse;
-                        store_result_tile(out,result,M,N,(g+group)*8,first_n,bias_data);
+                        store_result_tile(out,result,M,N,(g+group)*8,first_n,bias_data,gelu);
                     }
                 }
                 g+=batch_groups;
