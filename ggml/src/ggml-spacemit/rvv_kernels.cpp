@@ -5490,6 +5490,11 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
     const bool mrope_used = (mode & GGML_ROPE_TYPE_MROPE) != 0;
     const bool is_imrope  = (mode == GGML_ROPE_TYPE_IMROPE);
+    const bool is_vision  = (mode == GGML_ROPE_TYPE_VISION);
+    if (is_vision) {
+        GGML_ASSERT(int64_t(n_dims) * 2 == op->ne[0]);
+        GGML_ASSERT(ggml_get_op_params_i32(op, 15) == 0);
+    }
 
     // YaRN correction dims
     float corr_dims[2] = { 0.0f, 0.0f };
@@ -5556,7 +5561,7 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
                     theta *= theta_scale;
                 }
             } else {
-                // M-RoPE / IMROPE: multiple position sequences in src1
+                // M-RoPE / IMROPE / VISION: multiple position sequences in src1
                 const float p_t = (float) pos[i2];
                 const float p_h = (float) pos[i2 + ne2];
                 const float p_w = (float) pos[i2 + ne2 * 2];
@@ -5567,9 +5572,17 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
                 float theta_w = p_w;
                 float theta_e = p_e;
 
-                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                const int64_t cache_dims = is_vision ? op->ne[0] : n_dims;
+                for (int64_t i0 = 0; i0 < cache_dims; i0 += 2) {
                     const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
                     int sector = (sect_dims > 0) ? (i0 / 2) % sect_dims : 0;
+                    // Match CPU ggml_mrope_cache_init(indep_sects=true).
+                    if (is_vision) {
+                        if      (sector == 0)           theta_t = p_t;
+                        else if (sector == sections[0]) theta_h = p_h;
+                        else if (sector == sec_w)       theta_w = p_w;
+                        else if (sector == sec_e)       theta_e = p_e;
+                    }
 
                     float theta;
                     if (is_imrope) {
@@ -5628,8 +5641,8 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
         // of the old scalar element loop.  Keep NORMAL and non-F32 layouts on
         // the reference path because their pair mapping differs.
         if constexpr (std::is_same_v<T, float>) {
-            if (mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) {
-                const int64_t pairs = n_dims / 2;
+            if (mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE || is_vision) {
+                const int64_t pairs = is_vision ? n_dims : n_dims / 2;
                 int64_t j = 0;
                 while (j < pairs) {
                     const size_t vl = __riscv_vsetvl_e32m4((size_t) (pairs - j));
@@ -5654,9 +5667,10 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
                 }
             }
         } else {
-            const int offset = n_dims / 2;
-            for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const int ic = (mode == GGML_ROPE_TYPE_NORMAL) ? i0 : i0 / 2;
+            const int offset = is_vision ? n_dims : n_dims / 2;
+            const int64_t rotate_dims = is_vision ? op->ne[0] : n_dims;
+            for (int64_t i0 = 0; i0 < rotate_dims; i0 += 2) {
+                const int ic = (mode == GGML_ROPE_TYPE_NORMAL) ? int(i0) : int(i0 / 2);
                 const int no = (mode == GGML_ROPE_TYPE_NORMAL) ? 1 : offset;
                 const float x0 = (float) src[ic];
                 const float x1 = (float) src[ic + no];
@@ -5665,8 +5679,10 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
             }
         }
         }
-        for (int64_t i0 = n_dims; i0 < op->ne[0]; ++i0) {
-            dst_row[i0] = src[i0];
+        if (!is_vision) {
+            for (int64_t i0 = n_dims; i0 < op->ne[0]; ++i0) {
+                dst_row[i0] = src[i0];
+            }
         }
     }
 }

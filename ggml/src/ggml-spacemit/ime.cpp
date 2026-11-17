@@ -2214,10 +2214,26 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 const int mode   = ggml_get_op_params_i32(op, 2);
                 const bool src2_ok = op->src[2] == nullptr ||
                     (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]));
+                // Opt-in until the complete Paddle OCR output is revalidated.
+                // VISION rotates every channel and resets theta per section;
+                // admitting it to the ordinary MROPE branch would be incorrect.
+                static const bool vision_enabled = [] {
+                    const char * p = std::getenv("GGML_SPACEMIT_VISION_ROPE");
+                    return p && !std::strcmp(p, "1");
+                }();
+                int sections[4];
+                memcpy(sections, op->op_params + 11, sizeof(sections));
+                const int64_t sect_dims = int64_t(sections[0]) + sections[1] + sections[2] + sections[3];
+                const bool vision_ok = vision_enabled && mode == GGML_ROPE_TYPE_VISION &&
+                    int64_t(n_dims) * 2 == op->ne[0] && ggml_get_op_params_i32(op, 15) == 0 &&
+                    sections[0] >= 0 && sections[1] >= 0 && sections[2] >= 0 && sections[3] >= 0 &&
+                    (sections[0] > 0 || sections[1] > 0 || sections[2] > 0) && sect_dims <= op->ne[0] &&
+                    ggml_is_contiguous(op->src[1]) && op->src[1]->ne[0] >= 4 * op->ne[2] &&
+                    (!op->src[2] || op->src[2]->ne[0] >= op->ne[0] / 2);
                 const bool mode_ok = (mode == GGML_ROPE_TYPE_NORMAL ||
                                       mode == GGML_ROPE_TYPE_NEOX   ||
                                       mode == GGML_ROPE_TYPE_MROPE  ||
-                                      mode == GGML_ROPE_TYPE_IMROPE);
+                                      mode == GGML_ROPE_TYPE_IMROPE || vision_ok);
                 const bool c1 = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
                 const bool c2 = op->type == op->src[0]->type;
                 const bool c3 = op->src[1]->type == GGML_TYPE_I32;

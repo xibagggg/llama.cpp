@@ -427,3 +427,12 @@ if (GGML_SPACEMIT)
     set_tests_properties(test-paddle-attention test-paddle-attention-fullkv-two-pass
         test-paddle-attention-fullkv-head-cache PROPERTIES LABELS spacemit RUN_SERIAL TRUE)
 endif()
+
+
+# CPU/AI elementwise regression for the opt-in VISION RoPE implementation.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-vision-rope.cpp LINK ggml)
+    llama_test(test-paddle-vision-rope LABEL spacemit)
+    set_tests_properties(test-paddle-vision-rope PROPERTIES RUN_SERIAL TRUE ENVIRONMENT
+        "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+endif()
