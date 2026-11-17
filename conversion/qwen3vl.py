@@ -16,6 +16,7 @@ from .qwenvl import Qwen25AudioModel
 @ModelBase.register("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration", "OpenJevModel")
 @ModelBase.example("Qwen/Qwen3-VL-4B-Instruct", "Qwen/Qwen3-VL-30B-A3B-Instruct", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-35B-A3B")
 class Qwen3VLVisionModel(MmprojModel):
+    image_patch = False
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.hparams_vision is None:
@@ -46,6 +47,19 @@ class Qwen3VLVisionModel(MmprojModel):
         if not self.has_audio_encoder:
             self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN3VL)
         self.gguf_writer.add_vision_use_gelu(True)
+
+        # Qwen processors express these limits as pixel areas, including the
+        # newer size.shortest_edge/longest_edge spelling used by OvisOCR2.
+        size = self.preprocessor_config.get("size", {})
+        if not isinstance(size, dict):
+            size = {}
+        min_pixels = self.preprocessor_config.get("min_pixels", size.get("shortest_edge"))
+        max_pixels = self.preprocessor_config.get("max_pixels", size.get("longest_edge"))
+        if min_pixels is not None and max_pixels is not None:
+            if not 0 < int(min_pixels) <= int(max_pixels):
+                raise ValueError("invalid vision pixel limits")
+            self.gguf_writer.add_vision_min_pixels(int(min_pixels))
+            self.gguf_writer.add_vision_max_pixels(int(max_pixels))
 
         if self.hparams_vision is not None:
             merge_size = self.hparams_vision.get("spatial_merge_size")
@@ -132,6 +146,11 @@ class Qwen3VLVisionModel(MmprojModel):
             del c1, c2
             if kt != 2:
                 raise ValueError("Current implementation only supports temporal_patch_size of 2")
+            if self.image_patch:
+                # Still images repeat the same frame: conv(W0, x)+conv(W1, x)
+                # = conv(W0+W1, x). Sum before output precision conversion.
+                yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight.image",
+                       data_torch[:, :, 0, ...].float() + data_torch[:, :, 1, ...].float())
             yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight", data_torch[:, :, 0, ...])
             yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight.1", data_torch[:, :, 1, ...])
             return

@@ -11,6 +11,17 @@ ggml_tensor * clip_graph_qwen2vl::build_inp_with_temporal_merge() {
 
     if (n_batch == 1) {
         // still image input
+        if (model.patch_embeddings_image) {
+            // Keep pixels in F32 and put constant weights on the left of the
+            // matmul, allowing backend weight packing without a half im2col.
+            auto * w = model.patch_embeddings_image;
+            auto * cols = ggml_im2col(ctx0, w, inp_raw, patch_size, patch_size, 0, 0, 1, 1, true, GGML_TYPE_F32);
+            auto * patches = ggml_reshape_2d(ctx0, cols, cols->ne[0], cols->ne[1] * cols->ne[2]);
+            auto * out = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, w, cols->ne[0], w->ne[3]), patches);
+            ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+            out = ggml_reshape_4d(ctx0, out, w->ne[3], cols->ne[1], cols->ne[2], 1);
+            return ggml_cont(ctx0, ggml_permute(ctx0, out, 2, 0, 1, 3));
+        }
         return ggml_add(ctx0,
             ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
             ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));

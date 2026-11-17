@@ -118,6 +118,10 @@ def parse_args() -> argparse.Namespace:
         help="Export multimodal projector (mmproj) for vision models. This will only work on some vision models. An 'mmproj-' prefix will be added to the output file name.",
     )
     parser.add_argument(
+        "--mmproj-image-patch", action="store_true",
+        help="Qwen3.5 vision: add a summed temporal patch kernel for single-projection still-image encoding; retain original kernels for video.",
+    )
+    parser.add_argument(
         "--mtp", action="store_true",
         help="Export only the multi-token prediction (MTP) head as a separate GGUF, suitable for use as a speculative draft. An 'mtp-' prefix will be added to the output file name.",
     )
@@ -220,6 +224,9 @@ def main() -> None:
     }
 
     is_split = args.split_max_tensors > 0 or args.split_max_size != "0"
+    if args.mmproj_image_patch and not args.mmproj:
+        logger.error("--mmproj-image-patch requires --mmproj")
+        sys.exit(1)
     if args.use_temp_file and is_split:
         logger.error("Error: Cannot use temp file when splitting")
         sys.exit(1)
@@ -296,6 +303,12 @@ def main() -> None:
                                      fp8_as_q8=args.fp8_as_q8,
                                      fuse_qkv=args.fuse_qkv,
                                      )
+
+        if args.mmproj_image_patch:
+            if model_architecture != "Qwen3_5ForConditionalGeneration":
+                logger.error("--mmproj-image-patch currently requires Qwen3_5ForConditionalGeneration")
+                sys.exit(1)
+            model_instance.image_patch = True
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")

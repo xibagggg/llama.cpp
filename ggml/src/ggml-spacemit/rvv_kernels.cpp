@@ -4438,8 +4438,9 @@ void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
 
-    float scale;
+    float scale, bias;
     memcpy(&scale, op->op_params, sizeof(float));
+    memcpy(&bias, reinterpret_cast<const char *>(op->op_params) + sizeof(float), sizeof(float));
 
     const int64_t ith = ctx.ith;
     const int64_t nth = ctx.nth;
@@ -4466,6 +4467,9 @@ void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
             const size_t vl = __riscv_vsetvl_e32m4(remaining);
             vfloat32m4_t v  = __riscv_vle32_v_f32m4(src_row, vl);
             v               = __riscv_vfmul_vf_f32m4(v, scale, vl);
+            if (bias != 0.0f) {
+                v = __riscv_vfadd_vf_f32m4(v, bias, vl);
+            }
             __riscv_vse32_v_f32m4(dst_row, v, vl);
             src_row   += vl;
             dst_row   += vl;

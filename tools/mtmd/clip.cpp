@@ -676,7 +676,16 @@ ggml_tensor * clip_graph::build_ffn(
                 cur = ggml_geglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_geglu", il);
             } else {
-                cur = ggml_gelu(ctx0, cur);
+                const char * exact_gelu = std::getenv("MTMD_VISION_GELU_F32");
+                if (model.proj_type == PROJECTOR_TYPE_QWEN3VL && exact_gelu && std::strcmp(exact_gelu, "1") == 0) {
+                    // Reference mode avoids the CPU GELU half-precision lookup table.
+                    auto * cube = ggml_mul(ctx0, ggml_sqr(ctx0, cur), cur);
+                    auto * inner = ggml_scale(ctx0, ggml_add(ctx0, cur, ggml_scale(ctx0, cube, 0.044715f)), 0.7978845608028654f);
+                    auto * gate = ggml_scale_bias(ctx0, ggml_tanh(ctx0, inner), 1.0f, 1.0f);
+                    cur = ggml_mul(ctx0, ggml_scale(ctx0, cur, 0.5f), gate);
+                } else {
+                    cur = ggml_gelu(ctx0, cur);
+                }
                 cb(cur, "ffn_gelu", il);
             } break;
         case FFN_GELU_ERF:
@@ -2357,6 +2366,7 @@ struct clip_model_loader {
         model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
         model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   false);
         model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
+        model.patch_embeddings_image = get_tensor("v.patch_embd.weight.image", false);
 
         model.norm_embd_w = get_tensor(string_format(TN_NORM_EMBD, "weight"), false);
         model.norm_embd_b = get_tensor(string_format(TN_NORM_EMBD, "bias"),   false);

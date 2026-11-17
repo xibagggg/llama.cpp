@@ -116,6 +116,7 @@ struct img_tool {
         int max_pixels = 0;   // 0 = disabled
         // applied before min/max_pixels, so min_pixels can push an edge back above longest_edge
         int longest_edge = 0; // 0 = disabled
+        bool round_to_even = false; // Python round() used by Qwen3-VL processors
     };
 
     // calculate the size of the **resized** image, while preserving the aspect ratio and
@@ -128,7 +129,14 @@ struct img_tool {
             return {0, 0};
         }
 
-        auto round_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
+        auto round_by_factor = [f = opts.align_size, even = opts.round_to_even](float x) {
+            const double v = static_cast<double>(x) / f;
+            const double lo = std::floor(v);
+            const int rounded = even
+                ? static_cast<int>(lo) + (v - lo > 0.5 || (v - lo == 0.5 && static_cast<int>(lo) % 2))
+                : static_cast<int>(std::round(v));
+            return rounded * f;
+        };
         auto ceil_by_factor  = [f = opts.align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
         auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
 
@@ -797,10 +805,11 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
             /* min_pixels   */ hparams.image_min_pixels,
             /* max_pixels   */ hparams.image_max_pixels,
             /* longest_edge */ 0,
+            /* round_to_even */ round_to_even,
         });
     img_tool::resize(img, resized_image, target_size,
                         hparams.image_resize_algo,
-                        hparams.image_resize_pad,
+                        round_to_even ? PAD_NONE : hparams.image_resize_pad,
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);

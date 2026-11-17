@@ -130,7 +130,9 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    bool round_to_even;
+    mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx)
+        : mtmd_image_preprocessor(ctx), round_to_even(clip_get_projector_type(ctx) == PROJECTOR_TYPE_QWEN3VL) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
