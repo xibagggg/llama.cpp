@@ -516,3 +516,73 @@ if (GGML_SPACEMIT)
     set(paddle_pos_resize_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
     set_tests_properties(test-paddle-pos-resize test-paddle-pos-resize-disabled PROPERTIES RUN_SERIAL TRUE ENVIRONMENT "${paddle_pos_resize_env}")
 endif()
+
+
+# Append after the existing Paddle attention tests in tests/CMakeLists.txt.
+# Source only; no backend/CMake/source file was modified by this candidate.
+if (GGML_SPACEMIT AND UNIX AND NOT APPLE)
+    llama_build(test-paddle-attention-pack.cpp LINK ggml)
+
+    # Each configure creates a NEW immutable reference path. The executable
+    # refuses to replace an existing file. Reconfigure before rerunning the
+    # fixture setup, or set a fresh PADDLE_ATTENTION_PACK_RUN_ID explicitly.
+    if (NOT DEFINED PADDLE_ATTENTION_PACK_RUN_ID)
+        string(TIMESTAMP paddle_attention_pack_timestamp "%Y%m%d-%H%M%S" UTC)
+        string(RANDOM LENGTH 8 ALPHABET 0123456789abcdef paddle_attention_pack_nonce)
+        set(PADDLE_ATTENTION_PACK_RUN_ID "${paddle_attention_pack_timestamp}-${paddle_attention_pack_nonce}")
+    endif()
+    set(paddle_attention_pack_reference
+        "${CMAKE_CURRENT_BINARY_DIR}/paddle-attention-pack-${PADDLE_ATTENTION_PACK_RUN_ID}.bin")
+    set(paddle_attention_pack_env
+        "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+
+    # Six-bit order is FULL_PACK, LEAN_PREPARE, FUSED_QUERY, HALF_PACK,
+    # SOFTMAX_PACK (only 0/1), COMPACT. Every test owns a fresh process.
+    # The executable fixes FULL_KV=2 and unrelated experimental flags itself.
+    function(paddle_attention_pack_add name bits write_reference)
+        if (write_reference)
+            set(paddle_attention_pack_action --write-reference)
+        else()
+            set(paddle_attention_pack_action --compare-reference)
+        endif()
+        set(paddle_attention_pack_options "${paddle_attention_pack_env}")
+        set(paddle_attention_pack_names FULL_PACK LEAN_PREPARE FUSED_QUERY HALF_PACK SOFTMAX_PACK COMPACT)
+        foreach(paddle_attention_pack_index RANGE 0 5)
+            string(SUBSTRING "${bits}" ${paddle_attention_pack_index} 1 paddle_attention_pack_value)
+            list(GET paddle_attention_pack_names ${paddle_attention_pack_index} paddle_attention_pack_option)
+            list(APPEND paddle_attention_pack_options
+                "GGML_SPACEMIT_OCR_FA_${paddle_attention_pack_option}=${paddle_attention_pack_value}")
+        endforeach()
+        llama_test(test-paddle-attention-pack NAME "${name}" LABEL spacemit
+            ARGS ${paddle_attention_pack_action} "${paddle_attention_pack_reference}")
+        set_tests_properties("${name}" PROPERTIES
+            ENVIRONMENT "${paddle_attention_pack_options}" RUN_SERIAL TRUE TIMEOUT 1200)
+        if (write_reference)
+            set_tests_properties("${name}" PROPERTIES FIXTURES_SETUP paddle_attention_pack_reference)
+        else()
+            set_tests_properties("${name}" PROPERTIES FIXTURES_REQUIRED paddle_attention_pack_reference)
+        endif()
+    endfunction()
+
+    paddle_attention_pack_add(test-paddle-attention-pack-reference 000000 TRUE)
+    # Re-execute the exact reference mechanism to distinguish fixture/generator
+    # drift from a candidate mismatch. This also verifies reference stability.
+    paddle_attention_pack_add(test-paddle-attention-pack-control 000000 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full 100000 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-lean-alone 010000 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-query-alone 001000 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-half-alone 000100 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-softmax-alone 000010 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-compact-alone 000001 FALSE)
+    # LEAN/QUERY are inactive with FULL_PACK=0. These combinations exercise
+    # their actual branches separately, before the cumulative rollout.
+    paddle_attention_pack_add(test-paddle-attention-pack-full-lean 110000 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full-query 101000 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full-half 100100 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full-softmax 100010 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full-compact 100001 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full-lean-query 111000 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full-lean-query-half 111100 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-full-lean-query-half-softmax 111110 FALSE)
+    paddle_attention_pack_add(test-paddle-attention-pack-all 111111 FALSE)
+endif()
