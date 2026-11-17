@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <riscv_vector.h>
 
 namespace paddle_f16_ime2 {
@@ -28,6 +29,45 @@ inline bool activation_store64_enabled() {
         return p&&!std::strcmp(p,"1");
     }();
     return value;
+}
+// Independent opt-in: copy established packed/scratch storage as raw bytes.
+// The host resolves this once; workers never need to initialize its guard.
+inline bool tcm_copy64_enabled() {
+    static const bool value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_TCM_COPY64");
+        return p&&!std::strcmp(p,"1");
+    }();
+    return value;
+}
+inline void copy_to_from_tcm(bool wide,void *destination,const void *source,size_t bytes) {
+    // Keep the existing memcpy contract for non-overlapping ordinary storage.
+    // Misaligned or non-multiple-of-eight calls retain the libc implementation.
+    if(!wide||((reinterpret_cast<uintptr_t>(destination)|
+                reinterpret_cast<uintptr_t>(source)|bytes)&size_t(7))) {
+        std::memcpy(destination,source,bytes);
+        return;
+    }
+    size_t words=bytes/8;
+    if(!words)return;
+    auto *dst=static_cast<unsigned char*>(destination);
+    const auto *src=static_cast<const unsigned char*>(source);
+    size_t vl,step;
+    // No typed uint64_t lvalue accesses the F16/FP32 objects. Every vector
+    // copies exactly VL*8 object-representation bytes, including the tail.
+    asm volatile(
+      "1:\n\t"
+      "vsetvli %[vl],%[words],e64,m8,ta,ma\n\t"
+      "vle64.v v0,(%[src])\n\t"
+      "vse64.v v0,(%[dst])\n\t"
+      "slli %[step],%[vl],3\n\t"
+      "add %[src],%[src],%[step]\n\t"
+      "add %[dst],%[dst],%[step]\n\t"
+      "sub %[words],%[words],%[vl]\n\t"
+      "bnez %[words],1b\n\t"
+      : [dst]"+&r"(dst),[src]"+&r"(src),[words]"+&r"(words),
+        [vl]"=&r"(vl),[step]"=&r"(step)
+      :
+      : "v0","v1","v2","v3","v4","v5","v6","v7","memory");
 }
 // Independent opt-in: merge high/residual, scale and bias once per N8/M8
 // vector tile and scatter directly to the existing FP32 destination. Each
@@ -94,6 +134,7 @@ inline bool selected(const ggml_tensor *w) {
     (void)output64_enabled(); // Resolve the process-wide option while loading weights on the host.
     (void)paddle_f16_pipeline::enabled();
     (void)activation_store64_enabled();
+    (void)tcm_copy64_enabled();
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
         w->ne[2] != 1 || w->ne[3] != 1) return false;
     const bool vision = !std::strncmp(w->name,"v.blk.",6) &&
@@ -459,6 +500,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
     bool compute_impl(ggml::spacemit::context &ctx,ggml_tensor *op,ggml_tensor *dst,
                       const ggml_tensor *bias,bool gelu)const {
         if(!supported(op))return false;
+        const bool copy64=tcm_copy64_enabled();
         paddle_f16_phases::record timer;
         if constexpr(PROFILE)timer.begin(ctx,op);
         const int K=int(op->src[0]->ne[0]),N=int(op->ne[0]),M=int(op->ne[1]),groups=(M+7)/8;
@@ -538,7 +580,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                         // Existing packing is N8 x full-K. Slice each N8
                         // block independently and compact it to chunk-K.
                         for(int o=0;o<4;++o)
-                            std::memcpy(kw+size_t(p*tile_n+o*8)*kb,
+                            copy_to_from_tcm(copy64,kw+size_t(p*tile_n+o*8)*kb,
                                         pw+size_t(nb*tile_n+o*8)*K+size_t(k0)*8,
                                         size_t(8)*kb*2);
                     }
@@ -546,9 +588,9 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                     for(int g=0;g<groups;g+=2) {
                         const int batch_groups=std::min(2,groups-g);
                         for(int j=0;j<batch_groups;++j) {
-                            std::memcpy(kx+size_t(j)*8*kb,
+                            copy_to_from_tcm(copy64,kx+size_t(j)*8*kb,
                                         px+size_t(g+j)*8*K+size_t(k0)*8,size_t(8)*kb*2);
-                            std::memcpy(kl+size_t(j)*8*kb,
+                            copy_to_from_tcm(copy64,kl+size_t(j)*8*kb,
                                         pl+size_t(g+j)*8*K+size_t(k0)*8,size_t(8)*kb*2);
                         }
                         if constexpr(PROFILE)timer.tick(3);
@@ -557,8 +599,8 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                             auto *save=partial+(size_t(p)*groups+g)*256;
                             auto *save_low=partial_low+(size_t(p)*groups+g)*256;
                             if(k0) {
-                                std::memcpy(ph,save,size_t(batch_groups)*256*sizeof(float));
-                                std::memcpy(lo,save_low,size_t(batch_groups)*256*sizeof(float));
+                                copy_to_from_tcm(copy64,ph,save,size_t(batch_groups)*256*sizeof(float));
+                                copy_to_from_tcm(copy64,lo,save_low,size_t(batch_groups)*256*sizeof(float));
                             }
                             const auto *w=kw+size_t(p)*tile_n*kb;
                             if constexpr(PROFILE)timer.tick(4);
@@ -571,8 +613,8 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                             }
                             if constexpr(PROFILE)timer.tick(5);
                             if(k0+kb<K) {
-                                std::memcpy(save,ph,size_t(batch_groups)*256*sizeof(float));
-                                std::memcpy(save_low,lo,size_t(batch_groups)*256*sizeof(float));
+                                copy_to_from_tcm(copy64,save,ph,size_t(batch_groups)*256*sizeof(float));
+                                copy_to_from_tcm(copy64,save_low,lo,size_t(batch_groups)*256*sizeof(float));
                                 if constexpr(PROFILE)timer.tick(6);
                                 continue;
                             }
@@ -629,7 +671,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             const int active=std::min(panels,1+(ntiles-1-first_nb)/int(ctx.nth));
             for(int p=0;p<active;++p) {
                 const int nb=first_nb+p*int(ctx.nth);
-                std::memcpy(sw+size_t(p)*tile_n*K,pw+size_t(nb)*tile_n*K,weight_bytes);
+                copy_to_from_tcm(copy64,sw+size_t(p)*tile_n*K,pw+size_t(nb)*tile_n*K,weight_bytes);
             }
             if constexpr(PROFILE)timer.tick(2);
             for(int g=0;g<groups;) {
@@ -637,15 +679,15 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 // group beyond the allocated packed high/residual workspace.
                 const int batch_groups=m16&&g+1<groups?2:1;
                 const size_t copy_bytes=size_t(batch_groups)*activation_bytes;
-                std::memcpy(sx,px+size_t(g)*8*K,copy_bytes);
-                if(resident_low)std::memcpy(sl,pl+size_t(g)*8*K,copy_bytes);
+                copy_to_from_tcm(copy64,sx,px+size_t(g)*8*K,copy_bytes);
+                if(resident_low)copy_to_from_tcm(copy64,sl,pl+size_t(g)*8*K,copy_bytes);
                 if constexpr(PROFILE)timer.tick(3);
                 for(int p=0;p<active;++p) {
                     const auto *weights=sw+size_t(p)*tile_n*K;
                     if(batch_groups==2)kernel16(sx,sx+8*K,weights,temp,temp+256,K);
                     else kernel32(sx,weights,temp,K);
                     if constexpr(PROFILE)timer.tick(5);
-                    if(!resident_low)std::memcpy(sl,pl+size_t(g)*8*K,copy_bytes);
+                    if(!resident_low)copy_to_from_tcm(copy64,sl,pl+size_t(g)*8*K,copy_bytes);
                     if constexpr(PROFILE)timer.tick(3);
                     if(batch_groups==2)kernel16(sl,sl+8*K,weights,low,low+256,K);
                     else kernel32(sl,weights,low,K);
