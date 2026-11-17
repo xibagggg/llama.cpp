@@ -586,3 +586,20 @@ if (GGML_SPACEMIT AND UNIX AND NOT APPLE)
     paddle_attention_pack_add(test-paddle-attention-pack-full-lean-query-half-softmax 111110 FALSE)
     paddle_attention_pack_add(test-paddle-attention-pack-all 111111 FALSE)
 endif()
+
+# K4304 K1440 staging: exact comparisons include activation refresh and real M848.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-kblock-plan.cpp LINK ggml)
+    llama_test(test-paddle-kblock-plan LABEL spacemit)
+    set_tests_properties(test-paddle-kblock-plan PROPERTIES RUN_SERIAL TRUE)
+    llama_test(test-paddle-f16-ime2 NAME test-paddle-f16-ime2-kblock-1440 LABEL spacemit
+        ARGS --compare-reference "${paddle_f16_reference}")
+    set_tests_properties(test-paddle-f16-ime2-kblock-1440 PROPERTIES
+        ENVIRONMENT "${paddle_f16_env};GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=1440"
+        FIXTURES_REQUIRED paddle_f16_panel_reference RUN_SERIAL TRUE)
+    llama_test(test-paddle-f16-bias NAME test-paddle-f16-bias-kblock1440 LABEL spacemit
+        ARGS --compare-reference "${paddle_f16_bias_reference}")
+    set_tests_properties(test-paddle-f16-bias-kblock1440 PROPERTIES
+        ENVIRONMENT "${paddle_f16_bias_env};GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=1;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=1440"
+        FIXTURES_REQUIRED paddle_f16_bias_reference RUN_SERIAL TRUE)
+endif()

@@ -4,6 +4,7 @@
 // Enabled explicitly; all other shapes retain the existing RVV implementation.
 #include "spacemit-context.h"
 #include "spacemit-opnode.h"
+#include "paddle-f16-kblock-plan.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -43,15 +44,17 @@ inline bool projector_enabled() {
     }();
     return value;
 }
-// Independent opt-in: K4304 uses compact K1024/N128/M16 staging.
-// Each output continues its original FP32 K8 accumulator across K chunks.
-inline bool kblock_enabled() {
-    static const bool value=[] {
+// Independent opt-in: K4304 keeps original FP32 K8 accumulator order.
+// 1024 uses four resident panels; experimental 1440 uses three panels so
+// K4304 needs three chunks instead of five when the real TCM grant fits.
+inline int requested_kblock() {
+    static const int value=[] {
         const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_KBLOCK");
-        return p&&!std::strcmp(p,"1024");
+        return p&&!std::strcmp(p,"1440")?1440:p&&!std::strcmp(p,"1024")?1024:0;
     }();
     return value;
 }
+inline bool kblock_enabled() {return requested_kblock()!=0;}
 inline bool kblock_selected(const ggml_tensor *op) {
     return kblock_enabled() && op && op->src[0] && op->src[0]->ne[0]==4304 &&
            op->ne[0]==1152;
@@ -384,13 +387,14 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const auto *pw=reinterpret_cast<const _Float16*>(static_cast<const char*>(op->src[0]->data)+128);
         float wscale;std::memcpy(&wscale,op->src[0]->data,4);
         auto *base=static_cast<uint8_t*>(ctx.shared.data);
-        if(kblock_selected(op)&&ctx.shared.size>=344320) {
-            constexpr int block_k=1024, panel_count=4, panel_floats=512;
-            constexpr size_t weight_bytes=size_t(panel_count)*tile_n*block_k*2;
-            constexpr size_t activation_bytes=size_t(16)*block_k*2;
-            constexpr size_t scratch_bytes=2*panel_count*panel_floats*sizeof(float)+256;
-            static_assert(weight_bytes+2*activation_bytes+scratch_bytes==344320,
-                          "K1024/N128/M16 TCM budget changed");
+        const auto plan=make_kblock_plan(requested_kblock(),ctx.shared.size);
+        if(kblock_selected(op)&&plan.block_k) {
+            const int block_k=plan.block_k, panel_count=plan.panels;
+            constexpr int panel_floats=512;
+            const size_t weight_bytes=size_t(panel_count)*tile_n*block_k*2;
+            const size_t activation_bytes=size_t(16)*block_k*2;
+            const size_t scratch_bytes=2*panel_count*panel_floats*sizeof(float)+256;
+            GGML_ASSERT(weight_bytes+2*activation_bytes+scratch_bytes<=ctx.shared.size);
             auto *kw=reinterpret_cast<_Float16*>(base+128);
             auto *kx=kw+size_t(panel_count)*tile_n*block_k;
             auto *kl=kx+size_t(16)*block_k;
@@ -400,15 +404,15 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             auto *partial=reinterpret_cast<float*>(
                 static_cast<char*>(ctx.workspace)+activation_workspace_bytes(op)+
                 size_t(ctx.ith)*kblock_lane_bytes(op));
-            auto *partial_low=partial+size_t(panel_count)*groups*256;
+            auto *partial_low=partial+size_t(4)*groups*256;
             auto *out=static_cast<float*>(dst->data);
             const int ntiles=(N+tile_n-1)/tile_n;
             // Preserve the existing strided N32 ownership: with N1152/six
-            // workers, each lane handles four panels then its final two.
+            // workers, each lane handles four plus two, or three plus three.
             for(int first_nb=int(ctx.ith);first_nb<ntiles;first_nb+=panel_count*int(ctx.nth)) {
                 const int active=std::min(panel_count,1+(ntiles-1-first_nb)/int(ctx.nth));
                 for(int k0=0;k0<K;k0+=block_k) {
-                    const int kb=std::min(block_k,K-k0); // final chunk is208.
+                    const int kb=std::min(block_k,K-k0); // final chunk is208 or1424.
                     GGML_ASSERT(kb>0&&kb%8==0);
                     for(int p=0;p<active;++p) {
                         const int nb=first_nb+p*int(ctx.nth);
