@@ -11,6 +11,10 @@ inline bool trust_bounds_enabled() {
 inline bool head_key_cache_enabled() {
     static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_HEAD_K_TCM");return p&&!std::strcmp(p,"1");}();return on;
 }
+// Independent opt-in for exact FULL_KV=2. Keep the single-pass switch intact.
+inline bool head_key_cache_two_pass_enabled() {
+    static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_HEAD_K_TCM_2PASS");return p&&!std::strcmp(p,"1");}();return on;
+}
 inline bool all_key_cache_enabled() {
     static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_ALL_K_TCM");return p&&!std::strcmp(p,"1");}();return on;
 }

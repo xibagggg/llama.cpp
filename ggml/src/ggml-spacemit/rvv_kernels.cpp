@@ -57,6 +57,7 @@ void prepare_ocr_worker_state() {
     (void)ocr_fa_pack_v40::lazy_init();
     (void)ocr_fa_fullkv::trust_bounds_enabled();
     (void)ocr_fa_fullkv::head_key_cache_enabled();
+    (void)ocr_fa_fullkv::head_key_cache_two_pass_enabled();
     (void)ocr_fa_fullkv::all_key_cache_enabled();
     (void)ocr_fa_fullkv::half_pack_enabled();
     (void)ocr_fa_fullkv::lean_prepare_enabled();
@@ -1836,7 +1837,8 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     const bool compact=ocr_fa_fullkv::compact_enabled();
     const int vd=compact?D:96;
     const int key_tiles=int(ocr_fa_pack_v40::tiles(dst));
-    const bool head_option=ocr_fa_fullkv::head_key_cache_enabled();
+    const bool two_pass_head=passes==2&&ocr_fa_fullkv::head_key_cache_two_pass_enabled();
+    const bool head_option=ocr_fa_fullkv::head_key_cache_enabled()||two_pass_head;
     const bool all_key_option=ocr_fa_fullkv::all_key_cache_enabled();
     const size_t cached_key_bytes=size_t(key_tiles-1)*64*D*sizeof(_Float16);
     // QK scratch is dead before probabilities are written, and packed Q is
@@ -1855,7 +1857,7 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     // Uncached QK tiles temporarily use P before softmax writes it. Small
     // crops must still reserve enough room for the full K64 copy and result;
     // otherwise that scratch would overwrite the live V weights after P.
-    const bool head_cache=all_key_cache||(head_option&&passes==1&&
+    const bool head_cache=all_key_cache||(head_option&&(passes==1||two_pass_head)&&
         size_t(16)*padded*sizeof(_Float16)>=qk_bytes&&
         ocr_fa_fullkv::direct_pack_enabled()&&bytes_for(16,true)<=ctx.shared.size);
     const int Q=head_cache?16:ocr_fa_fullkv::query32_enabled()&&bytes_for(32,false)<=ctx.shared.size?32:16;
@@ -1874,7 +1876,7 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     auto *acc_high=all_key_cache?reinterpret_cast<float*>(packed_q):reinterpret_cast<float*>(weights+vd*padded);
     auto *acc_low=acc_high+512;
     auto *cached_keys=all_key_cache?weights+vd*padded:reinterpret_cast<_Float16*>(acc_high+passes*512);
-    ocr_fa_phases_v50::record phase(ctx,dst,"fullkv");
+    ocr_fa_phases_v50::record phase(ctx,dst,two_pass_head&&head_cache?"fullkv-k2":"fullkv");
     if constexpr(PROFILE)phase.begin();
     int loaded_head=-1;
     for(int ir=ir0;ir<ir1;){
