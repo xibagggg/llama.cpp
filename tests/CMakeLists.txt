@@ -691,3 +691,28 @@ if (GGML_SPACEMIT)
         set_tests_properties("${paddle_attention_head_cache_test}" PROPERTIES ENVIRONMENT "${paddle_attention_head_cache_env}" FIXTURES_REQUIRED paddle_attention_head_cache_reference RUN_SERIAL TRUE)
     endforeach()
 endif()
+
+# Exact high/residual merge, scale and direct FP32 store regression.
+if (GGML_SPACEMIT)
+    set(paddle_output64_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    foreach(paddle_output64_kind IN ITEMS ime2 bias)
+        set(paddle_output64_binary "test-paddle-f16-${paddle_output64_kind}")
+        set(paddle_output64_ref "${CMAKE_CURRENT_BINARY_DIR}/paddle-output64-${paddle_output64_kind}-reference.bin")
+        set(paddle_output64_reference "test-paddle-output64-${paddle_output64_kind}-reference")
+        llama_test(${paddle_output64_binary} NAME "${paddle_output64_reference}" LABEL spacemit ARGS --write-reference "${paddle_output64_ref}")
+        set_tests_properties("${paddle_output64_reference}" PROPERTIES RUN_SERIAL TRUE
+            ENVIRONMENT "${paddle_output64_env};GGML_SPACEMIT_PADDLE_F16_OUTPUT64=0;GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=0;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=1;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=8;GGML_SPACEMIT_PADDLE_F16_M16=0;GGML_SPACEMIT_PADDLE_F16_KBLOCK=0"
+            FIXTURES_SETUP "paddle_output64_${paddle_output64_kind}_reference")
+        foreach(paddle_output64_mode IN ITEMS m16 kblock1440)
+            set(paddle_output64_kblock 0)
+            if (paddle_output64_mode STREQUAL "kblock1440")
+                set(paddle_output64_kblock 1440)
+            endif()
+            set(paddle_output64_name "test-paddle-output64-${paddle_output64_kind}-${paddle_output64_mode}")
+            llama_test(${paddle_output64_binary} NAME "${paddle_output64_name}" LABEL spacemit ARGS --compare-reference "${paddle_output64_ref}")
+            set_tests_properties("${paddle_output64_name}" PROPERTIES RUN_SERIAL TRUE
+                ENVIRONMENT "${paddle_output64_env};GGML_SPACEMIT_PADDLE_F16_OUTPUT64=1;GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=1;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=${paddle_output64_kblock}"
+                FIXTURES_REQUIRED "paddle_output64_${paddle_output64_kind}_reference")
+        endforeach()
+    endforeach()
+endif()

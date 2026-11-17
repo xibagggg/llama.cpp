@@ -19,6 +19,16 @@ inline bool enabled() {
     static const bool value=[] {const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_IME2");return p&&!std::strcmp(p,"1");}();
     return value;
 }
+// Independent opt-in: merge high/residual, scale and bias once per N8/M8
+// vector tile and scatter directly to the existing FP32 destination. Each
+// output retains its original arithmetic order and no value is narrowed.
+inline bool output64_enabled() {
+    static const bool value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_OUTPUT64");
+        return p&&!std::strcmp(p,"1");
+    }();
+    return value;
+}
 // Diagnostic opt-in: number of this worker's W32 panels resident in TCM.
 // K4304 and K4608 fall back to one panel because of TCM capacity.
 inline int requested_panels() {
@@ -71,6 +81,7 @@ inline size_t kblock_lane_bytes(const ggml_tensor *op) {
     return groups*4*256*sizeof(float)*2;
 }
 inline bool selected(const ggml_tensor *w) {
+    (void)output64_enabled(); // Resolve the process-wide option while loading weights on the host.
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
         w->ne[2] != 1 || w->ne[3] != 1) return false;
     const bool vision = !std::strncmp(w->name,"v.blk.",6) &&
@@ -336,6 +347,30 @@ inline void store_result_tile(float *out,float *result,int M,int N,
         }
     }
 }
+// Selected Paddle N sizes are multiples of eight. The final M group uses
+// a shorter prefix; padded rows are never stored. Unordered indices are unique.
+inline void store_merged_tile64(float *out,const float *high,const float *low,
+                                float inverse,int M,int N,int first_m,int first_n,
+                                const float *bias) {
+    GGML_ASSERT(M>first_m&&N%8==0&&first_n%8==0);
+    const size_t vl=size_t(std::min(8,M-first_m))*8;
+    const auto ids=__riscv_vid_v_u32m2(64);
+    const auto columns=__riscv_vand_vx_u32m2(ids,7,64);
+    const auto offsets=__riscv_vsll_vx_u32m2(__riscv_vadd_vv_u32m2(
+        __riscv_vmul_vx_u32m2(__riscv_vsrl_vx_u32m2(ids,3,64),uint32_t(N),64),
+        columns,64),2,64);
+    for(int o=0;o<4&&first_n+o*8<N;++o) {
+        const auto residual=__riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(low+o*64,vl),1.0f/4096,vl);
+        const auto merged=__riscv_vfadd_vv_f32m2(__riscv_vle32_v_f32m2(high+o*64,vl),residual,vl);
+        auto value=__riscv_vfmul_vf_f32m2(merged,inverse,vl);
+        if(bias) {
+            const auto bias8=__riscv_vle32_v_f32m2(bias+first_n+o*8,8);
+            const auto repeated=__riscv_vrgather_vv_f32m2(bias8,columns,vl);
+            value=__riscv_vfadd_vv_f32m2(value,repeated,vl);
+        }
+        __riscv_vsuxei32_v_f32m2(out+size_t(first_m)*N+first_n+o*8,offsets,value,vl);
+    }
+}
 struct traits final:ggml::spacemit::tensor_traits_base {
     bool work_size(int nth,const ggml_tensor *op,size_t &size)const override {
         if(!supported(op))return false;
@@ -505,8 +540,13 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                             for(int j=0;j<batch_groups;++j) {
                                 auto *result=ph+j*256;
                                 const auto *residual=lo+j*256;
-                                for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                                 const float inverse=1/(wscale*scales[g+j]);
+                                if(output64_enabled()&&!gelu) {
+                                    store_merged_tile64(out,result,residual,inverse,M,N,(g+j)*8,first_n,bias_data);
+                                    if constexpr(PROFILE)timer.tick(8); // Fused merge/scale and store.
+                                    continue;
+                                }
+                                for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                                 for(int i=0;i<256;++i)result[i]*=inverse;
                                 if constexpr(PROFILE)timer.tick(7);
                                 store_result_tile(out,result,M,N,(g+j)*8,first_n,bias_data,gelu);
@@ -574,8 +614,13 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                     for(int group=0;group<batch_groups;++group) {
                         auto *result=temp+group*256;
                         const auto *residual=low+group*256;
-                        for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                         const float inverse=1/(wscale*scales[g+group]);
+                        if(output64_enabled()&&!gelu) {
+                            store_merged_tile64(out,result,residual,inverse,M,N,(g+group)*8,first_n,bias_data);
+                            if constexpr(PROFILE)timer.tick(8); // Fused merge/scale and store.
+                            continue;
+                        }
+                        for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
                         for(int i=0;i<256;++i)result[i]*=inverse;
                         if constexpr(PROFILE)timer.tick(7);
                         store_result_tile(out,result,M,N,(g+group)*8,first_n,bias_data,gelu);
