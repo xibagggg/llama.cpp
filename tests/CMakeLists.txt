@@ -820,3 +820,19 @@ if (GGML_SPACEMIT)
     set_tests_properties(test-paddle-f16-f16-patch PROPERTIES RUN_SERIAL TRUE ENVIRONMENT
         "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_PADDLE_F16_F16_PATCH=1")
 endif()
+
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-llm-head-stage.cpp LINK ggml)
+    set(paddle_llm_head_stage_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0")
+    set(paddle_llm_head_stage_ref "${CMAKE_CURRENT_BINARY_DIR}/paddle-llm-head-stage-reference.bin")
+    llama_test(test-paddle-llm-head-stage NAME test-paddle-llm-head-stage-reference LABEL spacemit ARGS --write-reference "${paddle_llm_head_stage_ref}")
+    set_tests_properties(test-paddle-llm-head-stage-reference PROPERTIES
+        ENVIRONMENT "${paddle_llm_head_stage_env};GGML_SPACEMIT_PADDLE_LLM_HEAD_STAGE_N=0"
+        FIXTURES_SETUP paddle_llm_head_stage_reference RUN_SERIAL TRUE)
+    foreach(paddle_llm_head_stage_n IN ITEMS 64 128)
+        llama_test(test-paddle-llm-head-stage NAME "test-paddle-llm-head-stage-${paddle_llm_head_stage_n}" LABEL spacemit ARGS --compare-reference "${paddle_llm_head_stage_ref}")
+        set_tests_properties("test-paddle-llm-head-stage-${paddle_llm_head_stage_n}" PROPERTIES
+            ENVIRONMENT "${paddle_llm_head_stage_env};GGML_SPACEMIT_PADDLE_LLM_HEAD_STAGE_N=${paddle_llm_head_stage_n}"
+            FIXTURES_REQUIRED paddle_llm_head_stage_reference RUN_SERIAL TRUE)
+    endforeach()
+endif()

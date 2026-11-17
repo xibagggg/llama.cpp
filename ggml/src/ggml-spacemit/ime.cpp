@@ -29,6 +29,7 @@
 #include "ocr-q4-f16.h"
 #include "paddle-f16-ime2.h"
 #include "paddle-f16-f16-patch.h"
+#include "paddle-llm-head-stage.h"
 #include "paddle-pos-resize.h"
 #include "ocr-q4-pc8.h"
 
@@ -87,6 +88,15 @@
 #endif
 
 // clang-format on
+
+// One hardware-wide capacity promise, resolved on the host before dispatch.
+// graph_compute validates every worker view against this backend-info bound.
+// Do not choose a barrier schedule from a worker-local capacity: uneven views
+// could otherwise select different widths and disagree on pair iterations.
+static size_t paddle_llm_head_shared_capacity() {
+    static const size_t bytes=spert::backend_info().shared_mem_size;
+    return bytes;
+}
 
 static bool ocr_strided_cast_supported(const ggml_tensor*op){
     static const bool enabled=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_STRIDED_CAST");return p&&!std::strcmp(p,"1");}();
@@ -692,9 +702,27 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 }
             }
         } else if (tcm_buffer != nullptr && per_nb_cols_wsize <= tcm_buffer_size) {
+            int64_t stage_cols=NB_COLS;
+#if defined(RISCV64_SPACEMIT_IME2)
+            if constexpr(std::is_same_v<BLOC_TYPE,block_q6_K> && INTER_SIZE==32 && NB_COLS==32) {
+                if(global_spine_env_info.use_ime2&&!fused_bias&&!packed_im2col&&
+                   ne02==1&&ne03==1&&ne12==1&&ne13==1&&
+                   ggml_is_contiguous(src1)&&ggml_is_contiguous(dst)) {
+                    const auto plan=paddle_llm_head_stage::choose(
+                        paddle_llm_head_stage::requested_cols(),gemm_m,gemm_k,gemm_n,
+                        src0->name,size_t(row_stride_b),paddle_llm_head_shared_capacity());
+                    if(plan.selected)stage_cols=plan.cols;
+                }
+            }
+#endif
+            const size_t stage_b_bytes=staged_b_bytes(stage_cols);
+            GGML_ASSERT(stage_b_bytes<=size_t(tcm_buffer_size));
+            const paddle_llm_head_stage::schedule stage{stage_cols,nth};
             uint8_t * a_row = quant_a_buffer;
             uint8_t * b_col = reinterpret_cast<uint8_t *>(tcm_buffer);
-            if ((gemm_workspace_size + per_nb_cols_wsize) <= tcm_buffer_size) {
+            // Retain DDR A when only B fits. Never overlap A with the larger B.
+            if (stage_b_bytes<=size_t(tcm_buffer_size) &&
+                size_t(gemm_workspace_size)<=size_t(tcm_buffer_size)-stage_b_bytes) {
                 a_row = (uint8_t *) tcm_buffer;
                 b_col = reinterpret_cast<uint8_t *>(tcm_buffer) + gemm_workspace_size;
             }
@@ -718,9 +746,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
             const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
 
-            const int64_t ni0     = (int64_t) ith * NB_COLS;
+            const int64_t ni0     = stage.first(ith);
             const bool    active0 = ni0 < gemm_n;
-            const int64_t nb0     = active0 ? std::min(gemm_n - ni0, (int64_t) NB_COLS) : 0;
+            const int64_t nb0     = stage.count(ni0,gemm_n);
 
             if (ith % 2 == 0 && active0) {
                 spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni0 * row_stride_b,
@@ -742,12 +770,14 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                                                 staged_b_bytes(nb0));
             }
 
-            const int64_t base_start = (int64_t) (ith & ~1) * NB_COLS;
-            const int64_t lane_off   = (int64_t) (ith & 1) * NB_COLS;
-            for (int64_t base = base_start; base < gemm_n; base += NB_COLS * nth) {
+            // Keep the existing paired even/odd copy/compute barriers. Both
+            // siblings traverse the same bases even when one tail is inactive.
+            const int64_t base_start = stage.pair_first(ith);
+            const int64_t lane_off   = stage.lane_offset(ith);
+            for (int64_t base = base_start; base < gemm_n; base += stage.step()) {
                 const int64_t ni      = base + lane_off;
                 const bool    active  = ni < gemm_n;
-                const int64_t nb_real = active ? std::min(gemm_n - ni, (int64_t) NB_COLS) : 0;
+                const int64_t nb_real = stage.count(ni,gemm_n);
 
                 if (has_pair && ith % 2 != 0) {
                     spine_barrier_wait(cur_barrier);
@@ -773,9 +803,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     spine_barrier_wait(cur_barrier);
                 }
 
-                const int64_t next_ni = ni + NB_COLS * nth;
+                const int64_t next_ni = ni + stage.step();
                 if (next_ni < gemm_n) {
-                    const int64_t next_nb = std::min(gemm_n - next_ni, (int64_t) NB_COLS);
+                    const int64_t next_nb = stage.count(next_ni,gemm_n);
                     spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + next_ni * row_stride_b,
                                                     staged_b_bytes(next_nb));
                 }
@@ -2501,6 +2531,8 @@ int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data,
 }
 
 bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t * size) {
+    (void)paddle_llm_head_stage::requested_cols(); // Host resolves before launch.
+    (void)paddle_llm_head_shared_capacity();
     if (ocr_ime2_fp16_v35::eligible(op)) { *size = ocr_ime2_fp16_v35::work_bytes(op); return true; }
     const auto * traits = ggml_spacemit_get_tensor_traits(op);
     return traits != nullptr && traits->work_size(n_threads, op, *size);
