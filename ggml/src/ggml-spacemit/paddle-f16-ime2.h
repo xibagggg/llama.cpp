@@ -42,6 +42,28 @@ inline bool projector_enabled() {
     }();
     return value;
 }
+// Independent opt-in: K4304 uses compact K1024/N128/M16 staging.
+// Each output continues its original FP32 K8 accumulator across K chunks.
+inline bool kblock_enabled() {
+    static const bool value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_KBLOCK");
+        return p&&!std::strcmp(p,"1024");
+    }();
+    return value;
+}
+inline bool kblock_selected(const ggml_tensor *op) {
+    return kblock_enabled() && op && op->src[0] && op->src[0]->ne[0]==4304 &&
+           op->ne[0]==1152;
+}
+inline size_t activation_workspace_bytes(const ggml_tensor *op) {
+    const size_t groups=GGML_PAD(size_t(op->ne[1]),8)/8;
+    return GGML_PAD(groups*8*size_t(op->src[0]->ne[0])*4,64)+GGML_PAD(groups*4,64);
+}
+inline size_t kblock_lane_bytes(const ggml_tensor *op) {
+    // Four N32 panels, each with high and residual M8/N32 accumulators.
+    const size_t groups=GGML_PAD(size_t(op->ne[1]),8)/8;
+    return groups*4*256*sizeof(float)*2;
+}
 inline bool selected(const ggml_tensor *w) {
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
         w->ne[2] != 1 || w->ne[3] != 1) return false;
@@ -122,6 +144,78 @@ __attribute__((noinline)) static void kernel16(
         "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
         "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
 }
+// Chunked kernels reload existing FP32 accumulators instead of adding partial dot products.
+__attribute__((noinline)) static void kernel32_continue(const _Float16 *x,const _Float16 *w,float *c,int K,int accumulate){
+    const _Float16 *w1=w+8*K,*w2=w+16*K,*w3=w+24*K;int blocks=K/8;
+    asm volatile(
+      "vsetvli t0,zero,e32,m2,ta,ma\n\t"
+      "beqz %[accumulate],2f\n\t"
+      "vle32.v v16,(%[c])\n\taddi t0,%[c],256\n\tvle32.v v18,(t0)\n\t"
+      "addi t0,%[c],512\n\tvle32.v v20,(t0)\n\t"
+      "addi t0,%[c],768\n\tvle32.v v22,(t0)\n\tj 3f\n\t"
+      "2:\n\tvmv.v.i v16,0\n\tvmv.v.i v18,0\n\tvmv.v.i v20,0\n\tvmv.v.i v22,0\n\t"
+      "3:\n\t"
+      "vsetvli t0,zero,e16,m1,ta,ma\n\t"
+      "1:\n\t"
+      "vle16.v v2,(%[x])\n\tvle16.v v8,(%[w])\n\t"
+      "vle16.v v9,(%[w1])\n\tvle16.v v10,(%[w2])\n\tvle16.v v11,(%[w3])\n\t"
+      "smt.vfwmadot v16,v2,v8\n\tsmt.vfwmadot v18,v2,v9\n\t"
+      "smt.vfwmadot v20,v2,v10\n\tsmt.vfwmadot v22,v2,v11\n\t"
+      "addi %[x],%[x],128\n\taddi %[w],%[w],128\n\taddi %[w1],%[w1],128\n\t"
+      "addi %[w2],%[w2],128\n\taddi %[w3],%[w3],128\n\t"
+      "addi %[blocks],%[blocks],-1\n\tbnez %[blocks],1b\n\t"
+      "vsetvli t0,zero,e32,m2,ta,ma\n\tvse32.v v16,(%[c])\n\t"
+      "addi t0,%[c],256\n\tvse32.v v18,(t0)\n\t"
+      "addi t0,%[c],512\n\tvse32.v v20,(t0)\n\t"
+      "addi t0,%[c],768\n\tvse32.v v22,(t0)\n\t"
+      :[x]"+&r"(x),[w]"+&r"(w),[w1]"+&r"(w1),[w2]"+&r"(w2),[w3]"+&r"(w3),[blocks]"+&r"(blocks)
+      :[c]"r"(c),[accumulate]"r"(accumulate)
+      :"t0","v2","v8","v9","v10","v11","v16","v17","v18","v19","v20","v21","v22","v23","memory");
+}
+__attribute__((noinline)) static void kernel16_continue(
+    const _Float16 *x0, const _Float16 *x1, const _Float16 *w,
+    float *c0, float *c1, int K, int accumulate) {
+    const _Float16 *w1=w+8*K, *w2=w+16*K, *w3=w+24*K;
+    int blocks=K/8;
+    asm volatile(
+      "beqz %[accumulate],2f\n\t"
+      "vsetvli t0,zero,e32,m2,ta,ma\n\t"
+      "vle32.v v16,(%[c0])\n\taddi t0,%[c0],256\n\tvle32.v v18,(t0)\n\t"
+      "addi t0,%[c0],512\n\tvle32.v v20,(t0)\n\t"
+      "addi t0,%[c0],768\n\tvle32.v v22,(t0)\n\t"
+      "vle32.v v24,(%[c1])\n\taddi t0,%[c1],256\n\tvle32.v v26,(t0)\n\t"
+      "addi t0,%[c1],512\n\tvle32.v v28,(t0)\n\t"
+      "addi t0,%[c1],768\n\tvle32.v v30,(t0)\n\tj 3f\n\t"
+      "2:\n\tvsetvli t0,zero,e32,m8,ta,ma\n\t"
+      "vmv.v.i v16,0\n\tvmv.v.i v24,0\n\t"
+      "3:\n\t"
+      "vsetvli t0,zero,e16,m1,ta,ma\n\t"
+      "1:\n\t"
+      "vle16.v v2,(%[x0])\n\tvle16.v v3,(%[x1])\n\t"
+      "vle16.v v8,(%[w])\n\tvle16.v v9,(%[w1])\n\t"
+      "vle16.v v10,(%[w2])\n\tvle16.v v11,(%[w3])\n\t"
+      "smt.vfwmadot v16,v2,v8\n\tsmt.vfwmadot v24,v3,v8\n\t"
+      "smt.vfwmadot v18,v2,v9\n\tsmt.vfwmadot v26,v3,v9\n\t"
+      "smt.vfwmadot v20,v2,v10\n\tsmt.vfwmadot v28,v3,v10\n\t"
+      "smt.vfwmadot v22,v2,v11\n\tsmt.vfwmadot v30,v3,v11\n\t"
+      "addi %[x0],%[x0],128\n\taddi %[x1],%[x1],128\n\t"
+      "addi %[w],%[w],128\n\taddi %[w1],%[w1],128\n\t"
+      "addi %[w2],%[w2],128\n\taddi %[w3],%[w3],128\n\t"
+      "addi %[blocks],%[blocks],-1\n\tbnez %[blocks],1b\n\t"
+      "vsetvli t0,zero,e32,m2,ta,ma\n\t"
+      "vse32.v v16,(%[c0])\n\taddi t0,%[c0],256\n\tvse32.v v18,(t0)\n\t"
+      "addi t0,%[c0],512\n\tvse32.v v20,(t0)\n\t"
+      "addi t0,%[c0],768\n\tvse32.v v22,(t0)\n\t"
+      "vse32.v v24,(%[c1])\n\taddi t0,%[c1],256\n\tvse32.v v26,(t0)\n\t"
+      "addi t0,%[c1],512\n\tvse32.v v28,(t0)\n\t"
+      "addi t0,%[c1],768\n\tvse32.v v30,(t0)\n\t"
+      : [x0]"+&r"(x0), [x1]"+&r"(x1), [w]"+&r"(w), [w1]"+&r"(w1),
+        [w2]"+&r"(w2), [w3]"+&r"(w3), [blocks]"+&r"(blocks)
+      : [c0]"r"(c0), [c1]"r"(c1), [accumulate]"r"(accumulate)
+      : "t0", "v2", "v3", "v8", "v9", "v10", "v11",
+        "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+        "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
+}
 // Diagnostic opt-in. The 64-wide path preserves the original per-value
 // high/residual arithmetic and changes only vector width and packed stores.
 inline bool wide_activation_pack() {
@@ -169,10 +263,10 @@ inline bool supported(const ggml_tensor *op) {
         ggml_is_contiguous(op->src[1])&&ggml_is_contiguous(op);
 }
 struct traits final:ggml::spacemit::tensor_traits_base {
-    bool work_size(int,const ggml_tensor *op,size_t &size)const override {
+    bool work_size(int nth,const ggml_tensor *op,size_t &size)const override {
         if(!supported(op))return false;
-        const size_t groups=GGML_PAD(size_t(op->ne[1]),8)/8;
-        size=GGML_PAD(groups*8*size_t(op->src[0]->ne[0])*4,64)+GGML_PAD(groups*4,64);
+        size=activation_workspace_bytes(op);
+        if(kblock_selected(op))size+=size_t(nth)*kblock_lane_bytes(op);
         return true;
     }
     int repack(ggml_tensor *w,const void *data,size_t bytes)const override {
@@ -236,6 +330,90 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const auto *pw=reinterpret_cast<const _Float16*>(static_cast<const char*>(op->src[0]->data)+128);
         float wscale;std::memcpy(&wscale,op->src[0]->data,4);
         auto *base=static_cast<uint8_t*>(ctx.shared.data);
+        if(kblock_selected(op)&&ctx.shared.size>=344320) {
+            constexpr int block_k=1024, panel_count=4, panel_floats=512;
+            constexpr size_t weight_bytes=size_t(panel_count)*tile_n*block_k*2;
+            constexpr size_t activation_bytes=size_t(16)*block_k*2;
+            constexpr size_t scratch_bytes=2*panel_count*panel_floats*sizeof(float)+256;
+            static_assert(weight_bytes+2*activation_bytes+scratch_bytes==344320,
+                          "K1024/N128/M16 TCM budget changed");
+            auto *kw=reinterpret_cast<_Float16*>(base+128);
+            auto *kx=kw+size_t(panel_count)*tile_n*block_k;
+            auto *kl=kx+size_t(16)*block_k;
+            auto *high=reinterpret_cast<float*>(kl+size_t(16)*block_k);
+            auto *low=high+panel_count*panel_floats;
+            std::memset(base,0xa5,128);std::memset(low+panel_count*panel_floats,0xa5,128);
+            auto *partial=reinterpret_cast<float*>(
+                static_cast<char*>(ctx.workspace)+activation_workspace_bytes(op)+
+                size_t(ctx.ith)*kblock_lane_bytes(op));
+            auto *partial_low=partial+size_t(panel_count)*groups*256;
+            auto *out=static_cast<float*>(op->data);
+            const int ntiles=(N+tile_n-1)/tile_n;
+            // Preserve the existing strided N32 ownership: with N1152/six
+            // workers, each lane handles four panels then its final two.
+            for(int first_nb=int(ctx.ith);first_nb<ntiles;first_nb+=panel_count*int(ctx.nth)) {
+                const int active=std::min(panel_count,1+(ntiles-1-first_nb)/int(ctx.nth));
+                for(int k0=0;k0<K;k0+=block_k) {
+                    const int kb=std::min(block_k,K-k0); // final chunk is208.
+                    GGML_ASSERT(kb>0&&kb%8==0);
+                    for(int p=0;p<active;++p) {
+                        const int nb=first_nb+p*int(ctx.nth);
+                        // Existing packing is N8 x full-K. Slice each N8
+                        // block independently and compact it to chunk-K.
+                        for(int o=0;o<4;++o)
+                            std::memcpy(kw+size_t(p*tile_n+o*8)*kb,
+                                        pw+size_t(nb*tile_n+o*8)*K+size_t(k0)*8,
+                                        size_t(8)*kb*2);
+                    }
+                    for(int g=0;g<groups;g+=2) {
+                        const int batch_groups=std::min(2,groups-g);
+                        for(int j=0;j<batch_groups;++j) {
+                            std::memcpy(kx+size_t(j)*8*kb,
+                                        px+size_t(g+j)*8*K+size_t(k0)*8,size_t(8)*kb*2);
+                            std::memcpy(kl+size_t(j)*8*kb,
+                                        pl+size_t(g+j)*8*K+size_t(k0)*8,size_t(8)*kb*2);
+                        }
+                        for(int p=0;p<active;++p) {
+                            auto *ph=high+p*panel_floats,*lo=low+p*panel_floats;
+                            auto *save=partial+(size_t(p)*groups+g)*256;
+                            auto *save_low=partial_low+(size_t(p)*groups+g)*256;
+                            if(k0) {
+                                std::memcpy(ph,save,size_t(batch_groups)*256*sizeof(float));
+                                std::memcpy(lo,save_low,size_t(batch_groups)*256*sizeof(float));
+                            }
+                            const auto *w=kw+size_t(p)*tile_n*kb;
+                            if(batch_groups==2) {
+                                kernel16_continue(kx,kx+8*kb,w,ph,ph+256,kb,k0!=0);
+                                kernel16_continue(kl,kl+8*kb,w,lo,lo+256,kb,k0!=0);
+                            } else {
+                                kernel32_continue(kx,w,ph,kb,k0!=0);
+                                kernel32_continue(kl,w,lo,kb,k0!=0);
+                            }
+                            if(k0+kb<K) {
+                                std::memcpy(save,ph,size_t(batch_groups)*256*sizeof(float));
+                                std::memcpy(save_low,lo,size_t(batch_groups)*256*sizeof(float));
+                                continue;
+                            }
+                            const int first_n=(first_nb+p*int(ctx.nth))*tile_n;
+                            for(int j=0;j<batch_groups;++j) {
+                                auto *result=ph+j*256;
+                                const auto *residual=lo+j*256;
+                                for(int i=0;i<256;++i)result[i]+=residual[i]*(1.0f/4096);
+                                const float inverse=1/(wscale*scales[g+j]);
+                                for(int i=0;i<256;++i)result[i]*=inverse;
+                                for(int o=0;o<4&&first_n+o*8<N;++o)
+                                    for(int r=0;r<8&&(g+j)*8+r<M;++r)
+                                        std::memcpy(out+size_t((g+j)*8+r)*N+first_n+o*8,
+                                                    result+o*64+r*8,size_t(std::min(8,N-first_n-o*8))*4);
+                            }
+                        }
+                    }
+                }
+            }
+            for(int i=0;i<128;++i)
+                GGML_ASSERT(base[i]==0xa5&&reinterpret_cast<uint8_t*>(low+panel_count*panel_floats)[i]==0xa5);
+            return true;
+        }
         const size_t weight_bytes=size_t(tile_n)*K*2;
         const size_t activation_bytes=size_t(8)*K*2;
         // M16 is admitted only where both high and residual A16 staging plus
