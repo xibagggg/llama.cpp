@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <time.h>
+#include <unistd.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +22,26 @@ extern "C" OrtStatus * ORT_API_CALL OrtSessionOptionsSpaceMITEnvInit(
     OrtSessionOptions *, const char * const *, const char * const *, size_t);
 
 namespace {
+// EP vision bypasses GGML, so its first session/encode needs a separate marker.
+// Emit before ai_guard/get_runtime/session creation: even compile-time device
+// activity, if introduced later, lies inside this conservative boundary.
+void startup_probe_first_vision_ep() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("OCR_STARTUP_PROBE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled) return;
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true, std::memory_order_relaxed)) return;
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+    const auto ns = static_cast<long long>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+    std::fprintf(stderr,
+        "OCR_STARTUP_PROBE event=vision_ep_begin pid=%ld ppid=%ld monotonic_ns=%lld backend=spacemit_ep\n",
+        static_cast<long>(::getpid()), static_cast<long>(::getppid()), ns);
+    std::fflush(stderr);
+}
+
 using clock_type = std::chrono::steady_clock;
 double elapsed(clock_type::time_point start) {
     return std::chrono::duration<double>(clock_type::now() - start).count();
@@ -167,6 +190,7 @@ void ocr_ep_encode_hwc(const float * pixels, int width, int height, std::vector<
             nchw[channel * area + i] = value;
         }
     }
+    startup_probe_first_vision_ep();
     ai_guard guard;
     auto & owner = get_runtime();
     auto & session = owner.vision_session(width, height);

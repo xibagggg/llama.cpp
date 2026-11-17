@@ -9,6 +9,7 @@
 #include "ocr-down-vector-v44.h"
 #include "ocr-concat-tcm-v46.h"
 #include "ocr-worker-events.h"
+#include "ocr-gdn-tcm.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -49,9 +50,11 @@ namespace {
 // Published by the dispatching host before the worker launch. Workers do not
 // read the environment or initialize a function-local static for this option.
 std::atomic<bool> ocr_concat_decode_segmented_enabled{false};
+std::atomic<bool> ocr_decode_gqa_kv_pack_enabled{false};
 }
 
 void prepare_ocr_worker_state() {
+    ocr_gdn_tcm::prepare();
     // Resolve these guards/environment reads on the dispatching host thread,
     // in this TU (ocr_fa_x8_enabled has internal linkage). No RVV/IME work here.
     (void)ocr_worker_events::get();
@@ -61,6 +64,8 @@ void prepare_ocr_worker_state() {
     (void)ocr_fa_pack_v40::full_kv_mode();
     (void)ocr_fa_pack_v40::direct_v44();
     (void)ocr_fa_pack_v40::lazy_init();
+    (void)ocr_fa_fullkv::normal_exp_enabled();
+    (void)ocr_fa_fullkv::blocked_softmax_enabled();
     (void)ocr_fa_fullkv::trust_bounds_enabled();
     (void)ocr_fa_fullkv::head_key_cache_enabled();
     (void)ocr_fa_fullkv::all_key_cache_enabled();
@@ -86,6 +91,11 @@ void prepare_ocr_worker_state() {
         return option && std::strcmp(option, "1") == 0;
     }();
     ocr_concat_decode_segmented_enabled.store(concat_decode_segmented, std::memory_order_relaxed);
+    static const bool decode_gqa_kv_pack = [] {
+        const char * option = std::getenv("GGML_SPACEMIT_DECODE_GQA_KV_PACK");
+        return option && std::strcmp(option, "1") == 0;
+    }();
+    ocr_decode_gqa_kv_pack_enabled.store(decode_gqa_kv_pack, std::memory_order_relaxed);
 }
 
 void drain_ocr_worker_events() {
@@ -253,6 +263,27 @@ static inline vfloat32m2_t rvv_expf_approx_f32m2(vfloat32m2_t x, size_t vl) {
                                  __riscv_vfmul_vv_f32m2(__riscv_vfmacc_vv_f32m2(s2, s2, j, vl), s1, vl), c, vl);
     return __riscv_vmerge_vvm_f32m2(r1, __riscv_vfmul_vv_f32m2(s1, s1, vl),
                                     __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 192.0f, vl), vl);
+}
+
+// Caller proves every input is in [-80,0], so the original |n|>126
+// slow-range condition is false. Arithmetic and all rounding stay identical.
+static inline vfloat32m2_t rvv_expf_normal_exact_f32m2(vfloat32m2_t x, size_t vl) {
+    const vfloat32m2_t r = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
+    const vfloat32m2_t z = __riscv_vfmacc_vf_f32m2(r, 0x1.715476p+0f, x, vl);
+    const vfloat32m2_t n = __riscv_vfsub_vv_f32m2(z, r, vl);
+    const vfloat32m2_t b =
+        __riscv_vfnmsac_vf_f32m2(__riscv_vfnmsac_vf_f32m2(x, 0x1.62e4p-1f, n, vl), 0x1.7f7d1cp-20f, n, vl);
+    const vuint32m2_t  e = __riscv_vsll_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(z), 23, vl);
+    const vfloat32m2_t k = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(e, 0x3f800000, vl));
+    const vfloat32m2_t u = __riscv_vfmul_vv_f32m2(b, b, vl);
+    const vfloat32m2_t j = __riscv_vfmacc_vv_f32m2(
+        __riscv_vfmul_vf_f32m2(b, 0x1.ffffecp-1f, vl),
+        __riscv_vfmacc_vv_f32m2(
+            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.fffdb6p-2f, vl), 0x1.555e66p-3f, b, vl),
+            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.573e2ep-5f, vl), 0x1.0e4020p-7f, b, vl), u, vl),
+        u, vl);
+
+    return __riscv_vfmacc_vv_f32m2(k, j, k, vl);
 }
 
 static inline vfloat32m2_t rvv_tanh_approx_f32m2(vfloat32m2_t x, size_t vl) {
@@ -896,36 +927,73 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
         float *    mv_tile_pack   = reinterpret_cast<float *>(mv_tile_addr);
 
         const int64_t k_tile_byte_stride = ic_tile_step * (int64_t) sizeof(_Float16);
+        // Decode GQA4 uses the same 64-visible-row groups as the original
+        // path. Only an entirely visible physical tile is packed in bulk;
+        // holes, small tails, other head sizes and verification batches
+        // retain the original row loader and arithmetic below.
+        const bool bulk_decode_pack = QLEN == 4 && n_mask_rows == 1 && DK == 256 && DV == 256 &&
+            ic_tile_step == 64 &&
+            ocr_decode_gqa_kv_pack_enabled.load(std::memory_order_relaxed);
 
         int64_t ic_step = 0;
         for (int64_t ic = 0; ic < nek1; ++ic) {
-            float mvs[16];
-            bool  visible = false;
-            for (int64_t m = 0; m < n_mask_rows; ++m) {
-                mvs[m] = mask_at(m, ic);
-                visible |= mvs[m] != -INFINITY;
+            bool packed_bulk = false;
+            if (bulk_decode_pack && ic_step == 0 && nek1 - ic >= ic_tile_step) {
+                bool all_visible = true;
+                for (int64_t j = 0; j < ic_tile_step; ++j) {
+                    const float mv = mask_at(0, ic + j);
+                    mv_tile_pack[j] = mv;
+                    all_visible = all_visible && mv != -INFINITY;
+                }
+                if (all_visible) {
+                    // This existing segmented-store transpose changes only
+                    // the copy schedule; packed F16 bits are unchanged.
+                    rvv_transposed_s16_mn_to_nm(
+                        reinterpret_cast<int8_t *>(k_tile_pack), k_tile_byte_stride,
+                        const_cast<int8_t *>(reinterpret_cast<const int8_t *>(k_data_row + ic * nbk1)),
+                        nbk1, ic_tile_step, DK);
+                    if (nbv1 == DV * (int64_t) sizeof(_Float16)) {
+                        memcpy1d(v_tile_pack, v_data_row + ic * nbv1,
+                                 ic_tile_step * DV * (int64_t) sizeof(_Float16));
+                    } else {
+                        memcpy2d(v_tile_pack, DV * (int64_t) sizeof(_Float16),
+                                 v_data_row + ic * nbv1, nbv1, ic_tile_step,
+                                 DV * (int64_t) sizeof(_Float16));
+                    }
+                    ic_step = ic_tile_step;
+                    ic += ic_tile_step - 1;
+                    packed_bulk = true;
+                }
             }
-
-            if (visible) {
-                const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
-                const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
-
-                // K tile is stored transposed (d-major), V tile row-major
-                for (int64_t d0 = 0; d0 < DK; d0 += seg) {
-                    const size_t       vl       = __riscv_vsetvl_e16m2(DK - d0);
-                    const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data + d0, vl);
-                    __riscv_vsse16_v_f16m2(k_tile_pack + d0 * ic_tile_step + ic_step, k_tile_byte_stride, k_data_v,
-                                           vl);
-                }
-                for (int64_t d0 = 0; d0 < DV; d0 += seg) {
-                    const size_t       vl       = __riscv_vsetvl_e16m2(DV - d0);
-                    const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data + d0, vl);
-                    __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV + d0, v_data_v, vl);
-                }
+            if (!packed_bulk) {
+                float mvs[16];
+                bool  visible = false;
                 for (int64_t m = 0; m < n_mask_rows; ++m) {
-                    mv_tile_pack[m * ic_tile_step + ic_step] = mvs[m];
+                    mvs[m] = mask_at(m, ic);
+                    visible |= mvs[m] != -INFINITY;
                 }
-                ic_step++;
+
+                if (visible) {
+                    const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
+                    const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
+
+                    // K tile is stored transposed (d-major), V tile row-major
+                    for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+                        const size_t       vl       = __riscv_vsetvl_e16m2(DK - d0);
+                        const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data + d0, vl);
+                        __riscv_vsse16_v_f16m2(k_tile_pack + d0 * ic_tile_step + ic_step, k_tile_byte_stride, k_data_v,
+                                               vl);
+                    }
+                    for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                        const size_t       vl       = __riscv_vsetvl_e16m2(DV - d0);
+                        const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data + d0, vl);
+                        __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV + d0, v_data_v, vl);
+                    }
+                    for (int64_t m = 0; m < n_mask_rows; ++m) {
+                        mv_tile_pack[m * ic_tile_step + ic_step] = mvs[m];
+                    }
+                    ic_step++;
+                }
             }
 
             if (ic_step > 0 && (ic_step == ic_tile_step || ic == (nek1 - 1))) {
@@ -1763,7 +1831,7 @@ void cast_pack_ocr_kv(ggml::spacemit::context &ctx,ggml_tensor *op){
     ctx.ocr_prepared_attention=op;
 }
 
-template<bool PROFILE>
+template<bool PROFILE,bool NORMAL_EXP=false>
 static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int capacity,
                             _Float16*high,_Float16*low,int passes,float*inverse){
     const int mode=ocr_fa_fullkv::softmax_pack_mode();
@@ -1791,11 +1859,23 @@ static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int ca
     for(int row=0;row<rows;++row){
         const float*p=scores+size_t(row)*n;
         auto vmax=__riscv_vfmv_v_f_f32m4(-INFINITY,128);
+        auto vmin=__riscv_vfmv_v_f_f32m4(INFINITY,128);
         for(int k=0;k<n;k+=128){const size_t vl=std::min(128,n-k);
-            vmax=__riscv_vfmax_vv_f32m4_tu(vmax,vmax,__riscv_vle32_v_f32m4(p+k,vl),vl);}
+            const auto values=__riscv_vle32_v_f32m4(p+k,vl);
+            vmax=__riscv_vfmax_vv_f32m4_tu(vmax,vmax,values,vl);
+            if constexpr(NORMAL_EXP)vmin=__riscv_vfmin_vv_f32m4_tu(vmin,vmin,values,vl);
+        }
         const float maximum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m4_f32m1(
             vmax,__riscv_vfmv_v_f_f32m1(-INFINITY,1),128));
         if(!std::isfinite(maximum))return false;
+        bool normal_row=false;
+        if constexpr(NORMAL_EXP){
+            const float minimum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmin_vs_f32m4_f32m1(
+                vmin,__riscv_vfmv_v_f_f32m1(INFINITY,1),128));
+            // The margin from -80 to the normal exp boundary near -87 makes
+            // the proof conservative across FP32 subtraction/round-to-integer.
+            normal_row=minimum-maximum>=-80.f;
+        }
         float sum=0;auto vsum=__riscv_vfmv_v_f_f32m2(0,64);
         const bool batch_check=ocr_fa_fullkv::batch_check_enabled();
         auto bad_any=__riscv_vmclr_m_b16(64);
@@ -1803,7 +1883,11 @@ static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int ca
         // vsetvl may split the final AVL in (VLMAX,2*VLMAX) into two
         // balanced vectors. Mode 1 retains the original sum grouping.
         for(int k=0;k<n;){const size_t vl=mode==1?__riscv_vsetvl_e32m2(n-k):std::min(64,n-k);
-            const auto f=rvv_expf_approx_f32m2(__riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(p+k,vl),maximum,vl),vl);
+            const auto exponent=__riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(p+k,vl),maximum,vl);
+            const auto f=[&] {
+                if constexpr(NORMAL_EXP)if(normal_row)return rvv_expf_normal_exact_f32m2(exponent,vl);
+                return rvv_expf_approx_f32m2(exponent,vl);
+            }();
             if(!trusted){
                 const auto bad=__riscv_vmor_mm_b16(__riscv_vmfne_vv_f32m2_b16(f,f,vl),
                     __riscv_vmor_mm_b16(__riscv_vmflt_vf_f32m2_b16(f,0.f,vl),__riscv_vmfgt_vf_f32m2_b16(f,1.001f,vl),vl),vl);
@@ -1840,12 +1924,97 @@ static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int ca
     return true;
 }
 
+// Native IME2 8x8 scores and probabilities have the same panel layout:
+// [query/8, key/8, query%8, key%8]. Keep it throughout the attention core.
+// Arithmetic stays FP32, FP16 probability/weight precision is unchanged.
+// Parallel lane sums change their reduction grouping and require acceptance.
+static bool ocr_softmax_pack_blocked(const float*scores,int rows,int n,int padded,int capacity,
+                                     _Float16*high,_Float16*low,int passes,float*inverse){
+    if(rows<1||rows>capacity||capacity%8||n<1||padded<n||padded%8||padded-n>=8||
+       (passes!=1&&passes!=2))return false;
+    constexpr size_t vl=64;
+    const auto ids=__riscv_vid_v_u32m2(vl);
+    const auto column=__riscv_vand_vx_u32m2(ids,7,vl);
+    const auto row_index=__riscv_vsrl_vx_u32m2(ids,3,vl);
+    const auto rowbase=__riscv_vand_vx_u32m2(ids,~uint32_t(7),vl);
+    const auto eight=__riscv_vmul_vx_u32m2(__riscv_vid_v_u32m2(8),8,8);
+    const int rounded=(rows+7)/8*8;
+    // Keep the same zero padding contract as the row-major implementation:
+    // PV may read all capacity*padded entries, including the partial key
+    // panel and query rows beyond `rows`.
+    if(rounded<capacity || n!=padded){
+        std::memset(high,0,size_t(capacity)*padded*sizeof(_Float16));
+        if(passes==2)std::memset(low,0,size_t(capacity)*padded*sizeof(_Float16));
+    }
+    for(int first=0;first<rows;first+=8){
+        const auto *p=scores+size_t(first)*padded;
+        auto vmax=__riscv_vfmv_v_f_f32m2(-INFINITY,vl);
+        for(int k=0;k<padded;k+=8){
+            auto x=__riscv_vle32_v_f32m2(p+size_t(k)*8,vl);
+            const auto valid_keys=__riscv_vmsltu_vx_u32m2_b16(column,n-k,vl);
+            if(k+8>n)x=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(-INFINITY,vl),x,valid_keys,vl);
+            vmax=__riscv_vfmax_vv_f32m2(vmax,x,vl);
+        }
+        // Reduce each independent eight-lane row group. A plain reduction
+        // would mix adjacent query rows at the group boundaries.
+        for (int shift : {4,2,1}) {
+            const auto shifted=__riscv_vslidedown_vx_f32m2(vmax,shift,vl);
+            const auto candidate=__riscv_vfmax_vv_f32m2(vmax,shifted,vl);
+            const auto mask=__riscv_vmsltu_vx_u32m2_b16(column,8-shift,vl);
+            vmax=__riscv_vmerge_vvm_f32m2(vmax,candidate,mask,vl);
+        }
+        const auto maximum=__riscv_vrgather_vv_f32m2(vmax,rowbase,vl);
+        const int valid_rows=std::min(8,rows-first);
+        const auto max_valid=__riscv_vrgather_vv_f32m2(vmax,eight,valid_rows);
+        const auto bad_max=__riscv_vmor_mm_b16(__riscv_vmfne_vv_f32m2_b16(max_valid,max_valid,valid_rows),
+            __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(max_valid,valid_rows),3.402823466e38f,valid_rows),valid_rows);
+        if(__riscv_vcpop_m_b16(bad_max,valid_rows))return false;
+        auto sum=__riscv_vfmv_v_f_f32m2(0.f,vl);
+        for(int k=0;k<padded;k+=8){
+            auto x=__riscv_vfsub_vv_f32m2(__riscv_vle32_v_f32m2(p+size_t(k)*8,vl),maximum,vl);
+            const auto valid_keys=__riscv_vmsltu_vx_u32m2_b16(column,n-k,vl);
+            if(k+8>n)x=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(-INFINITY,vl),x,valid_keys,vl);
+            auto f=rvv_expf_approx_f32m2(x,vl);
+            // Do not rely on the approximation's -inf behavior for the
+            // padded key lanes. They must contribute zero and be stored zero.
+            if(k+8>n)f=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(0.f,vl),f,valid_keys,vl);
+            if(valid_rows!=8)f=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(0.f,vl),f,
+                __riscv_vmsltu_vx_u32m2_b16(row_index,valid_rows,vl),vl);
+            sum=__riscv_vfadd_vv_f32m2(sum,f,vl);
+            const auto h=__riscv_vfncvt_f_f_w_f16m1(__riscv_vfmul_vf_f32m2(f,1024.f,vl),vl);
+            __riscv_vse16_v_f16m1(high+size_t(first)*padded+size_t(k)*8,h,vl);
+            if(passes==2){
+                const auto restored=__riscv_vfmul_vf_f32m2(__riscv_vfwcvt_f_f_v_f32m2(h,vl),1.f/1024.f,vl);
+                const auto l=__riscv_vfncvt_f_f_w_f16m1(__riscv_vfmul_vf_f32m2(
+                    __riscv_vfsub_vv_f32m2(f,restored,vl),16777216.f,vl),vl);
+                __riscv_vse16_v_f16m1(low+size_t(first)*padded+size_t(k)*8,l,vl);
+            }
+        }
+        for (int shift : {4,2,1}) {
+            const auto shifted=__riscv_vslidedown_vx_f32m2(sum,shift,vl);
+            const auto candidate=__riscv_vfadd_vv_f32m2(sum,shifted,vl);
+            const auto mask=__riscv_vmsltu_vx_u32m2_b16(column,8-shift,vl);
+            sum=__riscv_vmerge_vvm_f32m2(sum,candidate,mask,vl);
+        }
+        const auto sums=__riscv_vrgather_vv_f32m2(sum,eight,valid_rows);
+        float sum_rows[8];
+        __riscv_vse32_v_f32m2(sum_rows,sums,valid_rows);
+        for(int r=0;r<valid_rows;++r){
+            if(!(sum_rows[r]>0.f)||!std::isfinite(sum_rows[r]))return false;
+            inverse[first+r]=1.f/sum_rows[r];
+        }
+    }
+    return true;
+}
+
 template<bool PROFILE>
 static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,int ir0,int ir1){
     if(!ocr_fa_pack_v40::full_kv(dst)||!ctx.shared.data)return false;
     constexpr int D=ocr_fa_fullkv::D;
     const auto *q=dst->src[0];const int n=int(q->ne[1]);
     const int padded=int(ocr_fa_pack_v40::full_k(dst)),passes=ocr_fa_pack_v40::full_kv_mode();
+    const bool blocked=ocr_fa_fullkv::blocked_softmax_enabled();
+    const int score_stride=blocked?padded:n;
     float scale;std::memcpy(&scale,dst->op_params,sizeof(scale));
     const size_t qk_bytes=64*D*sizeof(_Float16)+512*sizeof(float);
     const bool compact=ocr_fa_fullkv::compact_enabled();
@@ -1857,13 +2026,13 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     // QK scratch is dead before probabilities are written, and packed Q is
     // dead before PV starts. Reuse those two regions for the QK/PV results.
     // The saved 4096 bytes let N1008 keep the final padded K tile in TCM too.
-    const size_t all_key_bytes=16*D*sizeof(_Float16)+16*n*sizeof(float)+
+    const size_t all_key_bytes=16*D*sizeof(_Float16)+16*score_stride*sizeof(float)+
         16*padded*sizeof(_Float16)+vd*padded*sizeof(_Float16)+
         size_t(key_tiles)*64*D*sizeof(_Float16);
     const bool all_key_cache=all_key_option&&head_option&&passes==1&&
         ocr_fa_fullkv::direct_pack_enabled()&&all_key_bytes<=ctx.shared.size;
     const auto bytes_for=[&](int queries,bool cache){return (cache?1:2)*queries*D*sizeof(_Float16)+
-        (cache?512*sizeof(float):qk_bytes)+queries*n*sizeof(float)+passes*queries*padded*sizeof(_Float16)+
+        (cache?512*sizeof(float):qk_bytes)+queries*score_stride*sizeof(float)+passes*queries*padded*sizeof(_Float16)+
         vd*padded*sizeof(_Float16)+passes*512*sizeof(float)+(cache?cached_key_bytes:0);};
     // Cache complete K tiles with V, leaving the final K tile transient in
     // the not-yet-written P buffer. Q16 fits without enlarging the TCM grant.
@@ -1875,7 +2044,7 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     auto *packed_q=head_cache?raw:raw+Q*D;
     void *qk_scratch=packed_q+Q*D;
     auto *scores=reinterpret_cast<float*>(static_cast<char*>(qk_scratch)+(all_key_cache?0:head_cache?512*sizeof(float):qk_bytes));
-    auto *high=reinterpret_cast<_Float16*>(scores+Q*n);
+    auto *high=reinterpret_cast<_Float16*>(scores+Q*score_stride);
     auto *low=high+Q*padded;
     auto *weights=high+passes*Q*padded;
     // The QK helper writes at most 512 floats, before softmax overwrites P.
@@ -1920,12 +2089,21 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
             const auto*key=cached?cached_keys+size_t(ic/64)*64*D:pk;
             // Last-tile scratch aliases P only before softmax writes P.
             void*scratch=head_cache&&!cached?static_cast<void*>(high):qk_scratch;
-            if(!ocr_qk_ime2_v53::qk(scores+ic,packed_q,key,n,rows,std::min(64,n-ic),scratch,cached))return false;
+            const bool ok=blocked
+                ?ocr_qk_ime2_v53::qk_blocked(scores+size_t(ic)*8,packed_q,key,score_stride,rows,std::min(64,n-ic),scratch,cached)
+                :ocr_qk_ime2_v53::qk(scores+ic,packed_q,key,n,rows,std::min(64,n-ic),scratch,cached);
+            if(!ok)return false;
         }
         if constexpr(PROFILE)phase.tick(5); // QK includes packed-key copy
         float inverse[32];
-        if(ocr_fa_fullkv::softmax_pack_mode()){
-            if(!ocr_softmax_pack<PROFILE>(scores,rows,n,padded,Q,high,low,passes,inverse))return false;
+        if(blocked){
+            if(!ocr_softmax_pack_blocked(scores,rows,n,padded,Q,high,low,passes,inverse))return false;
+            if constexpr(PROFILE)phase.tick(6);
+        }else if(ocr_fa_fullkv::softmax_pack_mode()){
+            const bool packed=ocr_fa_fullkv::normal_exp_enabled()
+                ?ocr_softmax_pack<PROFILE,true>(scores,rows,n,padded,Q,high,low,passes,inverse)
+                :ocr_softmax_pack<PROFILE>(scores,rows,n,padded,Q,high,low,passes,inverse);
+            if(!packed)return false;
             if constexpr(PROFILE)phase.tick(6); // fused softmax + probability packing
         }else{
         for(int row=0;row<rows;++row){
@@ -4151,16 +4329,16 @@ struct gdn_chunk_args {
 
 // One (head, seq): s_in / s_out are the transposed states (S_v x S_v), attn_data the first token's output.
 static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1, int64_t iv1, int64_t iq3, int64_t ik3,
-                             int64_t iv3, const float * s_in, float * s_out, float * attn_data) {
+                             int64_t iv3, const float * s_in, float * s_out, float * attn_data, float * scratch_workspace) {
     const int64_t D  = a.S_v;
     const int64_t CS = GDN_CHUNK_SIZE;
 
     static thread_local std::vector<float> buf;
     const size_t need = D * D + 7 * CS * D + 3 * CS * CS + 4 * CS + 64;
-    if (buf.size() < need) {
+    if (scratch_workspace == nullptr && buf.size() < need) {
         buf.resize(need);
     }
-    float * S   = buf.data();
+    float * S   = scratch_workspace != nullptr ? scratch_workspace : buf.data();
     float * Qc  = S + D * D;
     float * Kc  = Qc + CS * D;
     float * U   = Kc + CS * D;  // v rows, then U in place
@@ -4305,13 +4483,19 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
         const int64_t        rq3c = n_seqs / src_q->ne[3];
         const int64_t        rk3c = n_seqs / src_k->ne[3];
         const gdn_chunk_args args = { src_q, src_k, src_v, src_g, src_beta, S_v, H, n_tokens, scale };
+        float * gdn_scratch = nullptr;
+        if (ocr_gdn_tcm::enabled() && ctx.shared.data != nullptr &&
+            reinterpret_cast<uintptr_t>(ctx.shared.data) % alignof(float) == 0 &&
+            ocr_gdn_tcm::scratch_bytes(S_v) <= ctx.shared.size) {
+            gdn_scratch = static_cast<float *>(ctx.shared.data);
+        }
         for (int64_t ir = ir0; ir < ir1; ++ir) {
             const int64_t iv1 = ir % H;
             const int64_t iv3 = ir / H;
             gdn_chunked_head(args, iv1 % src_q->ne[1], iv1 % src_k->ne[1], iv1, iv3 / rq3c, iv3 / rk3c, iv3,
                              state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v,
                              state_out_base + (iv3 * H + iv1) * S_v * S_v,
-                             attn_out_base + (iv3 * n_tokens * H + iv1) * S_v);
+                             attn_out_base + (iv3 * n_tokens * H + iv1) * S_v, gdn_scratch);
         }
         return;
     }
@@ -5365,7 +5549,7 @@ void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     forward_mul_mat_f16_f32_impl<false>(ctx, op, nullptr);
 }
 
-// General stride-aware contiguous copy for F32/F16.
+// General stride-aware contiguous copy for F32/F16/I32.
 // src0 may be non-contiguous; dst is always contiguous.
 // Parallel over elements across ctx.nth cores.
 template <typename T>
@@ -5416,6 +5600,7 @@ void forward_cont_general(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
 template void forward_cont_general<float>(ggml::spacemit::context & ctx, ggml_tensor * op);
 template void forward_cont_general<_Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_cont_general<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];

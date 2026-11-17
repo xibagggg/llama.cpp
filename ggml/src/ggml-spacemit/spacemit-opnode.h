@@ -50,6 +50,7 @@ struct spacemit_opnode {
     ggml_tensor * node = nullptr;
     ggml_tensor * packed_im2col = nullptr;
     ggml_tensor * elided_pad = nullptr;
+    ggml_tensor * elided_gelu = nullptr;
     ggml_tensor * prepared_attention = nullptr;
     // in-place recurrent state update: {state gather (GET_ROWS), GATED_DELTA_NET, state store (CPY)}
     ggml_tensor * gdn_state[3] = {nullptr, nullptr, nullptr};
@@ -121,6 +122,18 @@ struct spacemit_opnode {
     }
 
     std::vector<const ggml_tensor *> get_inputs() const {
+        if(elided_gelu) {
+            std::vector<const ggml_tensor *> inputs{node->src[0],elided_gelu->src[0]};
+            // Bias and residual remain ordinary external graph inputs. The
+            // elided GELU/PAD/matmul outputs are not materialized dependencies.
+            for(const auto * f:fused)for(const auto * s:f->src) {
+                if(!s||s==node||s==elided_pad||s==elided_gelu||
+                   std::find(fused.begin(),fused.end(),s)!=fused.end()||
+                   std::find(inputs.begin(),inputs.end(),s)!=inputs.end())continue;
+                inputs.push_back(s);
+            }
+            return inputs;
+        }
         if(elided_pad)return {node->src[0],elided_pad->src[0]};
         if(packed_im2col)return {node->src[0],packed_im2col->src[0],packed_im2col->src[1]};
         if (fused.empty()) {
@@ -180,6 +193,7 @@ struct spacemit_opnode {
     }
 
     std::string op_name() const {
+        if(elided_gelu)return "GELU+PAD+PACK+PC8_MUL_MAT";
         if(elided_pad)return "PAD+PC8_MUL_MAT";
         if(packed_im2col)return "IM2COL+PACK+MUL_MAT";
         if (fused.empty()) {

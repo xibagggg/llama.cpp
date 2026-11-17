@@ -732,6 +732,16 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        if (std::getenv("OCR_STAGE_TIMING")) {
+            // Output steps are n_gen-1; they are independent of verification
+            // input tokens, draft tokens, or the number of backend calls.
+            SLT_INF(*this, "OCR_SPEC kind=request enabled=%d completion_tokens=%llu output_steps=%llu proposals=%llu accepted_proposals=%llu verify_rounds=%llu\n",
+                    int(spec != nullptr), (unsigned long long) stats.n_gen,
+                    (unsigned long long) stats.n_gen_steps(),
+                    (unsigned long long) stats.n_draft_tokens,
+                    (unsigned long long) stats.n_draft_accepted,
+                    (unsigned long long) stats.n_draft_verif_steps);
+        }
         common_speculative_print_stats(spec);
     }
 
@@ -901,7 +911,14 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                         batch.add_embd({ b->embd + (size_t) i * b->n_embd, 1, (size_t) b->n_embd }, pos, b->seq_id, false);
                     }
 
-                    return common_speculative_process(data->spec, batch) ? 0 : 1;
+                    const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
+                    const int64_t ocr_process_start = ocr_timing ? ggml_time_us() : 0;
+                    const int32_t rc = common_speculative_process(data->spec, batch) ? 0 : 1;
+                    if (ocr_timing && data->spec) {
+                        LOG_INF("OCR_STAGE kind=spec_process phase=prefill included_by=image_prefill seconds=%.6f tokens=%d result=%d\n",
+                                (ggml_time_us() - ocr_process_start) / 1e6, int(batch.size()), rc);
+                    }
+                    return rc;
                 };
 
                 llama_pos new_n_past; // unused for now
@@ -1365,7 +1382,9 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
+                const int64_t ocr_draft_init_start = ocr_model_init_timing ? ggml_time_us() : 0;
                 spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                const int64_t ocr_draft_init_us = ocr_model_init_timing ? ggml_time_us() - ocr_draft_init_start : 0;
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
@@ -1379,6 +1398,10 @@ private:
                     return false;
                 }
 
+                if (ocr_model_init_timing) {
+                    SRV_INF("OCR_METRIC kind=draft_model_init seconds=%.6f shared_prefill_decode=1\n",
+                            ocr_draft_init_us / 1e6);
+                }
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
             }
@@ -3545,7 +3568,15 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
+                const int64_t ocr_draft_start = ocr_timing ? ggml_time_us() : 0;
                 common_speculative_draft(spec.get());
+                if (ocr_timing) {
+                    size_t proposals = 0;
+                    for (const auto * slot : drafting) proposals += slot->spec_draft.size();
+                    SRV_INF("OCR_STAGE kind=spec_draft phase=decode seconds=%.6f slots=%zu proposals=%zu\n",
+                            (ggml_time_us() - ocr_draft_start) / 1e6, drafting.size(), proposals);
+                }
             });
         }
 
@@ -4330,12 +4361,16 @@ private:
             const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
             size_t ocr_prompt_tokens = 0;
             size_t ocr_decode_tokens = 0;
+            size_t ocr_verify_tokens = 0;
+            size_t ocr_plain_decode_tokens = 0;
             if (ocr_timing) {
                 for (int32_t i = off; i < off + batch.view.size(); ++i) {
                     if (batch.tokens[i].is_prompt) {
                         ++ocr_prompt_tokens;
                     } else {
                         ++ocr_decode_tokens;
+                        if (!slots[batch.tokens[i].id_slot].spec_draft.empty()) ++ocr_verify_tokens;
+                        else ++ocr_plain_decode_tokens;
                     }
                 }
             }
@@ -4347,9 +4382,10 @@ private:
                 llama_synchronize(ctx_tgt);
             }
             if (ocr_timing) {
-                SRV_INF("OCR_STAGE kind=text_forward phase=%s seconds=%.6f tokens=%zu result=%d prompt_tokens=%zu decode_tokens=%zu\n",
+                SRV_INF("OCR_STAGE kind=text_forward phase=%s seconds=%.6f tokens=%zu result=%d prompt_tokens=%zu decode_tokens=%zu target_verify_tokens=%zu plain_decode_tokens=%zu\n",
                         ocr_phase, (ggml_time_us() - ocr_forward_start) / 1e6,
-                        static_cast<size_t>(batch.view.size()), ret, ocr_prompt_tokens, ocr_decode_tokens);
+                        static_cast<size_t>(batch.view.size()), ret, ocr_prompt_tokens, ocr_decode_tokens,
+                        ocr_verify_tokens, ocr_plain_decode_tokens);
             }
         });
 
@@ -4412,7 +4448,23 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
+                size_t prompt_tokens = 0;
+                size_t decode_tokens = 0;
+                if (ocr_timing) {
+                    for (int32_t i = off; i < off + batch.view.size(); ++i) {
+                        if (batch.tokens[i].is_prompt) ++prompt_tokens;
+                        else ++decode_tokens;
+                    }
+                }
+                const int64_t ocr_process_start = ocr_timing ? ggml_time_us() : 0;
                 ok = common_speculative_process(spec.get(), batch.view);
+                if (ocr_timing) {
+                    const char * phase = prompt_tokens == 0 ? "decode" : decode_tokens == 0 ? "prefill" : "mixed";
+                    SRV_INF("OCR_STAGE kind=spec_process phase=%s included_by=none seconds=%.6f tokens=%zu result=%d prompt_tokens=%zu decode_tokens=%zu\n",
+                            phase, (ggml_time_us() - ocr_process_start) / 1e6,
+                            size_t(batch.view.size()), ok ? 0 : 1, prompt_tokens, decode_tokens);
+                }
             });
 
             if (!ok) {
@@ -4616,6 +4668,15 @@ private:
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+
+                if (std::getenv("OCR_STAGE_TIMING")) {
+                    // Work is counted before optional checkpoint replay. A verify
+                    // batch includes the anchor plus every proposed token, even
+                    // when only a prefix is accepted or output stops inside it.
+                    SLT_INF(slot, "OCR_SPEC kind=verify_result proposals=%zu target_tokens=%zu accepted_candidates=%zu rollback=%u checkpoint_replay=%d replayed=%d\n",
+                            n_draft, n_draft + 1, accepted.size() - 1, n_rollback,
+                            int(n_rollback > 0 && use_ckpt_tgt), int(slot.spec_is_replay));
+                }
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {

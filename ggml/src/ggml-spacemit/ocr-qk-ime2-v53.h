@@ -138,4 +138,27 @@ static bool qk(float*dst,const _Float16*packed_q,const _Float16*packed_k,int str
  }
  return true;
 }
+// Keep IME2's 8x8 accumulators in native query/key panels. Probability
+// packing consumes the identical panel order, avoiding score/P scatters.
+static bool qk_blocked(float*dst,const _Float16*packed_q,const _Float16*packed_k,
+                       int stride,int rows,int count,void*scratch,bool preloaded=false){
+ const auto*pk=preloaded?packed_k:static_cast<_Float16*>(scratch);
+ auto*tmp=preloaded?static_cast<float*>(scratch):reinterpret_cast<float*>(static_cast<_Float16*>(scratch)+64*D);
+ if(!preloaded)std::memcpy(static_cast<_Float16*>(scratch),packed_k,64*D*2);
+ for(int q=0;q<rows;q+=16)for(int key=0;key<count;key+=32){
+  const int qr=std::min(16,rows-q);
+  if(qr>8){
+   if(ocr_qk_pipeline::enabled())ocr_qk_pipeline::core16(packed_q+q*D,pk+key*D,tmp);
+   else core16(packed_q+q*D,pk+key*D,tmp);
+  }else core(packed_q+q*D,pk+key*D,tmp);
+  const int columns=std::min(32,count-key);
+  for(int r=0;r<qr;r+=8)for(int c=0;c<columns;c+=8){
+   const auto values=__riscv_vfmul_vf_f32m2(
+       __riscv_vle32_v_f32m2(tmp+(r/8)*256+(c/8)*64,64),1.f/1048576.f,64);
+   __riscv_vse32_v_f32m2(dst+size_t(q+r)*stride+size_t(key+c)*8,values,64);
+  }
+ }
+ return true;
+}
+
 }

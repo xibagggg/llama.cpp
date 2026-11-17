@@ -1227,7 +1227,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
+                const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
+                const int64_t ocr_forward_start = ocr_timing ? ggml_time_us() : 0;
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (ocr_timing) {
+                    // Context injection has no logits; synchronize explicitly so this
+                    // diagnostic measures completed backend work rather than enqueue time.
+                    llama_synchronize(ctx_dft);
+                    LOG_INF("OCR_STAGE kind=spec_forward mode=context engine=draft seconds=%.6f tokens=%d result=%d seq=%d\n",
+                            (ggml_time_us() - ocr_forward_start) / 1e6, n_chunk, rc, int(seq_id));
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1274,7 +1283,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
+        const int64_t ocr_forward_start = ocr_timing ? ggml_time_us() : 0;
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (ocr_timing) {
+            llama_synchronize(ctx_dft);
+            LOG_INF("OCR_STAGE kind=spec_forward mode=proposal engine=draft seconds=%.6f tokens=%d result=%d\n",
+                    (ggml_time_us() - ocr_forward_start) / 1e6, int(batch.size()), ret);
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;

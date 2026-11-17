@@ -37,6 +37,8 @@
 #include "ggml-cpu.h"
 #include "ggml-profile.h"
 #include "ocr-op-timing.h"
+#include "ocr-q4-head-prepared.h"
+#include "ocr-op-stats.h"
 #include "ocr-op-progress.h"
 #include "ocr-pc8-options.h"
 #include "ocr-fa-phases-v50.h"
@@ -743,39 +745,59 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         }
     }
 
-    // Pack the unpadded activation directly into the PC8 INT8 workspace.
-    // Retain graph allocations; all input reads and the packing barrier finish
-    // before the matmul writes output, even if gallocr reuses the input buffer.
+    // Optional GELU + activation packing fusion. Keep the original graph
+    // allocations and perform every source read before the packing barrier;
+    // only then may the down-projection overwrite any reused activation buffer.
+    const auto following_pc8=[&](int x){for(int j=x+1;j<graph->n_nodes;++j)if(op_is_compute(graph->nodes[j]))return j;return -1;};
     const char * pc8_pad=getenv("GGML_SPACEMIT_OCR_PC8_PAD_FUSE");
-    if(pc8_pad&&!strcmp(pc8_pad,"1")&&n->op==GGML_OP_PAD&&next_node&&
-       next_node->src[1]==n&&ggml_spacemit_can_fuse_pc8_pad(next_node)) {
-        const int idxs[2]={i,next_idx};
-        const enum ggml_op ops[2]={GGML_OP_PAD,GGML_OP_MUL_MAT};
-        if(ggml_can_fuse_subgraph_ext(graph,idxs,2,ops,&next_idx,1)) {
-            spacemit_opnode fused(next_node,{},SPACEMIT_OP_PC8_PAD_MUL_MAT);
-            fused.elided_pad=n;
+    const char * gelu_pack=getenv("GGML_SPACEMIT_OCR_GELU_PC8_PACK");
+    ggml_tensor * gelu_node=nullptr;
+    ggml_tensor * pad_node=n;
+    ggml_tensor * down_node=next_node;
+    int pad_index=i,down_index=next_idx;
+    std::vector<int> pc8_ids;
+    std::vector<ggml_op> pc8_ops;
+    if(gelu_pack&&!strcmp(gelu_pack,"1")&&n->op==GGML_OP_UNARY&&
+       ggml_get_unary_op(n)==GGML_UNARY_OP_GELU&&n->src[0]&&
+       n->type==GGML_TYPE_F32&&n->src[0]->type==GGML_TYPE_F32&&
+       !n->view_src&&!n->src[0]->view_src&&
+       ggml_is_contiguous(n)&&ggml_is_contiguous(n->src[0])&&
+       ggml_are_same_shape(n,n->src[0])&&next_node&&
+       next_node->op==GGML_OP_PAD&&next_node->src[0]==n) {
+        gelu_node=n;pad_node=next_node;pad_index=next_idx;
+        down_index=following_pc8(pad_index);
+        down_node=down_index<0?nullptr:graph->nodes[down_index];
+        pc8_ids.push_back(i);pc8_ops.push_back(GGML_OP_UNARY);
+    }
+    if(pc8_pad&&!strcmp(pc8_pad,"1")&&pad_node->op==GGML_OP_PAD&&down_node&&
+       down_node->src[1]==pad_node&&ggml_spacemit_can_fuse_pc8_pad(down_node)) {
+        pc8_ids.push_back(pad_index);pc8_ops.push_back(GGML_OP_PAD);
+        pc8_ids.push_back(down_index);pc8_ops.push_back(GGML_OP_MUL_MAT);
+        const auto guarded_pc8=[&](int output){return ggml_can_fuse_subgraph_ext(
+            graph,pc8_ids.data(),int(pc8_ids.size()),pc8_ops.data(),&output,1);};
+        if(guarded_pc8(down_index)) {
+            spacemit_opnode fused(down_node,{},SPACEMIT_OP_PC8_PAD_MUL_MAT);
+            fused.elided_pad=pad_node;fused.elided_gelu=gelu_node;
             const char*option=getenv("GGML_SPACEMIT_OCR_PC8_DOWN_EPILOGUE");
-            int last=next_idx;
+            int last=down_index;
             if(option&&!strcmp(option,"1")){
-                const auto following=[&](int x){for(int j=x+1;j<graph->n_nodes;++j)if(op_is_compute(graph->nodes[j]))return j;return -1;};
-                const int bi=following(next_idx);
+                const int bi=following_pc8(down_index);
                 if(bi>=0){
                     auto*b=graph->nodes[bi];
-                    const int ids[3]={i,next_idx,bi};const ggml_op ops[3]={GGML_OP_PAD,GGML_OP_MUL_MAT,GGML_OP_ADD};
-                    if(b->op==GGML_OP_ADD&&b->src[0]==next_node&&b->type==GGML_TYPE_F32&&
-                       ggml_are_same_shape(b,next_node)&&ggml_is_contiguous(b)&&
+                    pc8_ids.push_back(bi);pc8_ops.push_back(GGML_OP_ADD);
+                    if(b->op==GGML_OP_ADD&&b->src[0]==down_node&&b->type==GGML_TYPE_F32&&
+                       ggml_are_same_shape(b,down_node)&&ggml_is_contiguous(b)&&
                        ocr_norm_affine::row_weight(b->src[1],b->ne[0])&&b->src[1]->op==GGML_OP_NONE&&
-                       b->src[1]->src[0]==nullptr&&ggml_can_fuse_subgraph_ext(graph,ids,3,ops,&bi,1)){
+                       b->src[1]->src[0]==nullptr&&guarded_pc8(bi)){
                         fused.add_fused(b);last=bi;
-                        const int ri=following(bi);
+                        const int ri=following_pc8(bi);
                         if(ri>=0){
                             auto*res=graph->nodes[ri];
                             auto*skip=res->src[0]==b?res->src[1]:res->src[1]==b?res->src[0]:nullptr;
-                            const int all[4]={i,next_idx,bi,ri};const ggml_op allops[4]={GGML_OP_PAD,GGML_OP_MUL_MAT,GGML_OP_ADD,GGML_OP_ADD};
+                            pc8_ids.push_back(ri);pc8_ops.push_back(GGML_OP_ADD);
                             if(res->op==GGML_OP_ADD&&skip&&res->type==GGML_TYPE_F32&&skip->type==GGML_TYPE_F32&&
                                ggml_are_same_shape(res,b)&&ggml_are_same_shape(skip,b)&&ggml_is_contiguous(res)&&ggml_is_contiguous(skip)&&
-                               (!ocr_norm_affine::overlaps(res,skip)||res->data==skip->data)&&
-                               ggml_can_fuse_subgraph_ext(graph,all,4,allops,&ri,1)){
+                               (!ocr_norm_affine::overlaps(res,skip)||res->data==skip->data)&&guarded_pc8(ri)){
                                 fused.add_fused(res);last=ri;
                             }
                         }
@@ -1144,6 +1166,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         int n_add_gelu = 0;
         int n_matmul_add = 0;
         int n_im2col_pack = 0;
+        int n_gelu_pc8_pack = 0;
         int n_norm_affine = 0;
         int n_residual_norm_affine = 0;
         int n_conv_seen = 0;
@@ -1158,6 +1181,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             n_gdn_seen += node.node->op == GGML_OP_GATED_DELTA_NET;
             n_matmul_add += node.opcode == SPACEMIT_OP_MUL_MAT_ADD;
             n_im2col_pack += node.opcode == SPACEMIT_OP_IM2COL_MUL_MAT;
+            n_gelu_pc8_pack += node.elided_gelu != nullptr;
             n_norm_affine += node.opcode == SPACEMIT_OP_NORM_AFFINE;
             n_residual_norm_affine += node.opcode == SPACEMIT_OP_RESIDUAL_NORM_AFFINE;
             if (!node.fused.empty() || node.opcode != SPACEMIT_OP_INVALID) {
@@ -1166,6 +1190,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
         GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(),
                        (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
+        const char * gelu_pack_trace=getenv("GGML_SPACEMIT_OCR_GELU_PC8_PACK_TRACE");
+        if(n_gelu_pc8_pack&&gelu_pack_trace&&!strcmp(gelu_pack_trace,"1"))
+            GGML_LOG_INFO("ggml-spacemit: GELU+PAD+PACK+PC8 fused=%d graph=%llu\n",
+                          n_gelu_pc8_pack,(unsigned long long)graph->uid);
         const char * recurrent_trace = getenv("GGML_SPACEMIT_RECURRENT_TRACE");
         if (recurrent_trace && strcmp(recurrent_trace, "1") == 0 && n_gdn_seen > 0) {
             GGML_LOG_INFO("ggml-spacemit: recurrent conv fused=%d/%d scalar=%d gdn in-place=%d/%d graph=%llu\n",
@@ -1251,6 +1279,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                      static_cast<unsigned long long>(graph->uid), graph->n_nodes);
     }
 
+    auto * op_stats = ocr_op_stats::path() ? &ocr_op_stats::storage::get() : nullptr;
+    if (op_stats) op_stats->prepare(unsigned(n_threads), opnodes);
     const bool op_timing=ocr_op_timing::path()!=nullptr;
     const uint64_t op_timing_sequence=op_timing?ocr_op_timing::storage::get().next.fetch_add(1):0;
     // Phase storage registers atexit and allocates several MiB. Initialize and
@@ -1295,6 +1325,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     if (!pc8_host_options || std::strcmp(pc8_host_options, "0") != 0)
         ocr_q4_pc8::prepare_options_on_host();
     spacemit_kernels::rvv::prepare_ocr_worker_state();
+    ocr_q4_head_prepared::prepare_on_host();
     (void)ocr_fa_schedule::configured_rows(ggml_fa_tile_config::Q);
     (void)ocr_fa_schedule::separate_barrier_enabled();
     ocr_quant_phases::prepare_on_host();
@@ -1304,7 +1335,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         [&opnodes, workspace_size = sess->workspace_size, workspace, contexts,
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
-         attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
+         attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,op_stats,
          op_progress, progress_sequence,
          tcm_values = tcm_ownership_enabled ? &tcm_catalog : nullptr,
          tcm_state = &tcm_result](spert::Context * runtime) {
@@ -1357,7 +1388,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             for (const auto & node : opnodes) {
                 ggml_tensor * op = node.node;
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index),1,op);
-                const uint64_t op_begin=op_timing?ocr_op_timing::now():0;
+                const uint64_t op_begin=(op_timing || op_stats)?ocr_op_timing::now():0;
 
                 ggml_profile_log_spacemit_op_begin(op, (int) ith, (int) runtime->grid_dim(0));
 
@@ -1369,7 +1400,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                                              ggml_op_desc(op) + " (" + ggml_type_name(op->type) + ")");
                 }
                 ggml_profile_log_spacemit_op_end(op, (int) ith, (int) runtime->grid_dim(0));
-                const uint64_t op_end=op_timing?ocr_op_timing::now():0;
+                const uint64_t op_end=(op_timing || op_stats)?ocr_op_timing::now():0;
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index),2,op);
 
                 ++node_index;
@@ -1379,6 +1410,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 // dependencies can be farther away or hidden behind aliases/views.
                 ctx.sync();
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index-1),3,op);
+                if (op_stats) op_stats->record(ith,node_index-1,op_begin,op_end,ocr_op_timing::now());
                 if(op_timing)ocr_op_timing::record(ith,op_timing_sequence,unsigned(node_index-1),op,
                     int(node.opcode),op_begin,op_end,ocr_op_timing::now());
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index-1),4,op);
@@ -1413,6 +1445,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     spacemit_host_trace("graph-launch-end");
     const spert::Status status = fut.sync();
+    if (op_stats) op_stats->finish(opnodes, status == spert::Status::Ok);
     spacemit_host_trace("graph-sync-end");
     spacemit_kernels::rvv::drain_ocr_worker_events();
 
@@ -1626,7 +1659,9 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
+        case GGML_OP_ARGMAX:
         case GGML_OP_CLAMP:
             supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;

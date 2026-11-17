@@ -2441,6 +2441,34 @@ struct test_get_rows : public test_case {
     }
 };
 
+// Sampler backend initialization tests TOP_K with pre-existing I32 candidate
+// IDs. The active first sampler has no such vector, but the probe must pass.
+struct test_get_rows_dspark_i32 : public test_case {
+    const int64_t cols, rows, n_get;
+    test_get_rows_dspark_i32(int64_t cols, int64_t rows, int64_t n_get)
+        : cols(cols), rows(rows), n_get(n_get) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GET_ROWS_DSPARK_I32"; }
+    std::string vars() override { return VARS_TO_STR3(cols, rows, n_get); }
+    double max_nmse_err() override { return 0.0; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * src = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, rows);
+        auto * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_get);
+        ggml_set_name(src, "candidate_source"); ggml_set_name(idx, "candidate_indices");
+        return ggml_get_rows(ctx, src, idx);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) init_tensor_uniform(t);
+        auto * src = ggml_get_tensor(ctx, "candidate_source");
+        auto * idx = ggml_get_tensor(ctx, "candidate_indices");
+        std::vector<int32_t> data(cols * rows), indices(n_get);
+        const int32_t values[] = {INT32_MIN, INT32_MAX, 16777217, -16777217, 248099, 0, -1};
+        for (int64_t i = 0; i < cols * rows; ++i) data[i] = values[i % 7];
+        for (int64_t i = 0; i < n_get; ++i) indices[i] = (i * 137 + rows - 1) % rows;
+        ggml_backend_tensor_set(src, data.data(), 0, data.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(idx, indices.data(), 0, indices.size() * sizeof(int32_t));
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -2885,6 +2913,41 @@ struct test_argmax : public test_case {
     }
 };
 
+// DSpark masks most of its 248100-token vocabulary. Cover exceptional logits
+// and more rows than six AI workers; compare results with the CPU backend.
+struct test_argmax_special : public test_argmax {
+    test_argmax_special() : test_argmax(GGML_TYPE_F32, {248100, 9, 1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t n = t->ne[0];
+            for (int64_t row = 0; row < t->ne[1]; ++row) {
+                std::vector<float> data(n, -INFINITY);
+                switch (row) {
+                    case 0: data[1] = data[n - 2] = 7.0f; break; // tied maxima
+                    case 1: break; // all -infinity
+                    case 2: std::fill(data.begin(), data.end(), NAN); break;
+                    case 3: data[0] = NAN; data[n / 2] = 3.0f; break;
+                    case 4: data[0] = 100.0f; data[1] = NAN; data[2] = 1.0f; break;
+                    case 5: data[0] = 100.0f; data[n - 1] = NAN; break;
+                    case 6: data[1] = data[n - 1] = INFINITY; break;
+                    case 7:
+                        for (int64_t i = 0; i < n; ++i) data[i] = i % 2 ? -0.0f : 0.0f;
+                        break;
+                    case 8:
+                        for (int64_t i = 0; i < n; ++i) data[i] = static_cast<float>((i * 104729) % 10007);
+                        break;
+                }
+                ggml_backend_tensor_set(t, data.data(), row * t->nb[1], n * sizeof(float));
+            }
+        }
+    }
+};
+
 // GGML_OP_COUNT_EQUAL
 struct test_count_equal : public test_case {
     const ggml_type type;
@@ -3286,6 +3349,35 @@ struct test_cont : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// The DSpark Markov head packs one anchor from each 15-token block into
+// an I32 vector. Include more blocks than workers and token IDs that would
+// lose bits if a copy accidentally converted through float.
+struct test_cont_dspark_anchor : public test_case {
+    const int64_t n_blocks;
+    explicit test_cont_dspark_anchor(int64_t n_blocks) : n_blocks(n_blocks) {}
+    std::string vars() override { return VAR_TO_STR(n_blocks); }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 15 * n_blocks);
+        ggml_set_name(src, "dspark_anchor_source");
+        ggml_set_param(src);
+        ggml_tensor * anchors = ggml_view_2d(ctx, src, 1, n_blocks, 15 * src->nb[0], 0);
+        return ggml_cont_1d(ctx, anchors, n_blocks);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+        ggml_tensor * src = ggml_get_tensor(ctx, "dspark_anchor_source");
+        std::vector<int32_t> data(15 * n_blocks, -123);
+        const int32_t anchors[] = {248099, 16777217, -16777217, INT32_MAX, INT32_MIN, 0, -1};
+        for (int64_t i = 0; i < n_blocks; ++i) data[15 * i] = anchors[i % 7];
+        ggml_backend_tensor_set(src, data.data(), 0, data.size() * sizeof(int32_t));
     }
 };
 
@@ -7181,6 +7273,35 @@ struct test_top_k : public test_case {
     }
 };
 
+// Exact CPU top-k candidate sets for DSpark: real vocabulary, tied logits,
+// infinities/masked logits, and more rows than the six backend workers.
+struct test_top_k_dspark : public test_top_k {
+    const int pattern;
+    test_top_k_dspark(int64_t rows, int pattern)
+        : test_top_k(GGML_TYPE_F32, {248100, rows, 1, 1}, 10, false), pattern(pattern) {}
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOP_K_DSPARK";
+    }
+    std::string vars() override { return test_top_k::vars() + "," + VAR_TO_STR(pattern); }
+    bool run_whole_graph() override { return true; }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_top_k::initialize_tensors(ctx);
+        for (int64_t r = 0; r < input->ne[1]; ++r) {
+            std::vector<float> data(input->ne[0]);
+            for (int64_t i = 0; i < input->ne[0]; ++i) {
+                // A permutation gives unique, exactly representable logits.
+                data[i] = float((i * 104729 + r * 997) % 248100);
+                if (pattern == 1) data[i] = float(i % 17);
+                if (pattern == 2) data[i] = i % 5 ? -INFINITY : -float(i + 1);
+            }
+            if (pattern == 2 && r % 3 == 0) std::fill(data.begin(), data.end(), -INFINITY);
+            if (pattern == 2 && r % 3 == 1) data[137] = data[17] = INFINITY;
+            ggml_backend_tensor_set(input, data.data(), r * input->nb[1], data.size() * sizeof(float));
+        }
+    }
+};
+
 // top_k over rows like log-probabilities: distinct negative values, fewer
 // than k +inf (none for k = 1, so the expected indices are unique) and many
 // -inf (masked tokens)
@@ -10202,6 +10323,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248100, 1, 1, 1}));
+    test_cases.emplace_back(new test_argmax_special());
+    for (int64_t blocks : {1, 3, 7, 19}) {
+        test_cases.emplace_back(new test_cont_dspark_anchor(blocks));
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {248100, 1, 1, 1}, 1, 1));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {248100, 14, 1, 1}, 1, 1));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {1, 14, 1, 1}, 1, 1));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
@@ -10223,6 +10352,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 1, 2}, view));
     }
 
+    test_cases.emplace_back(new test_get_rows_dspark_i32(1, 131072, 10));
+    test_cases.emplace_back(new test_get_rows_dspark_i32(7, 21, 10));
+    test_cases.emplace_back(new test_get_rows_dspark_i32(7, 21, 1));
     test_cases.emplace_back(new test_dup(GGML_TYPE_F32));
     test_cases.emplace_back(new test_dup(GGML_TYPE_F16));
     test_cases.emplace_back(new test_dup(GGML_TYPE_I32));
@@ -11398,6 +11530,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
     }
 
+    for (int64_t rows : {1, 15}) {
+        for (int pattern : {0, 1, 2}) {
+            test_cases.emplace_back(new test_top_k_dspark(rows, pattern));
+        }
+    }
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));

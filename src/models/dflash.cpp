@@ -127,6 +127,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         const int64_t dspark_markov_rank = markov_meta->ne[0];
 
         dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
+        // Token-indexed lookup requires the original quantized row layout.
+        dspark_markov_w1->flags |= GGML_TENSOR_FLAG_NO_REPACK;
         dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
         dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
 

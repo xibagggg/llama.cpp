@@ -228,14 +228,28 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         }
         if(node.opcode!=SPACEMIT_OP_PC8_PAD_MUL_MAT||node.elided_pad!=node.node->src[1]||
            !pad_supported(node.node))return false;
-        if(node.fused.empty())return compute<true>(ctx,node.node,node.elided_pad->src[0]);
+        const auto * input=node.elided_gelu?node.elided_gelu->src[0]:node.elided_pad->src[0];
+        if(node.elided_gelu) {
+            if(node.elided_pad->src[0]!=node.elided_gelu||!input||
+               node.elided_gelu->op!=GGML_OP_UNARY||
+               ggml_get_unary_op(node.elided_gelu)!=GGML_UNARY_OP_GELU||
+               input->type!=GGML_TYPE_F32||!ggml_is_contiguous(input)||
+               !ggml_are_same_shape(input,node.elided_gelu))return false;
+            if(node.fused.empty())return compute<true,false,true>(ctx,node.node,input);
+            const auto*bias=node.fused[0]->src[1];
+            if(node.fused.size()==1)return compute<true,false,true>(ctx,node.node,input,node.fused[0],bias);
+            if(node.fused.size()!=2)return false;
+            auto*res=node.fused[1];const bool left=res->src[0]!=node.fused[0];
+            return compute<true,false,true>(ctx,node.node,input,res,bias,res->src[left?0:1],left);
+        }
+        if(node.fused.empty())return compute<true>(ctx,node.node,input);
         const auto*bias=node.fused[0]->src[1];
         if(node.fused.size()==1)return compute<true>(ctx,node.node,node.elided_pad->src[0],node.fused[0],bias);
         if(node.fused.size()!=2)return false;
         auto*res=node.fused[1];const bool left=res->src[0]!=node.fused[0];
         return compute<true>(ctx,node.node,node.elided_pad->src[0],res,bias,res->src[left?0:1],left);
     }
-    template<bool PAD,bool GELU=false>
+    template<bool PAD,bool GELU=false,bool INPUT_GELU=false>
     bool compute(ggml::spacemit::context&ctx,ggml_tensor*op,const ggml_tensor*input,ggml_tensor*dst=nullptr,const ggml_tensor*bias=nullptr,const ggml_tensor*residual=nullptr,bool residual_left=false)const {
         const int K=op->src[0]->ne[0],N=op->ne[0],M=op->ne[1],MP=GGML_PAD(M,4),NP=GGML_PAD(N,32);
         const int input_k=PAD?int(input->ne[0]):K;
@@ -251,14 +265,25 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         ctx.mark_subphase(100); // activation quantization and packing
         if(!reuse)for(int g=ctx.ith;g<MP/4;g+=ctx.nth)for(int r=0;r<4;++r){
             if(g*4+r>=M){scales[g*4+r]=0;for(int k=0;k<K;k+=32)std::memset(packed+size_t(g)*4*K+k*4+r*32,0,32);continue;}
+            const float * row=x+size_t(g*4+r)*input_k;
+            if constexpr(INPUT_GELU) {
+                static_assert(PAD,"GELU packing only supports the checked padded down projection");
+                // The GEMM scratch is still dead. Each lane already owns its
+                // TCM grant; this 17-KiB row does not allocate or claim memory.
+                GGML_ASSERT(ctx.shared.size>=size_t(input_k)*sizeof(float));
+                auto * scratch=static_cast<float *>(ctx.shared.data);
+                std::memcpy(scratch,row,size_t(input_k)*sizeof(float));
+                spacemit_kernels::rvv::forward_gelu_f32_tile(scratch,input_k);
+                row=scratch;
+            }
             auto vmax=__riscv_vfmv_v_f_f32m2(0,64);
-            for(int k=0;k<input_k;k+=64){const size_t vl=std::min(64,input_k-k);const auto a=__riscv_vfabs_v_f32m2(__riscv_vle32_v_f32m2(x+size_t(g*4+r)*input_k+k,vl),vl);vmax=__riscv_vfmax_vv_f32m2_tu(vmax,vmax,a,vl);}
+            for(int k=0;k<input_k;k+=64){const size_t vl=std::min(64,input_k-k);const auto a=__riscv_vfabs_v_f32m2(__riscv_vle32_v_f32m2(row+k,vl),vl);vmax=__riscv_vfmax_vv_f32m2_tu(vmax,vmax,a,vl);}
             const float maximum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m2_f32m1(vmax,__riscv_vfmv_v_f_f32m1(0,1),64));
             const float scale=maximum/127;GGML_ASSERT(std::isfinite(maximum));scales[g*4+r]=scale;const float inv=scale?1/scale:0;
             for(int k=0;k<K;k+=32){auto*target=packed+size_t(g)*4*K+k*4+r*32;
                 const size_t vl=PAD?std::min(32,std::max(0,input_k-k)):32;
                 if constexpr(PAD){if(vl<32)std::memset(target,0,32);if(!vl)continue;}
-                const auto a=__riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(x+size_t(g*4+r)*input_k+k,vl),inv,vl);
+                const auto a=__riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(row+k,vl),inv,vl);
                 const auto q=__riscv_vncvt_x_x_w_i8mf4(__riscv_vfncvt_x_f_w_i16mf2(a,vl),vl);
                 __riscv_vse8_v_i8mf4(target,q,vl);}
         }

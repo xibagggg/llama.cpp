@@ -22,6 +22,13 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#if defined(__linux__)
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -598,6 +605,31 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
     return err;
 }
 
+// One host-side marker for the earliest accepted GGML backend graph.
+// No operator callbacks, synchronization, profiling buffers or per-graph I/O.
+static void ggml_startup_probe_first_graph(ggml_backend_t backend, int compute_nodes) {
+#if defined(__linux__)
+    static const bool enabled = [] {
+        const char * value = std::getenv("OCR_STARTUP_PROBE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled) return;
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true, std::memory_order_relaxed)) return;
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+    const auto ns = static_cast<long long>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+    std::fprintf(stderr,
+        "OCR_STARTUP_PROBE event=ggml_graph_begin pid=%ld ppid=%ld monotonic_ns=%lld backend=%s compute_nodes=%d\n",
+        static_cast<long>(::getpid()), static_cast<long>(::getppid()), ns,
+        ggml_backend_name(backend), compute_nodes);
+    std::fflush(stderr);
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(compute_nodes);
+#endif
+}
+
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const char * required = getenv("GGML_SCHED_REQUIRE_BACKEND");
     const char * audit = getenv("GGML_SCHED_AUDIT_PATH");
@@ -620,6 +652,7 @@ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct
         fclose(f);
     }
     GGML_ASSERT(backend);
+    ggml_startup_probe_first_graph(backend, compute_nodes);
     return backend->iface.graph_compute(backend, cgraph);
 }
 
