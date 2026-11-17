@@ -1293,7 +1293,12 @@ private:
 
         // In dedicated multi-ASR mode llama-server owns only the model. The
         // sole llama_context is created and scheduled by multi-ASR below.
+        const int64_t ocr_llm_init_start = ggml_time_us();
         llama_init = common_init_from_params(params_base, use_multi_asr);
+        if (std::getenv("OCR_STAGE_TIMING")) {
+            SRV_INF("OCR_METRIC kind=llm_model_init seconds=%.6f\n",
+                    (ggml_time_us() - ocr_llm_init_start) / 1e6);
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1404,11 +1409,16 @@ private:
                 }
             }
 
+            const int64_t ocr_vision_init_start = ggml_time_us();
             try {
                 media_init = server_media_context::init(ctx_tgt, model_tgt, vocab, params_base, mparams, std::move(media_worker_init));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to load media backend: %s\n", e.what());
                 return false;
+            }
+            if (std::getenv("OCR_STAGE_TIMING")) {
+                SRV_INF("OCR_METRIC kind=vision_model_init seconds=%.6f\n",
+                        (ggml_time_us() - ocr_vision_init_start) / 1e6);
             }
             media = media_init.get();
             mctx = media != nullptr ? media->mtmd() : nullptr;
