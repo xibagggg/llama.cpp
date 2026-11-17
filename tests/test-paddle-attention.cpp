@@ -9,8 +9,9 @@
 #include <random>
 #include <vector>
 
-// Check large Paddle vision FA against sampled FP64 attention rows, including
-// the final key/query tile. This verifies the packed path above 4096 patches.
+// Check Paddle vision FA against sampled FP64 attention rows, including small
+// crops below the old 988-patch cutoff, partial Q/KV tiles and large images.
+// The sub-tile case also checks that the original RVV fallback remains valid.
 int main() {
     setenv("GGML_SPACEMIT_OCR_FA_PACK","1",1);
     setenv("GGML_SPACEMIT_OCR_FA_COMPUTE","3",1);
@@ -25,7 +26,7 @@ int main() {
     std::uniform_real_distribution<float> dist(-1.f,1.f);
     constexpr int D=72,H=16;
     bool ok=true;
-    for(int n:{988,1001,4097,10320}) {
+    for(int n:{63,64,65,752,804,848,896,987,988,1001,4097,10320}) {
         const auto ctx=ggml_init({32*1024*1024,nullptr,true});
         auto q=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,D,n,H);
         auto k=ggml_new_tensor_3d(ctx,GGML_TYPE_F16,D,n,H);
