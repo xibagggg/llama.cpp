@@ -3,6 +3,7 @@
 #include "ime_kernels.h"
 #include "rvv_kernels.h"
 #include "string.h"
+#include "paddle-q6-head-n64-kernel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -4928,6 +4929,13 @@ void gemm_kernel_i8i8_m1(size_t          blk_len,
             : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
             : "cc", "t0", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
     }
+}
+
+size_t gemm_kernel_i8i8_paddle_q6_head_n64(size_t blk_len,const uint8_t * a,const uint8_t * b,
+    const uint8_t * zp,float * c,size_t m,size_t n,size_t k_blks,size_t ldc) {
+    if(blk_len!=32||m!=1||n<=32||n>64||k_blks!=32||zp!=nullptr||__riscv_vlenb()!=128)return 0;
+    paddle_q6_head_n64_kernel(a,b,c,n,k_blks);
+    return 1;
 }
 
 void gemm_kernel_i8i8_m4(size_t          blk_len,

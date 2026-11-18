@@ -1,0 +1,120 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+
+// VLEN1024/IME2 only. Two existing physical N32 Q8 panels, 33<=n<=64,
+// K-block count >0. Production wrapper admits only K1024. A bytes/scales and B
+// bytes/scales are unchanged. Each output receives the same dot/conversion,
+// scale product and F32 FMA in the original ascending K32 order.
+static inline void paddle_q6_head_n64_kernel(const uint8_t*a,const uint8_t*b,
+                                            float*c,size_t n,size_t k_blks) {
+    const uint8_t*b1=b+k_blks*32*(32+2);
+    const size_t n2=n-32;
+    asm volatile(
+        "mv t3,%[KB]\n\t"
+        "mv t4,%[N2]\n\t"
+        "mv s2,%[A]\n\t"
+        "addi s3,%[A],6\n\t"
+        "mv s4,%[B0]\n\t"
+        "addi s5,%[B0],64\n\t"
+        "mv s7,%[B1]\n\t"
+        "addi s8,%[B1],64\n\t"
+        "mv s6,%[C]\n\t"
+        "vsetvli t0,zero,e32,m1\n\t"
+        "vxor.vv v2,v0,v0\n\t"
+        "vxor.vv v3,v0,v0\n\t"
+        ".align 4\n\t"
+        ".Lq6n64_k%=:\n\t"
+        // A and its exact second half are shared by both panels.
+        "vsetvli t0,zero,e8,mf4\n\t"
+        "vle8.v v12,(s3)\n\t"
+        "addi s3,s3,38\n\t"
+        "flw f0,(s2)\n\t"
+        "addi s2,s2,38\n\t"
+        "vsetvli t0,zero,e32,m1\n\t"
+        "vslidedown.vi v13,v12,4\n\t"
+        // Panel 0: baseline integer-dot and FP32 operations.
+        "vsetvli t0,zero,e8,m1\n\t"
+        "vl4r.v v4,(s5)\n\t"
+        "addi s5,s5,512\n\t"
+        "vl4r.v v8,(s5)\n\t"
+        "addi s5,s5,576\n\t"
+        "vsetvli t0,zero,e8,mf2\n\t"
+        "vle8.v v0,(s4)\n\t"
+        "addi s4,s4,1088\n\t"
+        "vsetvli t0,zero,e32,m1\n\t"
+        "vupack.vv v24,v4,v5,1\n\t"
+        "vupack.vv v26,v6,v7,1\n\t"
+        "vupack.vv v28,v8,v9,1\n\t"
+        "vupack.vv v30,v10,v11,1\n\t"
+        "vxor.vv v16,v16,v16\n\t"
+        "vxor.vv v18,v16,v16\n\t"
+        "vxor.vv v20,v16,v16\n\t"
+        "vxor.vv v22,v16,v16\n\t"
+        "vmadot v16,v12,v24,i8\n\t"
+        "vmadot v18,v12,v26,i8\n\t"
+        "vmadot v20,v12,v28,i8\n\t"
+        "vmadot v22,v12,v30,i8\n\t"
+        "vmadot v16,v13,v25,i8\n\t"
+        "vmadot v18,v13,v27,i8\n\t"
+        "vmadot v20,v13,v29,i8\n\t"
+        "vmadot v22,v13,v31,i8\n\t"
+        "vpack.vv v24,v16,v18,2\n\t"
+        "vpack.vv v26,v20,v22,2\n\t"
+        "vpack.vv v16,v24,v26,3\n\t"
+        "vsetvli t0,zero,e16,mf2\n\t"
+        "vfwcvt.f.f.v v24,v0\n\t"
+        "vsetvli t0,zero,e32,m1\n\t"
+        "vfcvt.f.x.v v26,v16\n\t"
+        "vfmul.vf v1,v24,f0\n\t"
+        "vfmacc.vv v2,v1,v26\n\t"
+        // Panel 1 uses the same A registers/scale, independent F32 accumulator.
+        "vsetvli t0,zero,e8,m1\n\t"
+        "vl4r.v v4,(s8)\n\t"
+        "addi s8,s8,512\n\t"
+        "vl4r.v v8,(s8)\n\t"
+        "addi s8,s8,576\n\t"
+        "vsetvli t0,zero,e8,mf2\n\t"
+        "vle8.v v0,(s7)\n\t"
+        "addi s7,s7,1088\n\t"
+        "vsetvli t0,zero,e32,m1\n\t"
+        "vupack.vv v24,v4,v5,1\n\t"
+        "vupack.vv v26,v6,v7,1\n\t"
+        "vupack.vv v28,v8,v9,1\n\t"
+        "vupack.vv v30,v10,v11,1\n\t"
+        "vxor.vv v16,v16,v16\n\t"
+        "vxor.vv v18,v16,v16\n\t"
+        "vxor.vv v20,v16,v16\n\t"
+        "vxor.vv v22,v16,v16\n\t"
+        "vmadot v16,v12,v24,i8\n\t"
+        "vmadot v18,v12,v26,i8\n\t"
+        "vmadot v20,v12,v28,i8\n\t"
+        "vmadot v22,v12,v30,i8\n\t"
+        "vmadot v16,v13,v25,i8\n\t"
+        "vmadot v18,v13,v27,i8\n\t"
+        "vmadot v20,v13,v29,i8\n\t"
+        "vmadot v22,v13,v31,i8\n\t"
+        "vpack.vv v24,v16,v18,2\n\t"
+        "vpack.vv v26,v20,v22,2\n\t"
+        "vpack.vv v16,v24,v26,3\n\t"
+        "vsetvli t0,zero,e16,mf2\n\t"
+        "vfwcvt.f.f.v v24,v0\n\t"
+        "vsetvli t0,zero,e32,m1\n\t"
+        "vfcvt.f.x.v v26,v16\n\t"
+        "vfmul.vf v1,v24,f0\n\t"
+        "vfmacc.vv v3,v1,v26\n\t"
+        "addi t3,t3,-1\n\t"
+        "bgtz t3,.Lq6n64_k%=\n\t"
+        // Store only logical columns; the second physical panel is still full.
+        "li t0,32\n\t"
+        "vsetvli zero,t0,e32,m1\n\t"
+        "vse32.v v2,(s6)\n\t"
+        "addi s6,s6,128\n\t"
+        "vsetvli t0,t4,e32,m1\n\t"
+        "vse32.v v3,(s6)\n\t"
+        :
+        : [KB]"r"(k_blks),[N2]"r"(n2),[A]"r"(a),[B0]"r"(b),[B1]"r"(b1),[C]"r"(c)
+        : "cc","memory","t0","t3","t4","f0","s2","s3","s4","s5","s6","s7","s8",
+          "v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11","v12","v13","v14","v15",
+          "v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31");
+}

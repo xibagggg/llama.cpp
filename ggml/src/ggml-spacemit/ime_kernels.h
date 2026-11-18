@@ -152,6 +152,11 @@ size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
                                size_t           k_blks,
                                size_t           ldc);
 
+// Default-off Paddle Q6 M1 head, two N32 panels sharing A inside each K32.
+// Returns zero for unsupported inputs; caller keeps the original generic path.
+size_t gemm_kernel_i8i8_paddle_q6_head_n64(size_t blk_len,const uint8_t * a,const uint8_t * b,
+    const uint8_t * zp,float * c,size_t m,size_t n,size_t k_blks,size_t ldc);
+
 size_t gemm_kernel_i8i8(size_t          blk_len,
                         const uint8_t * quant_a_ptr,
                         const uint8_t * quant_b_data,

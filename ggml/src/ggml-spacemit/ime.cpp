@@ -30,6 +30,7 @@
 #include "paddle-f16-ime2.h"
 #include "paddle-f16-f16-patch.h"
 #include "paddle-llm-head-stage.h"
+#include "paddle-q6-head-n64.h"
 #include "paddle-pos-resize.h"
 #include "ocr-q4-pc8.h"
 
@@ -572,6 +573,20 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
         const int64_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
+        bool use_paddle_q6_head_n64=false;
+#if defined(RISCV64_SPACEMIT_IME2)
+        if constexpr(std::is_same_v<BLOC_TYPE,block_q6_K> && INTER_SIZE==32 && NB_COLS==32) {
+            use_paddle_q6_head_n64=global_spine_env_info.use_ime2&&!fused_bias&&!packed_im2col&&
+                ne02==1&&ne03==1&&ne12==1&&ne13==1&&
+                ggml_is_contiguous(src1)&&ggml_is_contiguous(dst)&&
+                paddle_q6_head_n64::eligible(nth,global_spine_env_info.vlen,
+                    gemm_m,gemm_k,gemm_n,src0->name,size_t(row_stride_a),size_t(row_stride_b),
+                    paddle_llm_head_shared_capacity());
+            GGML_ASSERT(!use_paddle_q6_head_n64 ||
+                (tcm_buffer&&size_t(tcm_buffer_size)>=paddle_q6_head_n64::required_tcm_bytes));
+        }
+#endif
+        auto *q6_head_evidence=use_paddle_q6_head_n64?paddle_q6_head_n64::trace():nullptr;
         const auto run_gemm_tile = [&](const uint8_t * a, const uint8_t * b, const uint8_t * b_zp,
                                        float * c, int64_t rows, int64_t cols, int64_t bias_col) {
             size_t rows_handled = 0;
@@ -584,7 +599,15 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     GGML_ABORT("ggml-spacemit: unsupported fused Q4 bias GEMM shape");
                 }
             } else {
-                rows_handled = gemm_kernel(b_blk_len, a, b, b_zp, c, rows, cols, b_k_blks, gemm_n);
+#if defined(RISCV64_SPACEMIT_IME2)
+                if(use_paddle_q6_head_n64) {
+                    rows_handled=spacemit_kernels::ime2::gemm_kernel_i8i8_paddle_q6_head_n64(
+                        b_blk_len,a,b,b_zp,c,rows,cols,b_k_blks,gemm_n);
+                    if(q6_head_evidence)paddle_q6_head_n64::record_tile(q6_head_evidence,ith,cols,rows_handled!=0);
+                }
+#endif
+                if(rows_handled==0)
+                    rows_handled = gemm_kernel(b_blk_len, a, b, b_zp, c, rows, cols, b_k_blks, gemm_n);
             }
             return rows_handled;
         };
@@ -709,7 +732,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                    ne02==1&&ne03==1&&ne12==1&&ne13==1&&
                    ggml_is_contiguous(src1)&&ggml_is_contiguous(dst)) {
                     const auto plan=paddle_llm_head_stage::choose(
-                        paddle_llm_head_stage::requested_cols(),gemm_m,gemm_k,gemm_n,
+                        use_paddle_q6_head_n64?64:paddle_llm_head_stage::requested_cols(),gemm_m,gemm_k,gemm_n,
                         src0->name,size_t(row_stride_b),paddle_llm_head_shared_capacity());
                     if(plan.selected)stage_cols=plan.cols;
                 }
@@ -2534,6 +2557,8 @@ int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data,
 
 bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t * size) {
     (void)paddle_llm_head_stage::requested_cols(); // Host resolves before launch.
+    (void)paddle_q6_head_n64::requested();
+    (void)paddle_q6_head_n64::trace(); // Allocate/resolve libc on host, never AI worker.
     (void)paddle_llm_head_shared_capacity();
     if (ocr_ime2_fp16_v35::eligible(op)) { *size = ocr_ime2_fp16_v35::work_bytes(op); return true; }
     const auto * traits = ggml_spacemit_get_tensor_traits(op);
