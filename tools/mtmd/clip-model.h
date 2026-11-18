@@ -567,6 +567,7 @@ struct clip_model {
     ggml_tensor * class_embedding = nullptr;
     ggml_tensor * patch_embeddings_0 = nullptr;
     ggml_tensor * patch_embeddings_1 = nullptr;  // second Conv2D kernel when we decouple Conv3D along temporal dimension (Qwen2VL)
+    ggml_tensor * patch_embeddings_image = nullptr; // optional summed kernel for repeated still-image frames
     ggml_tensor * patch_bias = nullptr;
     ggml_tensor * position_embeddings = nullptr;
     ggml_tensor * norm_embd_w = nullptr;
