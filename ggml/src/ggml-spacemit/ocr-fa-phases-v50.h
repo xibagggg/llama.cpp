@@ -13,7 +13,7 @@ inline bool enabled(){return directory()!=nullptr;}
 inline uint64_t now(){return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 struct item{char name[64]{},stage[12]{};uint64_t start=0,end=0,ns[10]{};int64_t n=0;unsigned worker=0;};
 struct storage{
-    static constexpr unsigned capacity=1024;
+    static constexpr unsigned capacity=2048;
     unsigned used[8]{};item data[8][capacity]{};
     storage(){std::atexit(dump);}
     static storage& get(){static storage *p=new storage;return *p;}
