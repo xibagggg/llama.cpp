@@ -1,0 +1,35 @@
+{
+  "status": "PASS",
+  "normalization": "Only Markdown image reference targets are replaced by SHA256 of the referenced file; every other byte is preserved. No words, whitespace, punctuation, numbers or ordering are normalized.",
+  "left": {
+    "markdown": "/home/bianbu/ocr-merged/baseline-minicpm/model-zoo-ocr/output/minicpm_ocr/serial-baseline-1/native-p1/run/output/native-p1.md",
+    "markdown_bytes": 4584,
+    "markdown_sha256": "8f88bdaa258aa7e4396a5d0bf939317018d778bbfaccac994e26eb70c7f645ad",
+    "image_path_normalized_sha256": "cdee08ce840dd088abbea863fb9dc9791a1e90672c421009480fb691e266f16c",
+    "images": [
+      {
+        "reference": "image/native-p1_011_img_in_image_box_139_519_512_920.png",
+        "sha256": "367061bc4f82cccbdca147f228ceadbfad8b2f7ef0ff54544668adb740e461f0"
+      }
+    ],
+    "table_cells": 72,
+    "table_rows": 15,
+    "formula_delimiters": 2
+  },
+  "right": {
+    "markdown": "/home/bianbu/ocr-merged/model-zoo-ocr/output/minicpm_ocr/serial-merged-3/native-p1/run/output/native-p1.md",
+    "markdown_bytes": 4584,
+    "markdown_sha256": "8f88bdaa258aa7e4396a5d0bf939317018d778bbfaccac994e26eb70c7f645ad",
+    "image_path_normalized_sha256": "cdee08ce840dd088abbea863fb9dc9791a1e90672c421009480fb691e266f16c",
+    "images": [
+      {
+        "reference": "image/native-p1_011_img_in_image_box_139_519_512_920.png",
+        "sha256": "367061bc4f82cccbdca147f228ceadbfad8b2f7ef0ff54544668adb740e461f0"
+      }
+    ],
+    "table_cells": 72,
+    "table_rows": 15,
+    "formula_delimiters": 2
+  },
+  "limitations": "One native-p1 page relative to each source branch; inherits existing OCR defects. No corpus-level CER/TEDS claim."
+}
