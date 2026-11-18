@@ -47,6 +47,25 @@
 
 namespace spacemit_kernels::rvv {
 
+namespace {
+std::atomic<bool> paddle_gqa8_exact_admitted{false};
+std::atomic<uint64_t> paddle_gqa8_exact_calls{0};
+bool paddle_gqa8_exact_reported = false; // dispatching host thread only
+constexpr size_t PADDLE_GQA8_EXACT_TCM = 8 * (128 + 128) * sizeof(_Float16);
+}
+
+void prepare_paddle_fa_gqa8_exact(unsigned workers, size_t shared_bytes, bool pinned_tcm) {
+    static const bool requested = [] {
+        const char * p = std::getenv("GGML_SPACEMIT_PADDLE_FA_GQA8_EXACT");
+        return p && std::strcmp(p, "1") == 0;
+    }();
+    // Work units reorder output rows, so admission must be collective and made
+    // before launch. Per-worker fallback is forbidden after reordering.
+    paddle_gqa8_exact_admitted.store(requested && workers == 6 && pinned_tcm &&
+        shared_bytes >= PADDLE_GQA8_EXACT_TCM, std::memory_order_relaxed);
+}
+
+
 void prepare_ocr_worker_state() {
     // Resolve these guards/environment reads on the dispatching host thread,
     // in this TU (ocr_fa_x8_enabled has internal linkage). No RVV/IME work here.
@@ -82,6 +101,11 @@ void prepare_ocr_worker_state() {
 }
 
 void drain_ocr_worker_events() {
+    if (!paddle_gqa8_exact_reported && paddle_gqa8_exact_calls.load(std::memory_order_relaxed)) {
+        GGML_LOG_INFO("paddle-fa-gqa8-exact: active D128 GQA8 Q5..63 workers=6 pinned_TCM=%zu bytes\n",
+                      PADDLE_GQA8_EXACT_TCM);
+        paddle_gqa8_exact_reported = true;
+    }
     using ocr_worker_events::kind;
     ocr_worker_events::get().drain([](kind event, const ocr_worker_events::values & v) {
         switch(event) {
@@ -1156,7 +1180,55 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
     flash_attn_ext_finalize_row_f16(dst, VKQ16, DV, S, M, sinks);
 }
 
+#include "paddle-fa-gqa8-exact.h"
+
 }  // namespace
+
+bool forward_flash_attn_ext_f16_paddle_gqa8_exact(ggml::spacemit::context & ctx, ggml_tensor * dst) {
+    if (!paddle_gqa8_exact_admitted.load(std::memory_order_relaxed) || !dst) return false;
+    const auto * q = dst->src[0]; const auto * k = dst->src[1]; const auto * v = dst->src[2];
+    const auto * mask = dst->src[3]; const auto * sinks = dst->src[4];
+    const float * params = reinterpret_cast<const float *>(dst->op_params);
+    // These are the only Paddle shapes whose control path is original m1.
+    // The full attention's split-KV and tiled paths keep their original gates.
+    if (!q || !k || !v || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128 ||
+        q->ne[1] < 5 || q->ne[1] >= GGML_FA_TILE_Q || q->ne[2] != 16 || k->ne[2] != 2 || v->ne[2] != 2 ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[1] <= 0 || k->ne[1] != v->ne[1] ||
+        q->nb[0] != sizeof(float) || k->nb[0] != sizeof(_Float16) || v->nb[0] != sizeof(_Float16) ||
+        dst->ne[0] != 128 || dst->ne[1] != 16 || dst->ne[2] != q->ne[1] || dst->ne[3] != 1 ||
+        dst->nb[0] != sizeof(float) || params[1] != 0.f ||
+        (dst->op_params[3] != GGML_PREC_F32 && dst->op_params[3] != GGML_PREC_DEFAULT) ||
+        (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] ||
+                  mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[0] != sizeof(_Float16))) ||
+        (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
+                   sinks->ne[0] != 16 || ggml_nelements(sinks) != 16))) return false;
+    GGML_ASSERT(ctx.nth == 6 && ctx.shared.data && ctx.check_tcm_view &&
+                ctx.shared.size >= PADDLE_GQA8_EXACT_TCM && __riscv_vlenb() == 128);
+    if (ctx.ith == 0) paddle_gqa8_exact_calls.fetch_add(1, std::memory_order_relaxed);
+    const int64_t tokens = q->ne[1];
+    float scale = params[0]; const float logit_softcap = params[2];
+    if (logit_softcap != 0.f) scale /= logit_softcap;
+    // Unit=(KV head,token). Eight query heads share K/V and a mask row.
+    // Each logical output row has one owner, including token/work-unit tails.
+    for (int64_t unit = ctx.ith; unit < 2 * tokens; unit += ctx.nth) {
+        const int64_t kv_head = unit / tokens, token = unit % tokens;
+        std::array<float *, 8> queries{}, outputs{}, sink_rows{};
+        for (int64_t row = 0; row < 8; ++row) {
+            const int64_t head = 8 * kv_head + row;
+            queries[row] = reinterpret_cast<float *>(static_cast<char *>(q->data) + token * q->nb[1] + head * q->nb[2]);
+            outputs[row] = reinterpret_cast<float *>(static_cast<char *>(dst->data) + (head + token * dst->ne[1]) * dst->nb[1]);
+            sink_rows[row] = sinks ? static_cast<float *>(sinks->data) + head : nullptr;
+        }
+        const auto * mask_row = mask ? reinterpret_cast<const ggml_fp16_t *>(
+            static_cast<const char *>(mask->data) + token * mask->nb[1]) : nullptr;
+        const auto * key = static_cast<const char *>(k->data) + kv_head * k->nb[2];
+        const auto * value = static_cast<const char *>(v->data) + kv_head * v->nb[2];
+        flash_attn_ext_paddle_gqa8_exact_inner(queries.data(), key, value, mask_row, sink_rows.data(), outputs.data(),
+            scale, logit_softcap, 1.f, k->ne[1], k->nb[1], v->nb[1], 128, 128, ctx.shared.data, ctx.shared.size);
+    }
+    return true;
+}
 
 void memcpy1d(void * dst, const void * src, int64_t size) {
     if (size <= 0) {

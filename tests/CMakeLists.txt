@@ -895,3 +895,20 @@ if (GGML_SPACEMIT)
             FIXTURES_REQUIRED paddle_vision_content_reference)
     endforeach()
 endif()
+
+# Original m1 arithmetic with shared K/V loads for Paddle D128/GQA8 Q5..63.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-fa-gqa8-exact.cpp LINK ggml)
+    set(paddle_gqa8_exact_reference "${CMAKE_CURRENT_BINARY_DIR}/paddle-gqa8-exact-v3-reference.bin")
+    set(paddle_gqa8_exact_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;GGML_SPACEMIT_ALLOW_EIGHT_WORKERS=0;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_PADDLE_LLM_FA_X8=1")
+    llama_test(test-paddle-fa-gqa8-exact NAME test-paddle-fa-gqa8-exact-reference LABEL spacemit
+        ARGS --write-reference "${paddle_gqa8_exact_reference}")
+    set_tests_properties(test-paddle-fa-gqa8-exact-reference PROPERTIES
+        ENVIRONMENT "${paddle_gqa8_exact_env};GGML_SPACEMIT_PADDLE_FA_GQA8_EXACT=0"
+        FIXTURES_SETUP paddle_gqa8_exact_reference RUN_SERIAL TRUE)
+    llama_test(test-paddle-fa-gqa8-exact NAME test-paddle-fa-gqa8-exact LABEL spacemit
+        ARGS --compare-reference "${paddle_gqa8_exact_reference}")
+    set_tests_properties(test-paddle-fa-gqa8-exact PROPERTIES
+        ENVIRONMENT "${paddle_gqa8_exact_env};GGML_SPACEMIT_PADDLE_FA_GQA8_EXACT=1"
+        FIXTURES_REQUIRED paddle_gqa8_exact_reference RUN_SERIAL TRUE)
+endif()

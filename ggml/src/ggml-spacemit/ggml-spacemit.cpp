@@ -1370,6 +1370,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     if (!pc8_host_options || std::strcmp(pc8_host_options, "0") != 0)
         ocr_q4_pc8::prepare_options_on_host();
     spacemit_kernels::rvv::prepare_ocr_worker_state();
+    spacemit_kernels::rvv::prepare_paddle_fa_gqa8_exact(n_threads, shared_mem_size,
+        scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
     (void)ocr_fa_schedule::configured_rows(ggml_fa_tile_config::Q);
     (void)ocr_fa_schedule::separate_barrier_enabled();
     ocr_quant_phases::prepare_on_host();

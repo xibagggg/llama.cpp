@@ -43,6 +43,9 @@ namespace rvv {
 // Host-only preparation and draining around the graph launch/future.
 void prepare_ocr_worker_state();
 void drain_ocr_worker_events();
+// Default-off exact GQA8 reuse only for the original m1 Q5..63 control path.
+void prepare_paddle_fa_gqa8_exact(unsigned workers, size_t shared_bytes, bool pinned_tcm);
+bool forward_flash_attn_ext_f16_paddle_gqa8_exact(ggml::spacemit::context & ctx, ggml_tensor * dst);
 
 void memcpy1d(void * dst, const void * src, int64_t size);
 
