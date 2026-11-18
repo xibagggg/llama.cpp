@@ -1,3 +1,4 @@
+#include "ocr-fa-serial-p2-v3-qk-pair.h"
 #pragma once
 // Included after the existing RVV exp/reduction helpers, within their namespace.
 // Kept separate from the original f449 softmax; old small paths are unchanged.
@@ -141,6 +142,7 @@ static bool forward_ocr_serial_p2_v3(ggml::spacemit::context &ctx,ggml_tensor *d
     float scale;std::memcpy(&scale,dst->op_params,sizeof(scale));
     auto *raw=static_cast<_Float16*>(ctx.shared.data);
     auto *packed_q=raw+Q*D;
+    auto *packed_low=raw; // reuse the existing unused Q*D FP16 region
     void *qk_scratch=packed_q+Q*D;
     auto *scores=reinterpret_cast<float*>(static_cast<char*>(qk_scratch)+qk_bytes);
     auto *prob=reinterpret_cast<_Float16*>(scores+Q*n);
@@ -153,6 +155,9 @@ static bool forward_ocr_serial_p2_v3(ggml::spacemit::context &ctx,ggml_tensor *d
     static_assert(Q*64*sizeof(float)<=Q*1128*sizeof(_Float16),"low-score alias capacity");
     ocr_fa_phases_v50::record phase(ctx,dst,"fullkv-s3");
     if constexpr(PROFILE)phase.begin();
+    const bool pair_qk=ocr_fa_serial_p2_v3::pair_qk_enabled();
+    const bool report_pair_qk=pair_qk&&ocr_fa_serial_p2_v3::pair_qk_report_enabled();
+    uint64_t paired_tiles=0;
     int loaded_head=-1;
     for(int ir=ir0;ir<ir1;) {
         const int head=ir/n,iq=ir%n,rows=std::min(Q,std::min(ir1-ir,n-iq));
@@ -163,28 +168,41 @@ static bool forward_ocr_serial_p2_v3(ggml::spacemit::context &ctx,ggml_tensor *d
         }
         if constexpr(PROFILE)phase.tick(7);
         const auto *src=reinterpret_cast<const uint8_t*>(q->data)+iq*q->nb[1]+head*q->nb[2];
-        GGML_ASSERT((ocr_serial_v3_query<false,true>(src,q->nb[1],rows,(rows+7)/8*8,scale,packed_q)));
-        if constexpr(PROFILE)phase.tick(2);
-        for(int ic=0;ic<n;ic+=64) {
-            const auto *key=ocr_fa_pack_v40::ime_key_tile(ctx,dst,
-                size_t(head)*ocr_fa_pack_v40::tiles(dst)+ic/64);
-            GGML_ASSERT(ocr_qk_ime2_v53::qk(scores+ic,packed_q,key,n,rows,std::min(64,n-ic),qk_scratch));
-        }
-        // Re-read Q and recreate the same rounded high half. No content cache,
-        // address tag, extra Q buffer, or changed high-QK accumulation order.
-        GGML_ASSERT((ocr_serial_v3_query<true,true>(src,q->nb[1],rows,(rows+7)/8*8,scale,packed_q)));
-        if constexpr(PROFILE)phase.tick(2);
-        for(int ic=0;ic<n;ic+=64) {
-            const int count=std::min(64,n-ic);
-            const auto *key=ocr_fa_pack_v40::ime_key_tile(ctx,dst,
-                size_t(head)*ocr_fa_pack_v40::tiles(dst)+ic/64);
-            GGML_ASSERT(ocr_qk_ime2_v53::qk(low_scores,packed_q,key,64,rows,count,qk_scratch));
-            for(int row=0;row<rows;++row) {
-                const size_t vl=count;
-                const auto low=__riscv_vle32_v_f32m2(low_scores+row*64,vl);
-                const auto high=__riscv_vle32_v_f32m2(scores+size_t(row)*n+ic,vl);
-                __riscv_vse32_v_f32m2(scores+size_t(row)*n+ic,
-                    __riscv_vfmacc_vf_f32m2(high,1.f/1024.f,low,vl),vl);
+        if(pair_qk) {
+            GGML_ASSERT((ocr_serial_v3_query<false,true>(src,q->nb[1],rows,(rows+7)/8*8,scale,packed_q)));
+            GGML_ASSERT((ocr_serial_v3_query<true,true>(src,q->nb[1],rows,(rows+7)/8*8,scale,packed_low)));
+            if constexpr(PROFILE)phase.tick(2);
+            for(int ic=0;ic<n;ic+=64) {
+                const auto *key=ocr_fa_pack_v40::ime_key_tile(ctx,dst,
+                    size_t(head)*ocr_fa_pack_v40::tiles(dst)+ic/64);
+                GGML_ASSERT(ocr_serial_v3_qk_pair(scores+ic,low_scores,packed_q,packed_low,
+                    key,n,rows,std::min(64,n-ic),qk_scratch));
+                if(report_pair_qk)++paired_tiles;
+            }
+        }else {
+            GGML_ASSERT((ocr_serial_v3_query<false,true>(src,q->nb[1],rows,(rows+7)/8*8,scale,packed_q)));
+            if constexpr(PROFILE)phase.tick(2);
+            for(int ic=0;ic<n;ic+=64) {
+                const auto *key=ocr_fa_pack_v40::ime_key_tile(ctx,dst,
+                    size_t(head)*ocr_fa_pack_v40::tiles(dst)+ic/64);
+                GGML_ASSERT(ocr_qk_ime2_v53::qk(scores+ic,packed_q,key,n,rows,std::min(64,n-ic),qk_scratch));
+            }
+            // Re-read Q and recreate the same rounded high half. No content cache,
+            // address tag, extra Q buffer, or changed high-QK accumulation order.
+            GGML_ASSERT((ocr_serial_v3_query<true,true>(src,q->nb[1],rows,(rows+7)/8*8,scale,packed_q)));
+            if constexpr(PROFILE)phase.tick(2);
+            for(int ic=0;ic<n;ic+=64) {
+                const int count=std::min(64,n-ic);
+                const auto *key=ocr_fa_pack_v40::ime_key_tile(ctx,dst,
+                    size_t(head)*ocr_fa_pack_v40::tiles(dst)+ic/64);
+                GGML_ASSERT(ocr_qk_ime2_v53::qk(low_scores,packed_q,key,64,rows,count,qk_scratch));
+                for(int row=0;row<rows;++row) {
+                    const size_t vl=count;
+                    const auto low=__riscv_vle32_v_f32m2(low_scores+row*64,vl);
+                    const auto high=__riscv_vle32_v_f32m2(scores+size_t(row)*n+ic,vl);
+                    __riscv_vse32_v_f32m2(scores+size_t(row)*n+ic,
+                        __riscv_vfmacc_vf_f32m2(high,1.f/1024.f,low,vl),vl);
+                }
             }
         }
         if constexpr(PROFILE)phase.tick(5);
@@ -222,6 +240,7 @@ static bool forward_ocr_serial_p2_v3(ggml::spacemit::context &ctx,ggml_tensor *d
         }
         ir+=rows;
     }
+    if(report_pair_qk)ocr_fa_serial_p2_v3::pair_qk_calls().fetch_add(paired_tiles,std::memory_order_relaxed);
     if constexpr(PROFILE)phase.finish();
     ocr_worker_events::publish(ocr_worker_events::kind::full_kv,
         {uint64_t(n),uint64_t(Q),uint64_t(2),uint64_t(0),needed,ctx.shared.size});

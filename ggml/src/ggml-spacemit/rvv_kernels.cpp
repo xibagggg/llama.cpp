@@ -74,6 +74,9 @@ void prepare_ocr_worker_state() {
     (void)ocr_fa_pack_v40::ime_qk(nullptr);
     (void)ocr_fa_pack_v40::ime_pv(nullptr);
     (void)ocr_fa_pack_v40::full_kv_mode();
+    (void)ocr_fa_serial_p2_v3::pair_qk_enabled();
+    (void)ocr_fa_serial_p2_v3::pair_qk_report_enabled();
+    (void)ocr_fa_serial_p2_v3::pair_qk_calls();
     (void)ocr_fa_pack_v40::direct_v44();
     (void)ocr_fa_pack_v40::lazy_init();
     (void)ocr_fa_fullkv::trust_bounds_enabled();
@@ -101,6 +104,10 @@ void prepare_ocr_worker_state() {
 }
 
 void drain_ocr_worker_events() {
+    if(ocr_fa_serial_p2_v3::pair_qk_report_enabled()) {
+        const auto calls=ocr_fa_serial_p2_v3::pair_qk_calls().exchange(0,std::memory_order_relaxed);
+        if(calls)GGML_LOG_INFO("ocr-fa-serial-v3-a1: paired_tiles=%llu\n",static_cast<unsigned long long>(calls));
+    }
     if (!paddle_gqa8_exact_reported && paddle_gqa8_exact_calls.load(std::memory_order_relaxed)) {
         GGML_LOG_INFO("paddle-fa-gqa8-exact: active D128 GQA8 Q5..63 workers=6 pinned_TCM=%zu bytes\n",
                       PADDLE_GQA8_EXACT_TCM);
