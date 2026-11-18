@@ -132,7 +132,8 @@ int main(int argc,char ** argv) {
     }
     ggml_backend_tensor_set(w,packed.data(),0,packed.size());
     std::vector<float> bf(size_t(s.n));fill(bf,971u+source_case,.00013f);
-    ggml_backend_tensor_set(bias,bf.data(),0,bf.size()*4);
+    // Detached no-bias constant has no graph allocation.
+    if(bias_mode)ggml_backend_tensor_set(bias,bf.data(),0,bf.size()*4);
     std::vector<float> residual_values(size_t(s.n*s.m));fill(residual_values,477u,.0003f);
     ggml_backend_tensor_set(residual,residual_values.data(),0,residual_values.size()*4);
     ggml_backend_tensor_set(x,xf.data(),0,xf.size()*4);
@@ -167,8 +168,10 @@ int main(int argc,char ** argv) {
     const bool restored=std::memcmp(reference.data(),out.data(),out.size()*4)==0;
     ggml_backend_tensor_get(x,changed.data(),0,changed.size()*4);
     bool immutable=std::memcmp(xf.data(),changed.data(),xf.size()*4)==0;
-    std::vector<float> bc(bf.size());ggml_backend_tensor_get(bias,bc.data(),0,bc.size()*4);
-    immutable&=!std::memcmp(bf.data(),bc.data(),bf.size()*4);
+    if(bias_mode){
+        std::vector<float> bc(bf.size());ggml_backend_tensor_get(bias,bc.data(),0,bc.size()*4);
+        immutable&=!std::memcmp(bf.data(),bc.data(),bf.size()*4);
+    }
     std::vector<float> rc(residual_values.size());ggml_backend_tensor_get(residual,rc.data(),0,rc.size()*4);
     immutable&=!std::memcmp(rc.data(),residual_values.data(),rc.size()*4);
     if(!write(prefix+".f32",reference.data(),reference.size()*4))return 13;
