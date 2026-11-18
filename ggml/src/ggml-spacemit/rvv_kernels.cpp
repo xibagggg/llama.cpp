@@ -1702,6 +1702,8 @@ void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(ggml::spacemit::co
     }
 }
 
+#include "ocr-fa-serial-p2-v3-query.h"
+
 template<bool PROFILE>
 static void prepare_ocr_fa_kv_v50_impl(ggml::spacemit::context &ctx,ggml_tensor *op){
     if(!ocr_fa_pack_v40::eligible(op))return;
@@ -1735,15 +1737,46 @@ static void prepare_ocr_fa_kv_v50_impl(ggml::spacemit::context &ctx,ggml_tensor 
             iv[96*72]=valid?(_Float16)1:(_Float16)0;
         }
     }
-    if(ocr_fa_pack_v40::full_kv(op))for(int head=ctx.ith;head<16;head+=ctx.nth){
+    const bool serial_v3=ocr_fa_pack_v40::serial_v3(op);
+    if(ocr_fa_pack_v40::full_kv(op)||serial_v3)for(int head=ctx.ith;head<16;head+=ctx.nth){
         const int n=int(v->ne[1]),padded=int(ocr_fa_pack_v40::full_k(op));
         auto * dst=ocr_fa_pack_v40::full_value_head(ctx,op,head);
         const auto * src=reinterpret_cast<const _Float16*>(reinterpret_cast<const char*>(v->data)+head*v->nb[2]);
         const bool valid=ocr_fa_fullkv::pack_v(src,v->nb[1],n,padded,dst);
         dst[96*padded]=valid?(_Float16)1:(_Float16)0;
     }
-    if constexpr(PROFILE)phase.tick(0); // shared K/V pack and tail initialization
+    if(serial_v3){
+        // Validate every query before any worker may write serial output. Keep
+        // the original scaled-F16 guard, additionally bound the low half, and
+        // conservatively leave non-RNE or non-six-worker execution unchanged.
+        float scale;std::memcpy(&scale,op->op_params,sizeof(scale));
+        const auto *q=op->src[0];const int n=int(q->ne[1]);
+        bool valid=ctx.nth==6&&ctx.shared.data&&ctx.shared.size>=ocr_fa_serial_p2_v3::bytes(n)&&
+            ocr_serial_v3_frm()==0&&std::isfinite(scale);
+        for(int row=int(ctx.ith);valid&&row<n*16;row+=int(ctx.nth)){
+            const auto *src=static_cast<const char*>(q->data)+(row/n)*q->nb[2]+(row%n)*q->nb[1];
+            valid=ocr_serial_v3_query<false,false>(src,q->nb[1],1,8,scale,nullptr);
+        }
+        auto *lane=ocr_fa_pack_v40::serial_v3_lane(ctx,op,ctx.ith);
+        lane[0]=valid?1:0;lane[1]=0;
+    }
+    if constexpr(PROFILE)phase.tick(0); // shared K/V pack, tail initialization, complete Q precheck
     GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+    if(serial_v3){
+        // Read only immutable pre-barrier Q bits and K/V markers. Each worker
+        // publishes its own ready bit; no worker reads another ready bit, so
+        // this adds neither a race nor a second collective barrier.
+        bool ready=true;
+        for(size_t lane=0;lane<ctx.nth;++lane)
+            ready=ready&&ocr_fa_pack_v40::serial_v3_lane(ctx,op,lane)[0]==1;
+        const int padded=int(ocr_fa_pack_v40::full_k(op));
+        for(int head=0;ready&&head<16;++head){
+            ready=ocr_fa_pack_v40::full_value_head(ctx,op,head)[96*padded]!=(_Float16)0;
+            for(int tile=0;ready&&tile<nt;++tile)
+                ready=ocr_fa_pack_v40::ime_key_tile(ctx,op,size_t(head)*nt+tile)[D*KV]!=(_Float16)0;
+        }
+        ocr_fa_pack_v40::serial_v3_lane(ctx,op,ctx.ith)[1]=ready?1:0;
+    }
     if constexpr(PROFILE){phase.tick(1);phase.finish();}
     if(ctx.ith==0)ocr_worker_events::publish(ocr_worker_events::kind::pack,
         {uint64_t(k->ne[1]),ocr_fa_pack_v40::work_bytes(ctx.nth,op)});
@@ -1901,6 +1934,8 @@ static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int ca
     return true;
 }
 
+#include "ocr-fa-serial-p2-v3.h"
+
 template<bool PROFILE>
 static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,int ir0,int ir1){
     if(!ocr_fa_pack_v40::full_kv(dst)||!ctx.shared.data)return false;
@@ -2042,7 +2077,10 @@ static void forward_flash_attn_v50_impl(ggml::spacemit::context & ctx,
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
                                                     int                       ir1) {
-    if constexpr(IME)if(forward_ocr_full_kv<PROFILE>(ctx,dst,ir0,ir1))return;
+    if constexpr(IME){
+        if(forward_ocr_serial_p2_v3<PROFILE>(ctx,dst,ir0,ir1))return;
+        if(forward_ocr_full_kv<PROFILE>(ctx,dst,ir0,ir1))return;
+    }
     ocr_fa_phases_v50::record phase(ctx,dst,"compute");
     if constexpr(PROFILE)phase.begin();
     const ggml_tensor * q     = dst->src[0];

@@ -1,6 +1,8 @@
 #pragma once
 #include "ggml.h"
 #include "spacemit-context.h"
+#include "ocr-fa-serial-p2-v3-plan.h"
+#include <cstdint>
 #include "../ggml-cpu/common.h"
 #include <cstdlib>
 #include <cstring>
@@ -44,13 +46,30 @@ inline bool full_kv(const ggml_tensor *op){
  float p[3];std::memcpy(p,op->op_params,sizeof(p));
  return p[1]==0.f&&p[2]==0.f&&op->src[0]->ne[1]<=1120;
 }
+// This structural predicate may run before input data exists. It never reads
+// tensor contents and never changes the original full_kv()/ime_pv() decisions.
+inline bool serial_v3(const ggml_tensor *op){
+ if(!eligible(op)||!ime_qk(op)||op->src[3]||op->src[4]||op->src[0]->nb[0]!=sizeof(float))return false;
+ float p[3];std::memcpy(p,op->op_params,sizeof(p));
+ return p[1]==0.f&&p[2]==0.f&&ocr_fa_serial_p2_v3::eligible(int(op->src[0]->ne[1]),full_kv_mode());
+}
 inline size_t full_k(const ggml_tensor *op){return (size_t(op->src[1]->ne[1])+7)/8*8;}
 inline bool ime_pv(const ggml_tensor *op){
  static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PV_IME2");return p&&(!std::strcmp(p,"1")||!std::strcmp(p,"2"));}();
  return on&&ime_qk(op)&&!full_kv(op);
 }
 inline size_t full_value_offset(const ggml_tensor *op){return (ime_qk(op)?3:2)*packed_elements(op)+(ime_qk(op)?tiles(op)*16*32:0)+(ime_pv(op)?tiles(op)*16*(96*72+32):0);}
-inline size_t work_bytes(int threads,const ggml_tensor *op){return scratch_offset(threads)+(full_value_offset(op)+(full_kv(op)?16*(96*full_k(op)+32):0))*sizeof(_Float16);}
+inline size_t serial_v3_meta_offset(int threads,const ggml_tensor *op){
+ const size_t end=scratch_offset(threads)+(full_value_offset(op)+16*(96*full_k(op)+32))*sizeof(_Float16);
+ return (end+127)/128*128;
+}
+inline size_t work_bytes(int threads,const ggml_tensor *op){
+ if(serial_v3(op))return serial_v3_meta_offset(threads,op)+size_t(threads)*ocr_fa_serial_p2_v3::lane_bytes;
+ return scratch_offset(threads)+(full_value_offset(op)+(full_kv(op)?16*(96*full_k(op)+32):0))*sizeof(_Float16);
+}
+inline uint32_t *serial_v3_lane(ggml::spacemit::context &ctx,const ggml_tensor *op,size_t lane){
+ return reinterpret_cast<uint32_t*>(static_cast<char*>(ctx.workspace)+serial_v3_meta_offset(ctx.nth,op)+lane*ocr_fa_serial_p2_v3::lane_bytes);
+}
 inline _Float16 *keys(ggml::spacemit::context &ctx){return reinterpret_cast<_Float16*>(static_cast<char*>(ctx.workspace)+scratch_offset(ctx.nth));}
 inline _Float16 *values(ggml::spacemit::context &ctx,const ggml_tensor *op){return keys(ctx)+packed_elements(op);}
 inline _Float16 *ime_key_tile(ggml::spacemit::context &ctx,const ggml_tensor*op,size_t tile){return keys(ctx)+2*packed_elements(op)+tile*(72*GGML_FA_TILE_KV+32);}
