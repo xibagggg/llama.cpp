@@ -1485,10 +1485,6 @@ private:
                 SRV_ERR("failed to load media backend: %s\n", e.what());
                 return false;
             }
-            if (std::getenv("OCR_STAGE_TIMING")) {
-                SRV_INF("OCR_METRIC kind=vision_model_init seconds=%.6f\n",
-                        (ggml_time_us() - ocr_vision_init_start) / 1e6);
-            }
             media = media_init.get();
             mctx = media != nullptr ? media->mtmd() : nullptr;
             if (media == nullptr) {
