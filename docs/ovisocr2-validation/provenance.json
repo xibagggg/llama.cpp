@@ -1,0 +1,45 @@
+{
+  "baseline": {
+    "sdk_head": "88da558ee2d2888f794148651640a36f8d46bbc7",
+    "engine_head": "7587d8a9ea36f3718ee698055337c80030306aef",
+    "sdk_binary_sha256": "d89959efbb8774255feaa59c1bf6fcab99e759a841c6b272795ddadac6c8424d",
+    "engine_binaries": {
+      "libggml-base.so.0.26.0": "ee55e13968e01841a546873011c7dd6b8878f8d4d09c655c87f54f08bc5065b2",
+      "libggml-spacemit.so.0.26.0": "e7720cdece81b7fbec5d3415f2bc13dc960a7b1301e4f7fd832b1bd6c9369ec6",
+      "libllama-common.so.0.6.0": "40a530e3ee1bbdfe9d24cc500872025efd6ff93280bb235bdd9a4c8caba794db",
+      "libmtmd.so.0.6.0": "918d303102226ef68b8b5fd23ea2c11dd1330ccd88b9ec55bd632b7092bb2542",
+      "libggml.so.0.26.0": "03fdf723ce107a59911358a13a29ff375eb74cde105a166beabb91604e4aceea",
+      "llama-server": "7530afaf815afbb5a620e9ad2bd5f1eea5d679a044cf5d0a72d20068eed0f560",
+      "libllama.so.0.6.0": "91f7134b95b3a0cc5ffec9bc63f708beda4800763a008500a5074667d4f71172",
+      "libggml-cpu.so.0.26.0": "0eb4986073eda4da8aace72413b38467871761f0ecc26f7df467db4181fdce14",
+      "libllama-server-impl.so": "93d954dc0113175d59fe75b45dd5b5ac87921f56785c4a57c602d3e3fd1f4786"
+    },
+    "sdk_cache_sha256": "40eb83e24f0f40e68ff0abb042463405d753cbc5fe00fb855723da397d165467",
+    "engine_cache_sha256": "089203da8b873ce9f370ec6903225d7cbd5cdb7f192a903f0e8182b92ee6cf87"
+  },
+  "merged": {
+    "sdk_head": "3a9795f59778700f05cd0c80be4b12a532231810",
+    "engine_head": "a59f4b616d404544ca72e0f39a633a8328a22353",
+    "sdk_binary_sha256": "008f018f58a1394550daae8a8def96ffd1f8a342fdce923cb5b25f7b59b0f915",
+    "engine_binaries": {
+      "libllama-fit-params-impl.so": "b9ce783a3afda66aea5335f95a1bed5e8b9f2ecf7ee1fd8feb45aa83bc7ea426",
+      "libggml-base.so.0.26.0": "b41c2fe6d203f1cbafb2bde3505f73945b9ffc6d0cf660cd504ac86ed8cfc2cf",
+      "libggml-spacemit.so.0.26.0": "92ccd2a84c1954c365218e05a3b85353e46407007cffd337e5d0a3cd56464461",
+      "libllama-common.so.0.6.0": "0afd5429bc400ea6812e234acb9c2403c1ba02d7b73e088f42664f087445a2f2",
+      "libllama-batched-bench-impl.so": "7c23f12b73ade75ebda7e0eb422f520e9ed0c9e8c379b5f94b63729d1a5c5efb",
+      "libllama-bench-impl.so": "ad3cea3fcc4443c67133fc465c359a7981829c5f3edb8eeac22d135b43d02a84",
+      "libmtmd.so.0.6.0": "74db336e1de2445d5e2bad99169b7048d0fdf0d06523c161ca03977e56f40fd5",
+      "libggml.so.0.26.0": "27c12b90f6ac991da983ad42ccafc7a487ef0c662477fa5feff52dc32593d7f1",
+      "libllama-quantize-impl.so": "127bd9b2ca3ed5aaccb50007056f44edd2f2454c57d01a58705a0a35a06ac353",
+      "libllama-cli-impl.so": "858d6a64b1d02194857446bc34a7da780e12202d8c2c9189e444a60bfb27a81c",
+      "libllama-perplexity-impl.so": "f045b3a0acf6895104b9a3f0272b4294f0bc567987ac10ea1d788a681d29962d",
+      "llama-server": "7ebe320112ad2534e369db30a5a1c50e6621c057d98d693ec4f5c191d518f1ff",
+      "libllama.so.0.6.0": "bee9dce97c445e9f3d5dc6c23cb91b6d9aaddbfc73427d9405c7fc210b1afe9a",
+      "libggml-cpu.so.0.26.0": "189ba374f41370f3e125b297af83e4cb5d164c499b9b8f09ed282c9b023c74f5",
+      "libllama-server-impl.so": "d624077c270ac313e708fc53f72375b8493d68bf46f82475fa467db4c41f9762",
+      "libllama-completion-impl.so": "fbc79b8128b667001616f99e5f58dea47be58e7d9525377ffb02f2063788e386"
+    },
+    "sdk_cache_sha256": "e26c6d314c1e4d9f1297a212d675e38a4eedf0e6843217bb711d739e64919b7d",
+    "engine_cache_sha256": "1f627f3a66d4a439eda3d551c82b9e27af8cf7aee747ecae8f0b0e9a0e9c0a77"
+  }
+}

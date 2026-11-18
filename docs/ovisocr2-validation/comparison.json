@@ -1,0 +1,272 @@
+{
+  "records": {
+    "merged-1": {
+      "process_e2e_s": 83.65868326596683,
+      "conversion_s": 77.902,
+      "decode_s": 48.470417,
+      "tpot_ms": 30.735838300570705,
+      "server_prompt_including_vision_s": 22.994325,
+      "startup_connection_s": 5.229,
+      "layout_s": 5.697007
+    },
+    "baseline-1": {
+      "process_e2e_s": 84.96846121596172,
+      "conversion_s": 77.676,
+      "decode_s": 48.417744,
+      "tpot_ms": 30.70243753963221,
+      "server_prompt_including_vision_s": 22.85608,
+      "startup_connection_s": 6.637,
+      "layout_s": 5.675492
+    },
+    "merged-2": {
+      "process_e2e_s": 85.3375166580081,
+      "conversion_s": 79.538,
+      "decode_s": 50.210551,
+      "tpot_ms": 31.839284083703234,
+      "server_prompt_including_vision_s": 22.970575,
+      "startup_connection_s": 5.233,
+      "layout_s": 5.614718
+    },
+    "baseline-2": {
+      "process_e2e_s": 83.6014366929885,
+      "conversion_s": 77.211,
+      "decode_s": 48.312311,
+      "tpot_ms": 30.63558084971465,
+      "server_prompt_including_vision_s": 22.549294,
+      "startup_connection_s": 5.838,
+      "layout_s": 5.623948
+    }
+  },
+  "means": {
+    "baseline": {
+      "process_e2e_s": 84.28494895447511,
+      "conversion_s": 77.4435,
+      "decode_s": 48.3650275,
+      "tpot_ms": 30.66900919467343,
+      "server_prompt_including_vision_s": 22.702686999999997,
+      "startup_connection_s": 6.2375,
+      "layout_s": 5.64972
+    },
+    "merged": {
+      "process_e2e_s": 84.49809996198746,
+      "conversion_s": 78.72,
+      "decode_s": 49.340484000000004,
+      "tpot_ms": 31.28756119213697,
+      "server_prompt_including_vision_s": 22.98245,
+      "startup_connection_s": 5.231,
+      "layout_s": 5.6558625
+    }
+  },
+  "nine_metrics": {
+    "baseline": {
+      "prefill_model_load": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "decode_model_load": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "vision_model_load": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "ttft": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "vision": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "prefill": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "decode": {
+        "value": 48.3650275,
+        "unit": "s",
+        "scope": "decode_s",
+        "aggregation": "mean of two full-page runs",
+        "source": "native request timings / subprocess monotonic wall",
+        "status": "measured",
+        "sample_count": 2
+      },
+      "tpot": {
+        "value": 30.66900919467343,
+        "unit": "ms/token",
+        "scope": "tpot_ms",
+        "aggregation": "mean of two full-page runs",
+        "source": "native request timings / subprocess monotonic wall",
+        "status": "measured",
+        "sample_count": 2
+      },
+      "e2e": {
+        "value": 84.28494895447511,
+        "unit": "s",
+        "scope": "process_e2e_s",
+        "aggregation": "mean of two full-page runs",
+        "source": "native request timings / subprocess monotonic wall",
+        "status": "measured",
+        "sample_count": 2
+      }
+    },
+    "merged": {
+      "prefill_model_load": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "decode_model_load": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "vision_model_load": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "ttft": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "vision": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "prefill": {
+        "value": null,
+        "unit": "s",
+        "scope": "unavailable from current native instrumentation",
+        "status": "missing"
+      },
+      "decode": {
+        "value": 49.340484000000004,
+        "unit": "s",
+        "scope": "decode_s",
+        "aggregation": "mean of two full-page runs",
+        "source": "native request timings / subprocess monotonic wall",
+        "status": "measured",
+        "sample_count": 2
+      },
+      "tpot": {
+        "value": 31.28756119213697,
+        "unit": "ms/token",
+        "scope": "tpot_ms",
+        "aggregation": "mean of two full-page runs",
+        "source": "native request timings / subprocess monotonic wall",
+        "status": "measured",
+        "sample_count": 2
+      },
+      "e2e": {
+        "value": 84.49809996198746,
+        "unit": "s",
+        "scope": "process_e2e_s",
+        "aggregation": "mean of two full-page runs",
+        "source": "native request timings / subprocess monotonic wall",
+        "status": "measured",
+        "sample_count": 2
+      }
+    }
+  },
+  "quality": {
+    "merged-1": {
+      "markdown_byte_identical": true,
+      "retained_images_identical": true,
+      "requests": 24,
+      "failed": 0,
+      "truncated": 0,
+      "tokens": 1601,
+      "steps": 1577,
+      "td": 72,
+      "tr": 15,
+      "markdown_sha256": "25cef5fac2b83a86bcdca2a71ff7c8e4b05831658a58f801568de33c0ce81512",
+      "images": {
+        "image/native-p1_011_img_in_image_box_139_519_512_920.png": "367061bc4f82cccbdca147f228ceadbfad8b2f7ef0ff54544668adb740e461f0"
+      }
+    },
+    "baseline-1": {
+      "markdown_byte_identical": true,
+      "retained_images_identical": true,
+      "requests": 24,
+      "failed": 0,
+      "truncated": 0,
+      "tokens": 1601,
+      "steps": 1577,
+      "td": 72,
+      "tr": 15,
+      "markdown_sha256": "25cef5fac2b83a86bcdca2a71ff7c8e4b05831658a58f801568de33c0ce81512",
+      "images": {
+        "image/native-p1_011_img_in_image_box_139_519_512_920.png": "367061bc4f82cccbdca147f228ceadbfad8b2f7ef0ff54544668adb740e461f0"
+      }
+    },
+    "merged-2": {
+      "markdown_byte_identical": true,
+      "retained_images_identical": true,
+      "requests": 24,
+      "failed": 0,
+      "truncated": 0,
+      "tokens": 1601,
+      "steps": 1577,
+      "td": 72,
+      "tr": 15,
+      "markdown_sha256": "25cef5fac2b83a86bcdca2a71ff7c8e4b05831658a58f801568de33c0ce81512",
+      "images": {
+        "image/native-p1_011_img_in_image_box_139_519_512_920.png": "367061bc4f82cccbdca147f228ceadbfad8b2f7ef0ff54544668adb740e461f0"
+      }
+    },
+    "baseline-2": {
+      "markdown_byte_identical": true,
+      "retained_images_identical": true,
+      "requests": 24,
+      "failed": 0,
+      "truncated": 0,
+      "tokens": 1601,
+      "steps": 1577,
+      "td": 72,
+      "tr": 15,
+      "markdown_sha256": "25cef5fac2b83a86bcdca2a71ff7c8e4b05831658a58f801568de33c0ce81512",
+      "images": {
+        "image/native-p1_011_img_in_image_box_139_519_512_920.png": "367061bc4f82cccbdca147f228ceadbfad8b2f7ef0ff54544668adb740e461f0"
+      }
+    }
+  },
+  "screenshot_reference": {
+    "e2e_s": 78.74,
+    "decode_s": 52.307,
+    "tpot_ms": 33.168,
+    "comparison": "Historical timing boundaries/instrumentation not independently available; no direct equivalence claim."
+  },
+  "versions": {
+    "sdk_baseline": "88da558ee2d2888f794148651640a36f8d46bbc7",
+    "engine_baseline": "7587d8a9ea36f3718ee698055337c80030306aef",
+    "sdk_merged": "3a9795f59778700f05cd0c80be4b12a532231810",
+    "engine_merged": "a59f4b616d404544ca72e0f39a633a8328a22353"
+  },
+  "model_hashes": {
+    "mmproj-ovisocr2-image-q4_0.gguf": "e50001db51a40f74839256bac0b91f0f1b2797dc563dd2a5513c8c5f940571d0",
+    "ovisocr2-text-q4_0.gguf": "1be7c96613d0454a7ebea4cb00cdf40fada196aa4f5a09ccb193dd5c65b4cdbb"
+  },
+  "input_sha256": "c46b353f54fb0ef7b95673c31e6e60173566fa4c5621200701454df10b3aac96",
+  "layout_sha256": "5241af9785736a120c0cd03b798a98863728e9c586ece169bbefd48b4b6c1cca"
+}

@@ -1,0 +1,41 @@
+{
+  "backend": "ovisocr2",
+  "characters": 2790,
+  "complete": true,
+  "convert_s": 77.02258,
+  "ctc_used": false,
+  "elapsed_ms": 77211,
+  "inference": {
+    "counts": {
+      "blocks": 29,
+      "failed": 0,
+      "failed_blocks": 0,
+      "ok": 1,
+      "pages_with_failed_blocks": 0,
+      "planned": 1,
+      "vlm_blocks": 24
+    },
+    "recognize_ignored_labels": false
+  },
+  "inference_transport": "llama-server-http",
+  "layout": {
+    "provider": "spacemit",
+    "threads": 6
+  },
+  "load_ms": 5838,
+  "load_ms_scope": "server_connection_and_optional_startup",
+  "model_name": "ovisocr2",
+  "pages": 1,
+  "phases": {
+    "layout_s": 5.623948,
+    "vlm_s": 71.394029
+  },
+  "pipeline": "ovisocr2-shared-document",
+  "provider": "llama-server",
+  "request_metrics_path": "runtime/ovisocr2_requests.json",
+  "server_url": "http://127.0.0.1:18583",
+  "text_load_ms": null,
+  "text_provider": "llama-server",
+  "version": "0.1.0",
+  "vision_load_ms": null
+}

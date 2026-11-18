@@ -1,0 +1,19 @@
+[
+  "taskset",
+  "-c",
+  "0-5",
+  "/home/bianbu/ocr-merged/baseline-ovisocr2/model-zoo-ocr/build-baseline/ocr_file_demo",
+  "/home/bianbu/ocr-merged/model-zoo-ocr/data/pages/native-p1.png",
+  "-o",
+  "/home/bianbu/ocr-merged/evidence/ovisocr2-validation/baseline-2",
+  "--preset",
+  "ovisocr2-k3",
+  "--threads",
+  "6",
+  "--launch",
+  "/home/bianbu/ocr-merged/evidence/ovisocr2-validation/baseline-2-profile.json",
+  "--param",
+  "model_dir=/home/bianbu/.cache/model/ocr/ovisocr2",
+  "--param",
+  "layout_model=/home/bianbu/.cache/model/ocr/paddleocr_vl/PP-DocLayoutV3.f16.ep.onnx"
+]
