@@ -2130,6 +2130,12 @@ bool ggml_spacemit_can_fuse_pc8_pad(const ggml_tensor * op) {
     return ocr_q4_pc8::pad_supported(op)&&op->src[0]->extra==&ocr_q4_pc8::impl;
 }
 
+bool ggml_spacemit_can_fuse_paddle_f16_gelu_pack(int workers,const ggml_tensor * op,
+    const ggml_tensor * gelu,const ggml_tensor * dst,const ggml_tensor * bias) {
+    return op&&op->src[0]&&op->src[0]->extra==&paddle_f16_ime2::impl&&
+           paddle_f16_ime2::gelu_pack_storage_safe(workers,op,gelu,dst,bias);
+}
+
 bool ggml_spacemit_can_fuse_paddle_f16_bias(const ggml_tensor * op, const ggml_tensor * add) {
     return op && op->src[0] && op->src[0]->extra == &paddle_f16_ime2::impl &&
            paddle_f16_ime2::bias_supported(op, add) &&
@@ -2170,6 +2176,7 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
         case SPACEMIT_OP_PC8_PAD_MUL_MAT:
         case SPACEMIT_OP_PC8_MUL_MAT_BIAS:
         case SPACEMIT_OP_PADDLE_F16_BIAS:
+        case SPACEMIT_OP_PADDLE_F16_GELU_PACK:
         case SPACEMIT_OP_IM2COL_MUL_MAT: {
             const auto * traits=ggml_spacemit_get_tensor_traits(node.node);
             return traits&&traits->compute_forward_fused(ctx,node);

@@ -502,7 +502,7 @@ static int gdn_inplace_mark(const ggml_cgraph * graph, std::vector<spacemit_opno
             for (int w = 0; w < 3; ++w) {
                 if (on.node == want[w]) {
                     if (on.opcode != SPACEMIT_OP_INVALID || !on.fused.empty() || !on.extra_dsts.empty() ||
-                        on.packed_im2col != nullptr || on.elided_pad != nullptr ||
+                        on.packed_im2col != nullptr || on.elided_pad != nullptr || on.elided_gelu != nullptr ||
                         on.prepared_attention != nullptr) {
                         ok = false;
                     }
@@ -670,8 +670,40 @@ static bool ssm_conv_concat_inputs_intact(const ggml_cgraph * graph, int ci, int
     return true;
 }
 
+struct paddle_f16_gelu_pack_plan {
+    int matrix=-1,bias=-1;
+    explicit operator bool()const{return matrix>=0;}
+};
+static paddle_f16_gelu_pack_plan plan_paddle_f16_gelu_pack(
+    const ggml_cgraph *graph,int gi,int workers) {
+    paddle_f16_gelu_pack_plan result;
+    if(gi<0||gi>=graph->n_nodes||workers!=6)return result;
+    auto *gelu=graph->nodes[gi];
+    // Do not move a consumer across VIEW/RESHAPE or another compute. NONE
+    // sentinels alone are harmless; original gallocr allocations are retained.
+    int mi=gi+1;
+    while(mi<graph->n_nodes&&graph->nodes[mi]->op==GGML_OP_NONE)++mi;
+    if(mi==graph->n_nodes)return result;
+    auto *matrix=graph->nodes[mi];
+    if(!ggml_spacemit_can_fuse_paddle_f16_gelu_pack(workers,matrix,gelu,matrix,nullptr))return result;
+    const int ids[2]={gi,mi};const ggml_op ops[2]={GGML_OP_UNARY,GGML_OP_MUL_MAT};
+    if(!ggml_can_fuse_subgraph_ext(graph,ids,2,ops,&mi,1))return result;
+    result.matrix=mi;
+    int bi=mi+1;
+    while(bi<graph->n_nodes&&graph->nodes[bi]->op==GGML_OP_NONE)++bi;
+    if(paddle_f16_bias_fusion_enabled()&&bi<graph->n_nodes&&
+       ggml_spacemit_can_fuse_paddle_f16_bias(matrix,graph->nodes[bi])&&
+       ggml_spacemit_can_fuse_paddle_f16_gelu_pack(workers,matrix,gelu,
+           graph->nodes[bi],graph->nodes[bi]->src[1])) {
+        const int all[3]={gi,mi,bi};
+        const ggml_op allops[3]={GGML_OP_UNARY,GGML_OP_MUL_MAT,GGML_OP_ADD};
+        if(ggml_can_fuse_subgraph_ext(graph,all,3,allops,&bi,1))result.bias=bi;
+    }
+    return result;
+}
+
 static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
-                          std::unordered_set<ggml_tensor *> & emitted) {
+                          std::unordered_set<ggml_tensor *> & emitted,int workers) {
     ggml_tensor * n = graph->nodes[i];
 
     if (const auto plan = ocr_cast_kv_pack::match(graph,i)) {
@@ -733,6 +765,15 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
     }
     ggml_tensor * next_node = (next_idx >= 0) ? graph->nodes[next_idx] : nullptr;
 
+    // Execute at the original producer position. All A8 groups are packed
+    // before the original all-worker barrier and any down output store.
+    if(const auto plan=plan_paddle_f16_gelu_pack(graph,i,workers)) {
+        spacemit_opnode fused(graph->nodes[plan.matrix],{},SPACEMIT_OP_PADDLE_F16_GELU_PACK);
+        fused.elided_gelu=n;
+        if(plan.bias>=0)fused.add_fused(graph->nodes[plan.bias]);
+        nodes.push_back(std::move(fused));i=plan.bias>=0?plan.bias:plan.matrix;return true;
+    }
+
     // Keep full-K high/residual arithmetic and add row bias only at writeback.
     // The helper requires the physical Paddle trait and safe constant storage;
     // shape alone never admits an ordinary F16 matrix to this fused path.
@@ -744,7 +785,8 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
             for(int j=next_idx+1;j<graph->n_nodes;++j) {
                 if(op_is_compute(graph->nodes[j])){gelu_idx=j;break;}
             }
-            if(gelu_idx>=0&&ggml_spacemit_can_fuse_paddle_f16_bias_gelu(n,next_node,graph->nodes[gelu_idx])) {
+            if(gelu_idx>=0&&!plan_paddle_f16_gelu_pack(graph,gelu_idx,workers)&&
+               ggml_spacemit_can_fuse_paddle_f16_bias_gelu(n,next_node,graph->nodes[gelu_idx])) {
                 const int all_idxs[3]={i,next_idx,gelu_idx};
                 const enum ggml_op all_ops[3]={GGML_OP_MUL_MAT,GGML_OP_ADD,GGML_OP_UNARY};
                 // Ordinary ownership/output/view guards protect both elided
@@ -863,7 +905,8 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         ggml_get_unary_op(next_node) == GGML_UNARY_OP_GELU) {
         const int          idxs[2] = { i, next_idx };
         const enum ggml_op ops[2]  = { GGML_OP_ADD, GGML_OP_UNARY };
-        if (ggml_can_fuse_ext(graph, idxs, ops, 2) && add_gelu_fusable(n, next_node)) {
+        if (!plan_paddle_f16_gelu_pack(graph,next_idx,workers)&&
+            ggml_can_fuse_ext(graph, idxs, ops, 2) && add_gelu_fusable(n, next_node)) {
             spacemit_opnode node(n, {}, SPACEMIT_OP_ADD_GELU);
             node.add_fused(next_node);
             nodes.push_back(std::move(node));
@@ -1194,7 +1237,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             }
             // On a match, try_fuse_node pushes the fused opnodes and advances i past
             // the nodes it consumed; otherwise the node is appended as a single op.
-            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted)) {
+            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted,sess->num_cores)) {
                 continue;
             }
             sess->cached_graph.nodes.emplace_back(n);
@@ -1207,6 +1250,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         int n_matmul_add = 0;
         int n_paddle_f16_bias = 0;
         int n_paddle_f16_bias_gelu = 0;
+        int n_paddle_f16_gelu_pack = 0;
         int n_im2col_pack = 0;
         int n_norm_affine = 0;
         int n_residual_norm_affine = 0;
@@ -1222,6 +1266,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             n_gdn_seen += node.node->op == GGML_OP_GATED_DELTA_NET;
             n_matmul_add += node.opcode == SPACEMIT_OP_MUL_MAT_ADD;
             n_paddle_f16_bias += node.opcode == SPACEMIT_OP_PADDLE_F16_BIAS;
+            n_paddle_f16_gelu_pack += node.opcode == SPACEMIT_OP_PADDLE_F16_GELU_PACK;
             n_paddle_f16_bias_gelu += node.opcode == SPACEMIT_OP_PADDLE_F16_BIAS && node.fused.size()==2;
             n_im2col_pack += node.opcode == SPACEMIT_OP_IM2COL_MUL_MAT;
             n_norm_affine += node.opcode == SPACEMIT_OP_NORM_AFFINE;
@@ -1248,6 +1293,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             GGML_LOG_INFO("ggml-spacemit: Q4_0 MUL_MAT+BIAS fused=%d graph=%llu\n", n_matmul_add,
                           (unsigned long long) graph->uid);
         }
+        const char *gelu_pack_trace=getenv("GGML_SPACEMIT_PADDLE_F16_GELU_PACK_TRACE");
+        if(gelu_pack_trace&&!strcmp(gelu_pack_trace,"1"))
+            GGML_LOG_INFO("ggml-spacemit: PADDLE_F16 GELU+PACK fused=%d graph=%llu\n",
+                          n_paddle_f16_gelu_pack,(unsigned long long)graph->uid);
         const char * paddle_f16_bias_trace = getenv("GGML_SPACEMIT_PADDLE_F16_BIAS_TRACE");
         if (paddle_f16_bias_trace && strcmp(paddle_f16_bias_trace, "1") == 0) {
             GGML_LOG_INFO("ggml-spacemit: PADDLE_F16 GEMM+BIAS fused=%d graph=%llu\n",

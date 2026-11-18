@@ -9,6 +9,7 @@
 #include "rvv_kernels.h"
 #include "paddle-f16-kblock-plan.h"
 #include "paddle-f16-phases.h"
+#include "paddle-f16-gelu-pack-policy.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -405,6 +406,50 @@ inline bool bias_storage_safe(const ggml_tensor *op,const ggml_tensor *add,
     return !byte_ranges_overlap(dst->data,ggml_nbytes(dst),add->src[1]->data,ggml_nbytes(add->src[1]))&&
         !byte_ranges_overlap(dst->data,ggml_nbytes(dst),op->src[0]->data,nbytes(op->src[0]));
 }
+// Keep the producer at its original graph position. The graph matcher checks
+// ownership/output/view rules and rejects any intervening non-NONE node.
+inline bool gelu_pack_supported(int workers,const ggml_tensor *op,const ggml_tensor *gelu) {
+    if(!supported(op)||!gelu||op->src[1]!=gelu||gelu->op!=GGML_OP_UNARY||
+       ggml_get_unary_op(gelu)!=GGML_UNARY_OP_GELU||!gelu->src[0]||
+       gelu->view_src||gelu->src[0]->view_src||op->view_src||
+       gelu->type!=GGML_TYPE_F32||gelu->src[0]->type!=GGML_TYPE_F32||
+       !ggml_is_contiguous(gelu)||!ggml_is_contiguous(gelu->src[0])||
+       !ggml_are_same_shape(gelu,gelu->src[0])||!gelu->src[0]->data||
+       !op->data||!op->src[0]->data||
+       std::strncmp(op->src[0]->name,"v.blk.",6)||
+       !std::strstr(op->src[0]->name,"ffn_down.weight"))return false;
+    static const auto info=spert::backend_info(); // host plan initializes before worker dispatch
+    return paddle_f16_gelu_pack::eligible(workers,info.vlen,op->src[0]->ne[0],op->ne[0],
+               op->ne[1],info.shared_mem_size,wide_activation_pack());
+}
+inline bool gelu_pack_storage_safe(int workers,const ggml_tensor *op,const ggml_tensor *gelu,
+                                   const ggml_tensor *dst,const ggml_tensor *bias) {
+    if(!gelu_pack_supported(workers,op,gelu)||!dst||!dst->data||
+       dst->view_src||dst->type!=GGML_TYPE_F32||!ggml_is_contiguous(dst)||
+       !ggml_are_same_shape(dst,op)||(bias&&!bias->data))return false;
+    // Full A8 packing and its all-worker barrier finish before any GEMM output.
+    // Destination/input alias is therefore permitted; live model and bias are not.
+    return paddle_f16_gelu_pack::storage_eligible(gelu->src[0]->data,ggml_nbytes(gelu->src[0]),
+        dst->data,ggml_nbytes(dst),op->src[0]->data,nbytes(op->src[0]),
+        bias?bias->data:nullptr,bias?ggml_nbytes(bias):0);
+}
+inline void pack_gelu_group(const float *input,float *scratch,_Float16 *high,_Float16 *low,
+                            float *scale_out,int rows,int K) {
+    // The exact existing RVV GELU formula is evaluated once per element.
+    // This buffer is reused only after the complete K of all real A8 rows.
+    std::memcpy(scratch,input,size_t(rows)*K*sizeof(float));
+    spacemit_kernels::rvv::forward_gelu_f32_tile(scratch,size_t(rows)*K);
+    auto vmax=__riscv_vfmv_v_f_f32m2(0,64);
+    for(int r=0;r<rows;++r)for(int k=0;k<K;k+=64) {
+        const size_t vl=std::min(64,K-k);
+        const auto a=__riscv_vfabs_v_f32m2(__riscv_vle32_v_f32m2(scratch+size_t(r)*K+k,vl),vl);
+        vmax=__riscv_vfmax_vv_f32m2_tu(vmax,vmax,a,vl);
+    }
+    const float maximum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m2_f32m1(
+        vmax,__riscv_vfmv_v_f_f32m1(0,1),64));
+    const float scale=scale_for(maximum);*scale_out=scale;
+    pack_activation64(scratch,high,low,scale,0,rows,K);
+}
 inline bool bias_gelu_supported(const ggml_tensor *op,const ggml_tensor *add,const ggml_tensor *gelu) {
     return bias_supported(op,add)&&gelu&&gelu->op==GGML_OP_UNARY&&
         ggml_get_unary_op(gelu)==GGML_UNARY_OP_GELU&&gelu->src[0]==add&&
@@ -501,6 +546,16 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         return compute(ctx,op,op,nullptr,false);
     }
     bool compute_forward_fused(ggml::spacemit::context &ctx,const spacemit_opnode &node)const override {
+        if(node.opcode==SPACEMIT_OP_PADDLE_F16_GELU_PACK) {
+            if(!node.elided_gelu||node.fused.size()>1||!node.extra_dsts.empty()||
+               node.packed_im2col||node.elided_pad||!node.node->src[0]||
+               node.node->src[0]->extra!=this)return false;
+            const auto *bias=node.fused.empty()?nullptr:node.fused[0]->src[1];
+            auto *dst=node.fused.empty()?node.node:node.fused[0];
+            GGML_ASSERT((node.fused.empty()||bias_storage_safe(node.node,node.fused[0]))&&
+                gelu_pack_storage_safe(int(ctx.nth),node.node,node.elided_gelu,dst,bias));
+            return compute(ctx,node.node,dst,bias,false,node.elided_gelu);
+        }
         if(node.opcode!=SPACEMIT_OP_PADDLE_F16_BIAS||
            (node.fused.size()!=1&&node.fused.size()!=2)||
            !node.extra_dsts.empty()||node.packed_im2col||node.elided_pad||
@@ -512,14 +567,15 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         return compute(ctx,node.node,dst,node.fused[0]->src[1],gelu);
     }
     bool compute(ggml::spacemit::context &ctx,ggml_tensor *op,ggml_tensor *dst,
-                 const ggml_tensor *bias,bool gelu)const {
-        return paddle_f16_phases::enabled()?compute_impl<true>(ctx,op,dst,bias,gelu):
-                                           compute_impl<false>(ctx,op,dst,bias,gelu);
+                 const ggml_tensor *bias,bool gelu,const ggml_tensor *input_gelu=nullptr)const {
+        return paddle_f16_phases::enabled()?compute_impl<true>(ctx,op,dst,bias,gelu,input_gelu):
+                                           compute_impl<false>(ctx,op,dst,bias,gelu,input_gelu);
     }
     template<bool PROFILE>
     bool compute_impl(ggml::spacemit::context &ctx,ggml_tensor *op,ggml_tensor *dst,
-                      const ggml_tensor *bias,bool gelu)const {
+                      const ggml_tensor *bias,bool gelu,const ggml_tensor *input_gelu)const {
         if(!supported(op))return false;
+        GGML_ASSERT(!input_gelu||ctx.nth==6);
         const bool copy64=tcm_copy64_enabled();
         paddle_f16_phases::record timer;
         if constexpr(PROFILE)timer.begin(ctx,op);
@@ -546,7 +602,26 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const uint32_t pack_rounding=cache?paddle_qkv_content_cache::rounding_mode():0;
         const auto *x=static_cast<const float*>(op->src[1]->data);
         const auto *bias_data=bias?static_cast<const float*>(bias->data):nullptr;
+        if(input_gelu) {
+            auto *guard=static_cast<unsigned char*>(ctx.shared.data);
+            std::memset(guard,0xa5,128);
+            std::memset(guard+128+size_t(8)*K*sizeof(float),0xa5,128);
+        }
         for(int g=int(ctx.ith);g<groups;g+=int(ctx.nth)) {
+            if(input_gelu) {
+                GGML_ASSERT(!cache&&ctx.shared.size>=paddle_f16_gelu_pack::scratch_bytes);
+                auto *scratch=reinterpret_cast<float*>(static_cast<char*>(ctx.shared.data)+128);
+                const auto *source=static_cast<const float*>(input_gelu->src[0]->data)+size_t(g)*8*K;
+                const int rows=std::min(8,M-g*8);
+                GGML_ASSERT(!byte_ranges_overlap(scratch,size_t(8)*K*4,
+                                input_gelu->src[0]->data,ggml_nbytes(input_gelu->src[0]))&&
+                            !byte_ranges_overlap(scratch,size_t(8)*K*4,ctx.workspace,ctx.workspace_size)&&
+                            !byte_ranges_overlap(scratch,size_t(8)*K*4,dst->data,ggml_nbytes(dst))&&
+                            !byte_ranges_overlap(scratch,size_t(8)*K*4,op->src[0]->data,nbytes(op->src[0]))&&
+                            (!bias||!byte_ranges_overlap(scratch,size_t(8)*K*4,bias->data,ggml_nbytes(bias))));
+                pack_gelu_group(source,scratch,px+size_t(g)*8*K,pl+size_t(g)*8*K,scales+g,rows,K);
+                continue;
+            }
             if(cache&&cache->hit(g,x,pack_rounding,ctx.ith))continue;
             auto vmax=__riscv_vfmv_v_f_f32m2(0,64);
             for(int r=0;r<8&&g*8+r<M;++r)for(int k=0;k<K;k+=64) {
@@ -577,6 +652,11 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 __riscv_vse16_v_f16m1(px+off,h,8);
             }
             if(cache)cache->publish(g,x,pack_rounding,ctx.ith);
+        }
+        if(input_gelu) {
+            const auto *guard=static_cast<const unsigned char*>(ctx.shared.data);
+            for(int b=0;b<128;++b)GGML_ASSERT(guard[b]==0xa5&&
+                guard[128+size_t(8)*K*sizeof(float)+b]==0xa5);
         }
         if constexpr(PROFILE)timer.tick(0);
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);
