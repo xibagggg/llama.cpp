@@ -718,6 +718,19 @@ ggml_tensor * clip_graph::build_ffn(
             cur = ggml_pad(ctx0, cur, 48, 0, 0, 0);
             cb(cur, "ffn_down_pad48", il);
         }
+        // Paddle uses the same K4304 FFN width, but requires an independent
+        // model/activation opt-in. Never pad before the biased GELU.
+        if (model.proj_type == PROJECTOR_TYPE_PADDLEOCR && il >= 0 &&
+            hparams.n_ff == 4304 && down->ne[0] == 4352 && cur->ne[0] == 4304) {
+            const char * enable = std::getenv("MTMD_PADDLE_PADDED_DOWN");
+            if (!enable || std::strcmp(enable, "1") != 0) {
+                throw std::runtime_error("Padded Paddle down model requires MTMD_PADDLE_PADDED_DOWN=1");
+            }
+            GGML_ASSERT(down->ne[1] == 1152 &&
+                        (down->type == GGML_TYPE_Q4_0 || down->type == GGML_TYPE_F16));
+            cur = ggml_pad(ctx0, cur, 48, 0, 0, 0);
+            cb(cur, "paddle_ffn_down_pad48", il);
+        }
         cur = build_mm(down, cur);
     }
 
