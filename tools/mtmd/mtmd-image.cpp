@@ -926,7 +926,8 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_mi
         inst.grid_size     = clip_image_size{0, 0};
         return inst;
     }
-    return mtmd_image_preprocessor_llava_uhd::get_slice_instructions(original_size);
+    auto inst = mtmd_image_preprocessor_llava_uhd::get_slice_instructions(original_size);
+    return inst;
 }
 
 //

@@ -1,8 +1,16 @@
 #include "models.h"
+#include "ggml-backend.h"
 
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -127,6 +135,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         const int64_t dspark_markov_rank = markov_meta->ne[0];
 
         dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
+        // Token-indexed lookup requires the original quantized row layout.
+        dspark_markov_w1->flags |= GGML_TENSOR_FLAG_NO_REPACK;
         dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
         dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
 
@@ -289,8 +299,158 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+
+// Experimental, default-off DSpark path. No runtime state is cached across
+// graph/model lifetimes. Validation and allocations happen on the host only.
+static bool dspark_compact_markov_eligible(const llm_graph_context & g,
+                                         const llama_model & model,
+                                         const ggml_tensor * base) {
+    const char * option = std::getenv("OCR_DSPARK_COMPACT_MARKOV");
+    if (!option || std::strcmp(option, "1") != 0 || !model.d2t ||
+        !model.dspark_markov_w1 || !model.dspark_markov_w2 ||
+        model.dflash_selector_hidden || g.ubatch.n_seqs_unq != 1 ||
+        !base || base->type != GGML_TYPE_F32 || !ggml_is_matrix(base) ||
+        !ggml_is_contiguous(base) || base->ne[0] <= 0 || base->ne[1] <= 0) {
+        return false;
+    }
+    const auto anchor = model.gguf_kv.find("dflash.sample_from_anchor");
+    if (anchor != model.gguf_kv.end() && anchor->second != "true") {
+        return false;
+    }
+    const auto block = model.gguf_kv.find("dflash.block_size");
+    if (block == model.gguf_kv.end() || base->ne[1] > std::stoi(block->second)) {
+        return false;
+    }
+    const ggml_tensor * ids = model.d2t;
+    const int64_t n_vocab = int64_t(model.vocab.n_tokens());
+    if (n_vocab <= 0 || n_vocab > INT32_MAX || base->ne[0] > n_vocab ||
+        ids->type != GGML_TYPE_I64 || ids->ne[0] != base->ne[0] ||
+        !ggml_is_vector(ids) || !ggml_is_contiguous(ids) ||
+        !ids->data || !ids->buffer || ids->op != GGML_OP_NONE ||
+        ggml_backend_buffer_get_usage(ids->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        model.dspark_markov_w2->ne[1] != base->ne[0]) {
+        return false;
+    }
+    // A graph tensor with actual storage must not alias immutable mapping IDs.
+    // Ordinary graph construction has no storage yet; GGML's CUSTOM result is
+    // a fresh non-inplace tensor and its normal allocator protects live inputs.
+    if (base->data) {
+        const uintptr_t b = reinterpret_cast<uintptr_t>(base->data);
+        const uintptr_t d = reinterpret_cast<uintptr_t>(ids->data);
+        const size_t bn = ggml_nbytes(base), dn = ggml_nbytes(ids);
+        if (bn > UINTPTR_MAX - b || dn > UINTPTR_MAX - d ||
+            !(b + bn <= d || d + dn <= b)) {
+            return false;
+        }
+    }
+    std::vector<int64_t> mapping(size_t(ids->ne[0]), int64_t(0));
+    std::vector<uint8_t> seen(size_t(n_vocab), uint8_t(0));
+    ggml_backend_tensor_get(ids, mapping.data(), 0, mapping.size() * sizeof(int64_t));
+    for (const int64_t target : mapping) {
+        if (target < 0 || target >= n_vocab || seen[size_t(target)]) {
+            return false;
+        }
+        seen[size_t(target)] = 1;
+    }
+    return true;
+}
+
+// Return the legacy full-vocabulary ARGMAX result without materializing it.
+// The host gate has proved an immutable, unique, in-range d2t mapping.
+static int32_t dspark_compact_argmax(const float * values, const int64_t * ids,
+                                   int64_t n_draft, int64_t n_vocab) {
+    float best = -INFINITY;
+    int32_t index = int32_t(n_vocab - 1); // includes unmapped -infinity rows
+    bool has_nan = false;
+    for (int64_t i = 0; i < n_draft; ++i) {
+        const float value = values[i];
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        if ((bits & 0x7fffffffU) > 0x7f800000U) {
+            has_nan = true;
+            break;
+        }
+        const int32_t target = int32_t(ids[i]);
+        if (value > best || (value == best && target > index)) {
+            best = value;
+            index = target;
+        }
+    }
+    if (!has_nan) {
+        return index;
+    }
+
+    // MAX-macro NaN behavior depends on ascending FULL target order. Emulate
+    // that exact scan on the same AI worker, with only 1 KiB of stack scratch.
+    float chunk[256];
+    best = -INFINITY;
+    index = 0;
+    for (int64_t begin = 0; begin < n_vocab; begin += 256) {
+        const int64_t count = std::min<int64_t>(256, n_vocab - begin);
+        for (int64_t j = 0; j < count; ++j) {
+            chunk[j] = -INFINITY;
+        }
+        for (int64_t i = 0; i < n_draft; ++i) {
+            const int64_t offset = ids[i] - begin;
+            if (offset >= 0 && offset < count) {
+                chunk[offset] = values[i];
+            }
+        }
+        for (int64_t j = 0; j < count; ++j) {
+            const float value = chunk[j];
+            best = best > value ? best : value;
+            if (best == value) {
+                index = int32_t(begin + j);
+            }
+        }
+    }
+    return index;
+}
+
+static void dspark_compact_argmax_callback(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    const auto * values = static_cast<const float *>(dst->src[0]->data);
+    const auto * ids = static_cast<const int64_t *>(dst->src[1]->data);
+    const int64_t n_vocab = int64_t(reinterpret_cast<uintptr_t>(userdata));
+    static_cast<int32_t *>(dst->data)[0] = dspark_compact_argmax(
+            values, ids, dst->src[0]->ne[0], n_vocab);
+}
+
+
+// Host graph construction only. Do not cache a proc address across backend
+// unload/reload; missing or rejected registration keeps D2T's generic fallback.
+// The reviewed callback's code belongs to the process-loaded libllama, not a
+// model allocation, and remains loaded for the Spacemit backend's lifetime.
+static void dspark_register_compact_contract_on_host() {
+    using register_callback_t = bool (*)(ggml_custom_op_t);
+    const auto reg = ggml_backend_reg_by_name("SPACEMIT");
+    if (!reg) return;
+    const auto register_callback = reinterpret_cast<register_callback_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_spacemit_register_dspark_compact_argmax_v1"));
+    if (register_callback) (void)register_callback(dspark_compact_argmax_callback);
+}
+
+// Concatenate immutable column tensors in their original order. A balanced
+// tree changes copy topology only; each source column and its arithmetic are
+// unchanged. The final tensor remains contiguous [vocab, block-major tokens].
+static ggml_tensor * dspark_concat_balanced(ggml_context * ctx0,
+                                          const std::vector<ggml_tensor *> & columns,
+                                          size_t begin, size_t end) {
+    GGML_ASSERT(begin < end);
+    if (end - begin == 1) {
+        return columns[begin];
+    }
+    const size_t middle = begin + (end - begin) / 2;
+    ggml_tensor * left = dspark_concat_balanced(ctx0, columns, begin, middle);
+    ggml_tensor * right = dspark_concat_balanced(ctx0, columns, middle, end);
+    return ggml_concat(ctx0, left, right, 1);
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, bool compact = false) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -330,12 +490,24 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
     prev = ggml_cont_1d(ctx0, prev, n_blocks);
 
-    ggml_tensor * cat      = nullptr;
+    const char * concat_option = std::getenv("OCR_DSPARK_BALANCED_CONCAT");
+    const bool balanced_concat = concat_option && std::strcmp(concat_option, "1") == 0;
+    std::vector<ggml_tensor *> columns;
+    columns.reserve(size_t(block_drafts));
     ggml_tensor * cat_conf = nullptr;
+
+    // d2t is a CPU-mapped immutable weight. Passing it directly to CUSTOM
+    // makes scheduler pass 1 follow that CPU weight before GPU expansion.
+    // As in the existing SET_ROWS path, use one metadata-only view so the
+    // normal scheduler copy transfers the mapping into the selected backend.
+    // Share this same view with the final scatter to avoid duplicate copies.
+    if (compact) dspark_register_compact_contract_on_host();
+    ggml_tensor * compact_d2t = compact ? ggml_reshape_3d(ctx0, model.d2t, n_vocab, 1, 1) : nullptr;
 
     if (!sample_from_anchor) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
-        cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        columns.push_back(ggml_cont(ctx0,
+                ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0)));
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
@@ -346,7 +518,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
         ggml_tensor * bias    = g.build_lora_mm(w2, w1_prev, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
-        if (model.d2t) {
+        if (model.d2t && !compact) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
             ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_blocks), 0.0f);
@@ -360,7 +532,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        columns.push_back(col);
 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
@@ -379,7 +551,26 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
 
         if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
+            if (compact) {
+                ggml_tensor * args[] = { col, compact_d2t };
+                prev = ggml_custom_4d(ctx0, GGML_TYPE_I32, 1, 1, 1, 1, args, 2,
+                        dspark_compact_argmax_callback, 1,
+                        reinterpret_cast<void *>(uintptr_t(model.vocab.n_tokens())));
+                ggml_set_name(prev, "dspark_compact_mapped_argmax");
+            } else {
+                prev = ggml_argmax(ctx0, col);
+            }
+        }
+    }
+
+    GGML_ASSERT(columns.size() == size_t(block_drafts));
+    ggml_tensor * cat = nullptr;
+    if (balanced_concat) {
+        cat = dspark_concat_balanced(ctx0, columns, 0, columns.size());
+    } else {
+        // Preserve the legacy left-associated copy graph when the option is off.
+        for (ggml_tensor * column : columns) {
+            cat = cat ? ggml_concat(ctx0, cat, column, 1) : column;
         }
     }
 
@@ -399,6 +590,15 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_build_forward_expand(g.gf, conf);
     }
 
+    if (compact) {
+        const int64_t n_target_vocab = int64_t(model.vocab.n_tokens());
+        ggml_tensor * full = ggml_fill(ctx0,
+                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_target_vocab, n_tok), -INFINITY);
+        out = ggml_set_rows(ctx0, full,
+                ggml_reshape_3d(ctx0, out, 1, n_vocab, n_tok),
+                compact_d2t);
+        out = ggml_reshape_2d(ctx0, out, n_target_vocab, n_tok);
+    }
     res->t_logits = out;
     ggml_build_forward_expand(g.gf, out);
 }
@@ -823,8 +1023,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
     }
 
+    const bool compact_markov = dspark_compact_markov_eligible(*this, model, cur);
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
-    if (model.d2t) {
+    if (model.d2t && !compact_markov) {
         const int64_t n_draft_vocab = cur->ne[0];
         const int64_t n_outputs     = cur->ne[1];
         const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
@@ -843,7 +1044,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // DSpark: bias the draft logits with the Markov head
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        build_dspark_markov_head(*this, model, inp_tokens, compact_markov);
     }
 
     if (model.dflash_selector_hidden) {

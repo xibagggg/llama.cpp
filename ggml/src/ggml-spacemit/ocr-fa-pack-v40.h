@@ -7,12 +7,17 @@
 #include <cstdlib>
 #include <cstring>
 namespace ocr_fa_pack_v40 {
+inline int ime_min_rows(){
+ static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_IME_MIN_Q");
+  return p?std::atoi(p):988;}();
+ return v>0?v:988;
+}
 inline bool ime_qk(const ggml_tensor*op){
  static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_COMPUTE");return p&&std::strcmp(p,"3")==0;}();
  // The packed QK/PV kernels pad the final tile and support a full Q tile.
  // A historical 988-patch cutoff excluded common Paddle crops (804/848).
  return on&&op&&op->src[0]&&op->src[3]==nullptr&&
-     op->src[0]->ne[1]>=GGML_FA_TILE_Q;
+     op->src[0]->ne[1]>=ime_min_rows();
 }
 inline int direct_v44(){
     static const int v=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_DIRECT");

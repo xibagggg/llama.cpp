@@ -1,0 +1,19 @@
+[
+  "g++",
+  "-std=gnu++17",
+  "-O3",
+  "-UNDEBUG",
+  "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii",
+  "/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/gdn/frozen48/snapshot-bench.cpp",
+  "-I/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/gdn/frozen48/fixtures",
+  "-I/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/gdn/frozen48",
+  "-I/usr/include",
+  "-L/usr/lib",
+  "-Wl,-rpath,/usr/lib",
+  "-lspert",
+  "-latomic",
+  "-ldl",
+  "-pthread",
+  "-o",
+  "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/a06-published-engine-tests-20261118/gdn48/snapshot-bench"
+]

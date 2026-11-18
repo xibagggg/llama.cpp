@@ -1,0 +1,56 @@
+[
+  {
+    "time": "2026-11-18T12:23:53.988859+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=8/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    free   393216     -                  0x300              -           \n1    free   393216     0x60000            0x300              -           \n2    free   393216     0xc0000            0xc00              -           \n3    free   393216     0x120000           0xc00              -           \n4    free   393216     0x2000000          0x3000             -           \n5    free   393216     0x2060000          0x3000             -           \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:54.494459+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=2/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    busy   393216     -                  0x300              1237311     \n1    busy   393216     0x60000            0x300              1237312     \n2    busy   393216     0xc0000            0xc00              1237313     \n3    busy   393216     0x120000           0xc00              1237314     \n4    busy   393216     0x2000000          0x3000             1237315     \n5    busy   393216     0x2060000          0x3000             1237316     \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:54.999449+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=2/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    busy   393216     -                  0x300              1237311     \n1    busy   393216     0x60000            0x300              1237312     \n2    busy   393216     0xc0000            0xc00              1237313     \n3    busy   393216     0x120000           0xc00              1237314     \n4    busy   393216     0x2000000          0x3000             1237315     \n5    busy   393216     0x2060000          0x3000             1237316     \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:55.504409+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=2/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    busy   393216     -                  0x300              1237311     \n1    busy   393216     0x60000            0x300              1237312     \n2    busy   393216     0xc0000            0xc00              1237313     \n3    busy   393216     0x120000           0xc00              1237314     \n4    busy   393216     0x2000000          0x3000             1237315     \n5    busy   393216     0x2060000          0x3000             1237316     \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:56.009308+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=8/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    free   393216     -                  0x300              -           \n1    free   393216     0x60000            0x300              -           \n2    free   393216     0xc0000            0xc00              -           \n3    free   393216     0x120000           0xc00              -           \n4    free   393216     0x2000000          0x3000             -           \n5    free   393216     0x2060000          0x3000             -           \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:56.515105+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=8/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    free   393216     -                  0x300              -           \n1    free   393216     0x60000            0x300              -           \n2    free   393216     0xc0000            0xc00              -           \n3    free   393216     0x120000           0xc00              -           \n4    free   393216     0x2000000          0x3000             -           \n5    free   393216     0x2060000          0x3000             -           \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:57.021030+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=2/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    busy   393216     -                  0x300              1237311     \n1    busy   393216     0x60000            0x300              1237312     \n2    busy   393216     0xc0000            0xc00              1237313     \n3    busy   393216     0x120000           0xc00              1237314     \n4    busy   393216     0x2000000          0x3000             1237315     \n5    busy   393216     0x2060000          0x3000             1237316     \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:57.527477+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=8/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    free   393216     -                  0x300              -           \n1    free   393216     0x60000            0x300              -           \n2    free   393216     0xc0000            0xc00              -           \n3    free   393216     0x120000           0xc00              -           \n4    free   393216     0x2000000          0x3000             -           \n5    free   393216     0x2060000          0x3000             -           \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  },
+  {
+    "time": "2026-11-18T12:23:58.033903+08:00",
+    "returncode": 0,
+    "stdout": "spacemit-tcm-smi 3.0.1\nbackend=v2 runtime=available fake=no block_size=393216 block_num=8 available_blocks=8/8\nID   STATE  SIZE       PHYS               CPU_MASK           PID         \n0    free   393216     -                  0x300              -           \n1    free   393216     0x60000            0x300              -           \n2    free   393216     0xc0000            0xc00              -           \n3    free   393216     0x120000           0xc00              -           \n4    free   393216     0x2000000          0x3000             -           \n5    free   393216     0x2060000          0x3000             -           \n6    free   393216     0x20c0000          0xc000             -           \n7    free   393216     0x2120000          0xc000             -           \n",
+    "stderr": ""
+  }
+]

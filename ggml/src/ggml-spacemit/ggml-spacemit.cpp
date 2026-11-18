@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <optional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -40,6 +42,8 @@
 #include "ggml-profile.h"
 #include "paddle-f16-phases.h"
 #include "ocr-op-timing.h"
+#include "ocr-q4-head-prepared.h"
+#include "ocr-op-stats.h"
 #include "ocr-op-progress.h"
 #include "ocr-pc8-options.h"
 #include "ocr-fa-phases-v50.h"
@@ -48,8 +52,11 @@
 #include "spacemit-host-memory.h"
 #include "ocr-pv-pipeline.h"
 #include "ocr-quant-phases.h"
+#include "ocr-gdn-snapshot-store.h"
+#include "ocr-dspark-sampling.h"
 #include "ocr-fa-schedule.h"
 #include "ocr-startup-gate.h"
+#include "spacemit-tcm-ownership-linux.h"
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -536,6 +543,55 @@ static int gdn_inplace_mark(const ggml_cgraph * graph, std::vector<spacemit_opno
     return n_marked;
 }
 
+// K16 rollback snapshots retain the exact recurrence and original graph lifetime.
+// Only the final snapshot destination is forwarded; neither node is deleted.
+static int gdn_snapshot_store_mark(const ggml_cgraph * graph, std::vector<spacemit_opnode> & nodes) {
+    int count = 0;
+    for (int gi = 0; gi < graph->n_nodes; ++gi) {
+        ggml_tensor * g = graph->nodes[gi];
+        ggml_tensor * store = ocr_gdn_snapshot_store::match_store(graph, gi, op_is_compute);
+        if (store == nullptr) {
+            continue;
+        }
+        size_t positions[2] = {0, 0};
+        int seen[2] = {0, 0};
+        bool plain = true;
+        ggml_tensor * wanted[2] = {g, store};
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const spacemit_opnode & current = nodes[i];
+            for (int w = 0; w < 2; ++w) {
+                if (current.node == wanted[w]) {
+                    plain = plain && current.opcode == SPACEMIT_OP_INVALID && current.fused.empty() &&
+                        current.extra_dsts.empty() && current.packed_im2col == nullptr &&
+                        current.elided_pad == nullptr && current.elided_gelu == nullptr &&
+                        current.prepared_attention == nullptr && current.gdn_state[0] == nullptr &&
+                        current.gdn_snapshots[0] == nullptr;
+                    positions[w] = i;
+                    ++seen[w];
+                }
+                if (current.packed_im2col == wanted[w] || current.elided_pad == wanted[w] ||
+                    current.elided_gelu == wanted[w] || current.prepared_attention == wanted[w]) {
+                    plain = false;
+                }
+                for (const ggml_tensor * fused : current.fused) {
+                    plain = plain && fused != wanted[w];
+                }
+            }
+        }
+        if (!plain || seen[0] != 1 || seen[1] != 1 || positions[0] + 1 != positions[1]) {
+            continue;
+        }
+        nodes[positions[0]].opcode = SPACEMIT_OP_GDN_SNAPSHOT_DIRECT;
+        nodes[positions[1]].opcode = SPACEMIT_OP_GDN_SNAPSHOT_STORE;
+        for (size_t p : positions) {
+            nodes[p].gdn_snapshots[0] = g;
+            nodes[p].gdn_snapshots[1] = store;
+        }
+        ++count;
+    }
+    return count;
+}
+
 // concat(conv_states, transpose(qkv), dim 0) as built by build_conv_state: contiguous F32 rows, the
 // second input laid out transposed (column-major) so the fused kernel reads it column by column.
 static bool is_transposed_concat_f32(const ggml_tensor * t) {
@@ -894,39 +950,59 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         }
     }
 
-    // Pack the unpadded activation directly into the PC8 INT8 workspace.
-    // Retain graph allocations; all input reads and the packing barrier finish
-    // before the matmul writes output, even if gallocr reuses the input buffer.
+    // Optional GELU + activation packing fusion. Keep the original graph
+    // allocations and perform every source read before the packing barrier;
+    // only then may the down-projection overwrite any reused activation buffer.
+    const auto following_pc8=[&](int x){for(int j=x+1;j<graph->n_nodes;++j)if(op_is_compute(graph->nodes[j]))return j;return -1;};
     const char * pc8_pad=getenv("GGML_SPACEMIT_OCR_PC8_PAD_FUSE");
-    if(pc8_pad&&!strcmp(pc8_pad,"1")&&n->op==GGML_OP_PAD&&next_node&&
-       next_node->src[1]==n&&ggml_spacemit_can_fuse_pc8_pad(next_node)) {
-        const int idxs[2]={i,next_idx};
-        const enum ggml_op ops[2]={GGML_OP_PAD,GGML_OP_MUL_MAT};
-        if(ggml_can_fuse_subgraph_ext(graph,idxs,2,ops,&next_idx,1)) {
-            spacemit_opnode fused(next_node,{},SPACEMIT_OP_PC8_PAD_MUL_MAT);
-            fused.elided_pad=n;
+    const char * gelu_pack=getenv("GGML_SPACEMIT_OCR_GELU_PC8_PACK");
+    ggml_tensor * gelu_node=nullptr;
+    ggml_tensor * pad_node=n;
+    ggml_tensor * down_node=next_node;
+    int pad_index=i,down_index=next_idx;
+    std::vector<int> pc8_ids;
+    std::vector<ggml_op> pc8_ops;
+    if(gelu_pack&&!strcmp(gelu_pack,"1")&&n->op==GGML_OP_UNARY&&
+       ggml_get_unary_op(n)==GGML_UNARY_OP_GELU&&n->src[0]&&
+       n->type==GGML_TYPE_F32&&n->src[0]->type==GGML_TYPE_F32&&
+       !n->view_src&&!n->src[0]->view_src&&
+       ggml_is_contiguous(n)&&ggml_is_contiguous(n->src[0])&&
+       ggml_are_same_shape(n,n->src[0])&&next_node&&
+       next_node->op==GGML_OP_PAD&&next_node->src[0]==n) {
+        gelu_node=n;pad_node=next_node;pad_index=next_idx;
+        down_index=following_pc8(pad_index);
+        down_node=down_index<0?nullptr:graph->nodes[down_index];
+        pc8_ids.push_back(i);pc8_ops.push_back(GGML_OP_UNARY);
+    }
+    if(pc8_pad&&!strcmp(pc8_pad,"1")&&pad_node->op==GGML_OP_PAD&&down_node&&
+       down_node->src[1]==pad_node&&ggml_spacemit_can_fuse_pc8_pad(down_node)) {
+        pc8_ids.push_back(pad_index);pc8_ops.push_back(GGML_OP_PAD);
+        pc8_ids.push_back(down_index);pc8_ops.push_back(GGML_OP_MUL_MAT);
+        const auto guarded_pc8=[&](int output){return ggml_can_fuse_subgraph_ext(
+            graph,pc8_ids.data(),int(pc8_ids.size()),pc8_ops.data(),&output,1);};
+        if(guarded_pc8(down_index)) {
+            spacemit_opnode fused(down_node,{},SPACEMIT_OP_PC8_PAD_MUL_MAT);
+            fused.elided_pad=pad_node;fused.elided_gelu=gelu_node;
             const char*option=getenv("GGML_SPACEMIT_OCR_PC8_DOWN_EPILOGUE");
-            int last=next_idx;
+            int last=down_index;
             if(option&&!strcmp(option,"1")){
-                const auto following=[&](int x){for(int j=x+1;j<graph->n_nodes;++j)if(op_is_compute(graph->nodes[j]))return j;return -1;};
-                const int bi=following(next_idx);
+                const int bi=following_pc8(down_index);
                 if(bi>=0){
                     auto*b=graph->nodes[bi];
-                    const int ids[3]={i,next_idx,bi};const ggml_op ops[3]={GGML_OP_PAD,GGML_OP_MUL_MAT,GGML_OP_ADD};
-                    if(b->op==GGML_OP_ADD&&b->src[0]==next_node&&b->type==GGML_TYPE_F32&&
-                       ggml_are_same_shape(b,next_node)&&ggml_is_contiguous(b)&&
+                    pc8_ids.push_back(bi);pc8_ops.push_back(GGML_OP_ADD);
+                    if(b->op==GGML_OP_ADD&&b->src[0]==down_node&&b->type==GGML_TYPE_F32&&
+                       ggml_are_same_shape(b,down_node)&&ggml_is_contiguous(b)&&
                        ocr_norm_affine::row_weight(b->src[1],b->ne[0])&&b->src[1]->op==GGML_OP_NONE&&
-                       b->src[1]->src[0]==nullptr&&ggml_can_fuse_subgraph_ext(graph,ids,3,ops,&bi,1)){
+                       b->src[1]->src[0]==nullptr&&guarded_pc8(bi)){
                         fused.add_fused(b);last=bi;
-                        const int ri=following(bi);
+                        const int ri=following_pc8(bi);
                         if(ri>=0){
                             auto*res=graph->nodes[ri];
                             auto*skip=res->src[0]==b?res->src[1]:res->src[1]==b?res->src[0]:nullptr;
-                            const int all[4]={i,next_idx,bi,ri};const ggml_op allops[4]={GGML_OP_PAD,GGML_OP_MUL_MAT,GGML_OP_ADD,GGML_OP_ADD};
+                            pc8_ids.push_back(ri);pc8_ops.push_back(GGML_OP_ADD);
                             if(res->op==GGML_OP_ADD&&skip&&res->type==GGML_TYPE_F32&&skip->type==GGML_TYPE_F32&&
                                ggml_are_same_shape(res,b)&&ggml_are_same_shape(skip,b)&&ggml_is_contiguous(res)&&ggml_is_contiguous(skip)&&
-                               (!ocr_norm_affine::overlaps(res,skip)||res->data==skip->data)&&
-                               ggml_can_fuse_subgraph_ext(graph,all,4,allops,&ri,1)){
+                               (!ocr_norm_affine::overlaps(res,skip)||res->data==skip->data)&&guarded_pc8(ri)){
                                 fused.add_fused(res);last=ri;
                             }
                         }
@@ -1296,6 +1372,13 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
 
         const int n_gdn_inplace = gdn_inplace_enabled() ? gdn_inplace_mark(graph, sess->cached_graph.nodes) : 0;
+        const int n_gdn_snapshots = ocr_gdn_snapshot_store::enabled_on_host() ?
+            gdn_snapshot_store_mark(graph, sess->cached_graph.nodes) : 0;
+        const char * snapshot_trace = std::getenv("GGML_SPACEMIT_OCR_GDN_SNAPSHOT_STORE_TRACE");
+        if (n_gdn_snapshots && snapshot_trace && std::strcmp(snapshot_trace, "1") == 0) {
+            GGML_LOG_INFO("ggml-spacemit: GDN direct snapshot store=%d graph=%llu\n",
+                n_gdn_snapshots, (unsigned long long) graph->uid);
+        }
 
         int n_fused = 0;
         int n_add_gelu = 0;
@@ -1305,6 +1388,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         int n_paddle_f16_gelu_pack = 0;
         int n_paddle_pc8_gelu_pack = 0;
         int n_im2col_pack = 0;
+        int n_gelu_pc8_pack = 0;
         int n_norm_affine = 0;
         int n_residual_norm_affine = 0;
         int n_conv_seen = 0;
@@ -1323,6 +1407,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             n_paddle_pc8_gelu_pack += node.opcode == SPACEMIT_OP_PADDLE_PC8_GELU_PACK;
             n_paddle_f16_bias_gelu += node.opcode == SPACEMIT_OP_PADDLE_F16_BIAS && node.fused.size()==2;
             n_im2col_pack += node.opcode == SPACEMIT_OP_IM2COL_MUL_MAT;
+            n_gelu_pc8_pack += node.elided_gelu != nullptr;
             n_norm_affine += node.opcode == SPACEMIT_OP_NORM_AFFINE;
             n_residual_norm_affine += node.opcode == SPACEMIT_OP_RESIDUAL_NORM_AFFINE;
             if (!node.fused.empty() || node.opcode != SPACEMIT_OP_INVALID) {
@@ -1331,6 +1416,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
         GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(),
                        (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
+        const char * gelu_pack_trace=getenv("GGML_SPACEMIT_OCR_GELU_PC8_PACK_TRACE");
+        if(n_gelu_pc8_pack&&gelu_pack_trace&&!strcmp(gelu_pack_trace,"1"))
+            GGML_LOG_INFO("ggml-spacemit: GELU+PAD+PACK+PC8 fused=%d graph=%llu\n",
+                          n_gelu_pc8_pack,(unsigned long long)graph->uid);
         const char * recurrent_trace = getenv("GGML_SPACEMIT_RECURRENT_TRACE");
         if (recurrent_trace && strcmp(recurrent_trace, "1") == 0 && n_gdn_seen > 0) {
             GGML_LOG_INFO("ggml-spacemit: recurrent conv fused=%d/%d scalar=%d gdn in-place=%d/%d graph=%llu\n",
@@ -1351,8 +1440,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         if(pc8_pack_trace&&!strcmp(pc8_pack_trace,"1"))
             GGML_LOG_INFO("ggml-spacemit: PADDLE_PC8 GELU+PACK fused=%d graph=%llu\n",
                 n_paddle_pc8_gelu_pack,(unsigned long long)graph->uid);
-        const char *gelu_pack_trace=getenv("GGML_SPACEMIT_PADDLE_F16_GELU_PACK_TRACE");
-        if(gelu_pack_trace&&!strcmp(gelu_pack_trace,"1"))
+        const char *paddle_gelu_pack_trace=getenv("GGML_SPACEMIT_PADDLE_F16_GELU_PACK_TRACE");
+        if(paddle_gelu_pack_trace&&!strcmp(paddle_gelu_pack_trace,"1"))
             GGML_LOG_INFO("ggml-spacemit: PADDLE_F16 GELU+PACK fused=%d graph=%llu\n",
                           n_paddle_f16_gelu_pack,(unsigned long long)graph->uid);
         const char * paddle_f16_bias_trace = getenv("GGML_SPACEMIT_PADDLE_F16_BIAS_TRACE");
@@ -1453,6 +1542,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                      static_cast<unsigned long long>(graph->uid), graph->n_nodes);
     }
 
+    auto * op_stats = ocr_op_stats::path() ? &ocr_op_stats::storage::get() : nullptr;
+    if (op_stats) op_stats->prepare(unsigned(n_threads), opnodes);
     const bool op_timing=ocr_op_timing::path()!=nullptr;
     const uint64_t op_timing_sequence=op_timing?ocr_op_timing::storage::get().next.fetch_add(1):0;
     // Phase storage registers atexit and allocates several MiB. Initialize and
@@ -1461,10 +1552,28 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     if(paddle_f16_phases::enabled())(void)paddle_f16_phases::storage::get();
     ocr_op_progress::storage * op_progress = nullptr;
     ggml::spacemit::scratch_mode scratch_mode;
+    // PINNED_TCM pins a SPERT allocation, but does not verify its backing or
+    // register v2 ownership. Keep the extra protocol verification opt-in.
+    const bool tcm_ownership_enabled = [] {
+        const char * value = std::getenv("GGML_SPACEMIT_TCM_OWNERSHIP");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    ggml::spacemit::tcm_ownership::catalog tcm_catalog;
+    ggml::spacemit::tcm_ownership::launch_state tcm_result;
     const uint64_t progress_sequence = ocr_op_progress::next_sequence();
     const size_t shared_mem_size = spert::backend_info().shared_mem_size;
     try {
         scratch_mode = ggml::spacemit::configured_scratch_mode();
+        if (tcm_ownership_enabled) {
+            if (n_threads <= 0 || size_t(n_threads) > ggml::spacemit::tcm_ownership::max_lanes)
+                throw std::runtime_error("TCM ownership worker count exceeds supported lane capacity");
+            if (scratch_mode != ggml::spacemit::scratch_mode::pinned_tcm)
+                throw std::runtime_error("TCM ownership requires GGML_SPACEMIT_SHARED_MODE=PINNED_TCM");
+            const auto error = ggml::spacemit::tcm_ownership::prepare_platform_catalog(tcm_catalog, shared_mem_size);
+            if (error != ggml::spacemit::tcm_ownership::error::ok)
+                throw std::runtime_error(std::string("real TCM catalog: ") +
+                    ggml::spacemit::tcm_ownership::name(error));
+        }
         if (scratch_mode == ggml::spacemit::scratch_mode::locked_ddr && shared_mem_size)
             sess->ddr_scratch.prepare(n_threads, shared_mem_size);
         op_progress = ocr_op_progress::get();
@@ -1479,6 +1588,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     const char * pc8_host_options = std::getenv("GGML_SPACEMIT_PC8_HOST_OPTIONS");
     if (!pc8_host_options || std::strcmp(pc8_host_options, "0") != 0)
         ocr_q4_pc8::prepare_options_on_host();
+    sess->d2t_scatter.prepare(opnodes, unsigned(n_threads), graph);
     spacemit_kernels::rvv::prepare_ocr_worker_state();
     spacemit_kernels::rvv::prepare_paddle_fa_gqa8_exact(n_threads, shared_mem_size,
         scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
@@ -1491,6 +1601,14 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     const bool tcm_trace = tcm_trace_option && !std::strcmp(tcm_trace_option, "1");
     std::array<spert::SharedBufferView, 8> tcm_views{};
     std::array<int, 8> tcm_cpus{};
+    spacemit_kernels::rvv::prepare_ocr_gdn_rollback_tcm(unsigned(n_threads), shared_mem_size,
+        scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+    spacemit_kernels::rvv::prepare_ocr_fa_gqa_ime256_r24(unsigned(n_threads), shared_mem_size,
+        scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+    spacemit_kernels::rvv::prepare_ocr_fa_gqa_group(unsigned(n_threads), shared_mem_size,
+        scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+    ocr_q4_head_prepared::prepare_on_host();
+    ocr_dspark_sampling::prepare_on_host();
     spacemit_host_trace("graph-launch-begin");
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
@@ -1498,7 +1616,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
          qkv_content_view,
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
-         attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
+         attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,op_stats,
+         d2t_scatter = &sess->d2t_scatter,
+         tcm_values = tcm_ownership_enabled ? &tcm_catalog : nullptr,
+         tcm_state = &tcm_result,
          op_progress, progress_sequence, tcm_trace, &tcm_views, &tcm_cpus,
          extended_workers, &extended_worker_cpus](spert::Context * runtime) {
             const uint32_t ith = runtime->program_id(0);
@@ -1513,13 +1634,40 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 throw std::runtime_error("inference worker is outside AI cores 8-15");
             ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
             const bool use_ddr = scratch_mode == ggml::spacemit::scratch_mode::locked_ddr;
-            ggml::spacemit::tcm_lease lease(*runtime, shared_mem_size,
-                scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
-            ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,11,nullptr);
-            auto shared = use_ddr ? ddr_scratch->lane(ith) :
-                (shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{});
-            if (shared_mem_size > 0 && (!shared || shared.size < shared_mem_size)) {
-                throw std::runtime_error("ggml-spacemit: worker shared buffer unavailable");
+            // optional stores the nonmovable pool lease on the worker stack.
+            // In ownership mode a scratch preparation failure must still join
+            // the collective barrier instead of stranding the other lanes.
+            std::optional<ggml::spacemit::tcm_lease> pool_lease;
+            spert::SharedBufferView shared{};
+            auto preparation = ggml::spacemit::tcm_ownership::error::ok;
+            try {
+                if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
+                    throw std::runtime_error("inference worker is outside AI cores 8-15");
+                ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
+                pool_lease.emplace(*runtime, shared_mem_size,
+                    scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+                ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,11,nullptr);
+                shared = use_ddr ? ddr_scratch->lane(ith) :
+                    (shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{});
+                if (shared_mem_size > 0 && (!shared || shared.size < shared_mem_size))
+                    throw std::runtime_error("ggml-spacemit: worker shared buffer unavailable");
+            } catch (...) {
+                if (!tcm_values) throw;
+                preparation = ggml::spacemit::tcm_ownership::error::scratch_unavailable;
+            }
+
+            ggml::spacemit::tcm_ownership::lease ownership(tcm_values, tcm_state, ith);
+            if (tcm_values) {
+                // All lanes publish preparation/claim errors before the same
+                // barrier, then collectively leave before the first operator.
+                // SPERT remains responsible for runtime/barrier cancellation.
+                ownership.acquire(shared.data, shared.size, preparation);
+                if (runtime->sync() != spert::Status::Ok)
+                    tcm_state->fail(ggml::spacemit::tcm_ownership::error::barrier_failed);
+                if (tcm_state->failed()) {
+                    ownership.release();
+                    return;
+                }
             }
 
             auto & ctx = contexts[ith];
@@ -1532,6 +1680,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 tcm_cpus[ith] = sched_getcpu();
             }
             ctx.qkv_content_cache=qkv_content_view;
+            ctx.d2t_scatter = d2t_scatter;
             ctx.diagnostic_subphase = op_progress ? &op_progress->lanes[ith].subphase : nullptr;
 
             size_t node_index = 0;
@@ -1539,7 +1688,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 ggml_tensor * op = node.node;
                 ctx.prepared_vision_rope = vision_rope_tables.get(node_index);
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index),1,op);
-                const uint64_t op_begin=op_timing?ocr_op_timing::now():0;
+                const uint64_t op_begin=(op_timing || op_stats)?ocr_op_timing::now():0;
 
                 ggml_profile_log_spacemit_op_begin(op, (int) ith, (int) runtime->grid_dim(0));
 
@@ -1551,7 +1700,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                                              ggml_op_desc(op) + " (" + ggml_type_name(op->type) + ")");
                 }
                 ggml_profile_log_spacemit_op_end(op, (int) ith, (int) runtime->grid_dim(0));
-                const uint64_t op_end=op_timing?ocr_op_timing::now():0;
+                const uint64_t op_end=(op_timing || op_stats)?ocr_op_timing::now():0;
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index),2,op);
 
                 ++node_index;
@@ -1561,6 +1710,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 // dependencies can be farther away or hidden behind aliases/views.
                 ctx.sync();
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index-1),3,op);
+                if (op_stats) op_stats->record(ith,node_index-1,op_begin,op_end,ocr_op_timing::now());
                 if(op_timing)ocr_op_timing::record(ith,op_timing_sequence,unsigned(node_index-1),op,
                     int(node.opcode),op_begin,op_end,ocr_op_timing::now());
                 ocr_op_progress::record(op_progress,ith,progress_sequence,unsigned(node_index-1),4,op);
@@ -1585,6 +1735,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 }
             }
 
+            ownership.release();
             ctx.clear();
 #ifdef GGML_BUILD_PROFILE
             ggml_profile_flush_tls();
@@ -1594,6 +1745,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     spacemit_host_trace("graph-launch-end");
     const spert::Status status = fut.sync();
+    sess->d2t_scatter.report_worker_hits();
+    if (op_stats) op_stats->finish(opnodes, status == spert::Status::Ok);
     spacemit_host_trace("graph-sync-end");
     const bool extended_grant_ok=!extended_workers||ocr_worker_policy::exact_grant(
         size_t(n_threads),stream.core_count(),stream_cfg.core_ids.data(),stream_cfg.core_ids.size(),
@@ -1645,6 +1798,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
     }
     spacemit_kernels::rvv::drain_ocr_worker_events();
+    spacemit_kernels::rvv::drain_ocr_fa_gqa_ime256_r24();
 
     if (op_hash_trace != nullptr) {
         std::fprintf(op_hash_trace, "E,%llu,%d\n",
@@ -1653,7 +1807,27 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         std::fclose(op_hash_trace);
     }
 
-    if (status != spert::Status::Ok || !qkv_content_guards_ok || !extended_grant_ok || !vision_rope_content_guards_ok) {
+    if (tcm_ownership_enabled) {
+        static std::atomic<bool> reported{false};
+        const char * diagnostics = std::getenv("GGML_SPACEMIT_TCM_DIAGNOSTICS");
+        if (tcm_result.failed() || (diagnostics && std::strcmp(diagnostics, "1") == 0) ||
+            !reported.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_INFO("ggml-spacemit: real TCM ownership graph=%llu runtime=%s error=%s\n",
+                static_cast<unsigned long long>(graph->uid),
+                ggml::spacemit::tcm_ownership::platform_version(),
+                ggml::spacemit::tcm_ownership::name(static_cast<ggml::spacemit::tcm_ownership::error>(
+                    tcm_result.first_error.load(std::memory_order_acquire))));
+            for (int i = 0; i < n_threads; ++i) {
+                const auto & lane = tcm_result.lanes[size_t(i)];
+                GGML_LOG_INFO("ggml-spacemit: TCM lane=%d cpu=%d tid=%d block=%d ptr=%p bytes=%zu "
+                    "claimed=%d released=%d acquire_error=%s release_error=%s\n", i,
+                    lane.cpu, lane.tid, lane.id, lane.data, lane.size, int(lane.claimed), int(lane.released),
+                    ggml::spacemit::tcm_ownership::name(lane.acquire_error),
+                    ggml::spacemit::tcm_ownership::name(lane.release_error));
+            }
+        }
+    }
+    if (status != spert::Status::Ok || tcm_result.failed() || !qkv_content_guards_ok || !extended_grant_ok || !vision_rope_content_guards_ok) {
         return GGML_STATUS_FAILED;
     }
     qkv_completion.commit();
@@ -1838,7 +2012,9 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
+        case GGML_OP_ARGMAX:
         case GGML_OP_CLAMP:
             supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;
@@ -1950,9 +2126,10 @@ static ggml_backend_dev_t ggml_backend_spacemit_reg_get_device(ggml_backend_reg_
 }
 
 static void * ggml_backend_spacemit_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    return NULL;
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (name && std::strcmp(name, "ggml_backend_spacemit_register_dspark_compact_argmax_v1") == 0)
+        return reinterpret_cast<void *>(ocr_dspark_custom_contract::register_callback);
+    return nullptr;
 }
 
 static void ggml_spacemit_init(ggml_backend_reg * reg) {

@@ -108,3 +108,5 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+// At most max_bytes of the exact serialized byte string; no truncation marker.
+std::string gguf_kv_to_str_bounded(const struct gguf_context * ctx_gguf, int i, size_t max_bytes);

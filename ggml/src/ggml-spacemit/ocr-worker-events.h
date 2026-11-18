@@ -10,7 +10,7 @@
 // arbitration uses a lock-free CAS; later calls only perform a relaxed load.
 namespace ocr_worker_events {
 
-enum class kind : unsigned { pack, full_kv, direct, lazy, x8, group, pv, count };
+enum class kind : unsigned { pack, full_kv, direct, lazy, x8, group, pv, concat_segmented, gqa_proposal, gqa_verify, count };
 
 struct values {
     uint64_t a = 0, b = 0, c = 0, d = 0, e = 0, f = 0;

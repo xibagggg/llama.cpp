@@ -1,0 +1,1 @@
+PASS mapped callback metadata/refusal cases=124; trusted identity, n_tasks/userdata, nulls, dtype/shape/stride, aliases, alignment, extra sources, overflow, host option parsing; no callback or RVV executed.

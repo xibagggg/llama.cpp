@@ -53,6 +53,22 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// Narrow request-switch contract: no implementation switching and no synthetic acceptance.
+bool common_speculative_is_single_dspark(const common_speculative * spec);
+// Clear wrapper references after the caller has cleared target+draft sequence memory.
+bool common_speculative_reset_dspark_request(common_speculative * spec, llama_seq_id seq_id);
+struct common_speculative_request_graph_state {
+    uint32_t target_rs = 0;
+    uint32_t rs_capacity = 0;
+    uint32_t target_capture = 0;
+    uint32_t configured_capture = 0;
+};
+bool common_speculative_dspark_request_graph_state(
+        const common_speculative * spec, common_speculative_request_graph_state & state);
+// Caller already cleared both prompts/wrapper references at a single-slot boundary.
+bool common_speculative_prepare_dspark_request_graph(
+        common_speculative * spec, bool enabled, common_speculative_request_graph_state & state);
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it

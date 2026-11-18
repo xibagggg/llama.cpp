@@ -397,11 +397,26 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
-
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n_rs_seq = 0;
+        for (const auto type : types) {
+            switch (type) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                    n_rs_seq = std::max(n_rs_seq, static_cast<uint32_t>(std::max(0, draft.n_max)));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    n_rs_seq = std::max(n_rs_seq, static_cast<uint32_t>(ngram_simple.size_m));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                    n_rs_seq = std::max(n_rs_seq, static_cast<uint32_t>(ngram_map_k.size_m));
+                    break;
+                default:
+                    break;
+            }
+        }
+        return n_rs_seq;
     }
 };
 

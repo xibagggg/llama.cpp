@@ -2136,6 +2136,9 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_MERGES).c_str()));
                 }
                 const int n_merges = gguf_get_arr_n(ctx, merges_keyidx);
+                if (n_merges > 0 && bpe_ranks.empty()) {
+                    bpe_ranks.reserve(static_cast<size_t>(n_merges));
+                }
                 for (int i = 0; i < n_merges; i++) {
                     const std::string word = gguf_get_arr_str(ctx, merges_keyidx, i);
                     //GGML_ASSERT(unicode_cpts_from_utf8(word).size() > 0);

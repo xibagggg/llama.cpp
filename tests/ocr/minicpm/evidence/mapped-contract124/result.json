@@ -1,0 +1,18 @@
+{
+  "compiler": "g++ (Rev13, Built by MSYS2 project) 15.2.0",
+  "build_command": [
+    "g++",
+    "-std=c++17",
+    "-O2",
+    "-IC:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\test_mapped_contract_stubs",
+    "-IC:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\mapped-argmax-next",
+    "C:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\test_mapped_contract.cpp",
+    "-o",
+    "C:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\mosaic_review\\continuation-small-candidates-20261118\\evidence\\host-contract\\test_mapped_contract.exe"
+  ],
+  "build_returncode": 0,
+  "run_returncode": 0,
+  "source_sha256": "e6cebced3505f3e0cb8679ca782a25622eac31f0b3dc99f1c044f09bf0c96f32",
+  "stub_sha256": "b35c6a48ae0408b7d7fd3fa396a6d93bde77352c1b78a2611b6bbf929b034241",
+  "scope": "Host callback metadata/refusal only. __riscv_vector undefined, no RVV numerical execution and no model timing."
+}

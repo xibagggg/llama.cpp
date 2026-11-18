@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <time.h>
+#include <unistd.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +22,26 @@ extern "C" OrtStatus * ORT_API_CALL OrtSessionOptionsSpaceMITEnvInit(
     OrtSessionOptions *, const char * const *, const char * const *, size_t);
 
 namespace {
+// EP vision bypasses GGML, so its first session/encode needs a separate marker.
+// Emit before ai_guard/get_runtime/session creation: even compile-time device
+// activity, if introduced later, lies inside this conservative boundary.
+void startup_probe_first_vision_ep() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("OCR_STARTUP_PROBE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled) return;
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true, std::memory_order_relaxed)) return;
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+    const auto ns = static_cast<long long>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+    std::fprintf(stderr,
+        "OCR_STARTUP_PROBE event=vision_ep_begin pid=%ld ppid=%ld monotonic_ns=%lld backend=spacemit_ep\n",
+        static_cast<long>(::getpid()), static_cast<long>(::getppid()), ns);
+    std::fflush(stderr);
+}
+
 using clock_type = std::chrono::steady_clock;
 double elapsed(clock_type::time_point start) {
     return std::chrono::duration<double>(clock_type::now() - start).count();
@@ -56,12 +79,12 @@ struct runtime {
         if (path.empty()) {
             throw std::runtime_error(std::string("OCR_EP_") + kind + "_MODEL must name an ONNX model");
         }
-        if (setting("SPERT_SHARED_MODE") != "DDR") {
-            throw std::runtime_error("EP OCR requires SPERT_SHARED_MODE=DDR");
-        }
+//         if (setting("SPERT_SHARED_MODE") != "DDR") {
+//             throw std::runtime_error("EP OCR requires SPERT_SHARED_MODE=DDR");
+//         }
         auto start = clock_type::now();
         Ort::SessionOptions options;
-        options.SetIntraOpNumThreads(8);
+        options.SetIntraOpNumThreads(6);
         options.SetInterOpNumThreads(1);
         options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -85,7 +108,9 @@ struct runtime {
             "SPERT_BACKEND", "SPACEMIT_EP_INTER_THREAD_NUM", "SPACEMIT_EP_INTRA_THREAD_NUM",
             "SPACEMIT_EP_ENABLE_DMA", "SPACEMIT_EP_DENSE_ACCURACY_LEVEL", "SPACEMIT_EP_ENABLE_BLOCKLAYOUT",
             "SPACEMIT_EP_DEBUG_PROFILE"};
-        const auto threads = std::to_string(integer_setting("OCR_EP_THREADS", 8, 1, 8));
+        // The validated K3 OCR configuration uses six AI workers. Using all
+        // eight can hang the board, so reject it before creating the session.
+        const auto threads = std::to_string(integer_setting("OCR_EP_THREADS", 6, 1, 6));
         const auto accuracy = std::to_string(integer_setting("OCR_EP_DENSE_ACCURACY", 0, 0, 2));
         const auto blocklayout = std::to_string(integer_setting("OCR_EP_BLOCKLAYOUT", 0, 0, 1));
         const auto ep_profile = profile + "-ep-" + kind + "-" + std::to_string(width) + "x" + std::to_string(height);
@@ -165,6 +190,7 @@ void ocr_ep_encode_hwc(const float * pixels, int width, int height, std::vector<
             nchw[channel * area + i] = value;
         }
     }
+    startup_probe_first_vision_ep();
     ai_guard guard;
     auto & owner = get_runtime();
     auto & session = owner.vision_session(width, height);

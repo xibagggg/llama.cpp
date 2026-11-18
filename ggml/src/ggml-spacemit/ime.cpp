@@ -11,6 +11,7 @@
 #include "ocr-norm-affine-rvv.h"
 #include "ocr-fa-schedule.h"
 #include "ocr-quant-phases.h"
+#include "ocr-gdn-snapshot-store.h"
 
 #include "common.h"
 #include "ggml-backend-impl.h"
@@ -33,6 +34,7 @@
 #include "paddle-q6-head-n64.h"
 #include "paddle-pos-resize.h"
 #include "ocr-q4-pc8.h"
+#include "ocr-q4-head-prepared.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -501,7 +503,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                             const char * e=std::getenv("GGML_SPACEMIT_OCR_Q4_M8");
                             return e&&std::strcmp(e,"1")==0;
                         }();
-                        if(m8&&gemm_k==1152&&gemm_m>=8&&(gemm_n==1152||gemm_n==4304)) {
+                        if(m8&&gemm_m>=8&&((gemm_k==1152&&(gemm_n==1152||gemm_n==4304))||(gemm_k==4304&&gemm_n==1152))) {
                             gemm_kernel=spacemit_kernels::ime2::gemm_kernel_i8i4_ocr_m8;
                             use_ocr_m8=true;
                         }
@@ -587,9 +589,18 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         }
 #endif
         auto *q6_head_evidence=use_paddle_q6_head_n64?paddle_q6_head_n64::trace():nullptr;
+        const uint8_t * prepared_head_a = nullptr;
         const auto run_gemm_tile = [&](const uint8_t * a, const uint8_t * b, const uint8_t * b_zp,
                                        float * c, int64_t rows, int64_t cols, int64_t bias_col) {
             size_t rows_handled = 0;
+#if defined(RISCV64_SPACEMIT_IME2)
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 32 && NB_COLS == 32) {
+                if (prepared_head_a != nullptr) {
+                    GGML_ASSERT(rows == 1 && b_zp == nullptr && fused_bias_data == nullptr);
+                    return ocr_q4_head_prepared::compute(prepared_head_a, b, c, size_t(cols), size_t(b_k_blks));
+                }
+            }
+#endif
             if (fused_bias_data != nullptr) {
                 if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256 && NB_COLS == 32) {
                     GGML_ASSERT(b_zp == nullptr && cols > 0 && cols % NB_COLS == 0 && bias_col % NB_COLS == 0);
@@ -750,13 +761,35 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 b_col = reinterpret_cast<uint8_t *>(tcm_buffer) + gemm_workspace_size;
             }
             uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
+#if defined(RISCV64_SPACEMIT_IME2)
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 32 && NB_COLS == 32) {
+                // Only the measured Qwen35 output head, keeping its standard
+                // quantization, N32 staging, pair barriers and tail handling.
+                const size_t prepared_bytes = size_t(b_k_blks) * ocr_q4_head_prepared::block_bytes;
+                if (ocr_q4_head_prepared::active.load(std::memory_order_relaxed) &&
+                    global_spine_env_info.use_ime2 && __riscv_vlenb() == 128 && nth == 6 &&
+                    gemm_m == 1 && gemm_k == 1024 && gemm_n == 248100 &&
+                    src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                    std::strcmp(op->name, "result_output") == 0 && fused_bias_data == nullptr &&
+                    block_stride_a == 38 && row_stride_a == 38 * b_k_blks &&
+                    size_t(gemm_workspace_size + per_nb_cols_wsize) + prepared_bytes + 128 <= size_t(tcm_buffer_size)) {
+                    const auto end = reinterpret_cast<uintptr_t>(tcm_buffer) + size_t(tcm_buffer_size);
+                    auto * prepared = reinterpret_cast<uint8_t *>((end - prepared_bytes) & ~uintptr_t(127));
+                    GGML_ASSERT(prepared >= b_col + per_nb_cols_wsize);
+                    ocr_q4_head_prepared::prepare(prepared, quant_a_buffer, size_t(b_k_blks));
+                    prepared_head_a = prepared;
+                }
+            }
+#endif
 
             // Direct IME-from-DRAM GEMV path, decode only (gemm_m == 1), q4_0 only:
             // q8_0 always loses to the staged TCM path here.
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256 && NB_COLS == 32) {
                 if (gemm_m == 1 && a_row != quant_a_buffer) {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
-                    constexpr int64_t tile_cols = 4 * NB_COLS;
+                    int64_t tile_cols = 4 * NB_COLS;
+                    if (const char* tc = std::getenv("GGML_SPACEMIT_GEMV_TILE"))
+                        tile_cols = std::max<int64_t>(32, (int64_t) std::atoi(tc));
                     for (int64_t ni = (int64_t) ith * tile_cols; ni < gemm_n; ni += tile_cols * nth) {
                         const int64_t nb_real  = std::min(gemm_n - ni, tile_cols);
                         uint8_t *     b_row    = reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b;
@@ -1290,6 +1323,12 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             return size != 0;
         }
         switch (op->op) {
+            case GGML_OP_TOP_K:
+                // Reserve one index array for each active row worker. The
+                // session allocates this before entering the AI worker loop.
+                size = GGML_PAD((size_t) op->src[0]->ne[0] * sizeof(int32_t), 64) *
+                       std::min<int64_t>(n_threads, ggml_nrows(op->src[0]));
+                return true;
             case GGML_OP_MUL_MAT:
                 if (paddle_f16_f16_patch::selected(op)) {
                     size = paddle_f16_f16_patch::work_bytes(op);
@@ -1511,6 +1550,13 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             case GGML_OP_CONT:
                 {
                     const ggml_tensor * src0 = op->src[0];
+                    // DSpark's anchor tokens are a strided I32 view. Preserve
+                    // the integer bits while packing them into a flat vector.
+                    if (op->type == GGML_TYPE_I32 && src0->type == GGML_TYPE_I32 &&
+                        ggml_is_contiguous(op) && ggml_nelements(op) == ggml_nelements(src0)) {
+                        spacemit_kernels::rvv::forward_cont_general<int32_t>(ctx, op);
+                        return true;
+                    }
                     if (op->type == src0->type && op->nb[0] != src0->nb[0] && op->nb[0] == src0->nb[1] &&
                         op->ne[3] * op->ne[2] * op->nb[2] == src0->ne[3] * src0->ne[2] * src0->nb[2]) {
                         spacemit_kernels::rvv::forward_cont_with_permute(ctx, op);
@@ -1619,6 +1665,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     if (op->src[0]->type == op->type) {
                         switch (op->src[0]->type) {
                             case GGML_TYPE_F32:
+                            case GGML_TYPE_I32:
                                 spacemit_kernels::rvv::forward_get_rows<int32_t>(ctx, op);
                                 return true;
                             case GGML_TYPE_F16:
@@ -1638,6 +1685,10 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         return true;
                     }
                     const int32_t dim = ggml_get_op_params_i32(op, 0);
+                    if (dim == 1) {
+                        spacemit_kernels::scalar::forward_concat_dim1_f32(ctx, op);
+                        return true;
+                    }
                     if (dim == 0 && op->type == op->src[0]->type) {
                         switch (op->src[0]->type) {
                             case GGML_TYPE_F32:
@@ -1682,8 +1733,14 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             case GGML_OP_GATED_DELTA_NET:
                 spacemit_kernels::rvv::forward_gated_delta_net(ctx, op);
                 return true;
+            case GGML_OP_ARGMAX:
+                spacemit_kernels::scalar::forward_argmax_f32(ctx, op);
+                return true;
             case GGML_OP_ARGSORT:
                 spacemit_kernels::scalar::forward_argsort_f32(ctx, op);
+                return true;
+            case GGML_OP_TOP_K:
+                spacemit_kernels::scalar::forward_top_k10_f32(ctx, op);
                 return true;
             case GGML_OP_CLAMP:
                 spacemit_kernels::scalar::forward_clamp_f32(ctx, op);
@@ -1756,6 +1813,8 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
         }
 
         if (spacemit_kernels::rvv::forward_flash_attn_ext_f16_paddle_gqa8_exact(ctx, dst)) return true;
+        if (spacemit_kernels::rvv::forward_flash_attn_ext_f16_gqa_ime256_r24(ctx, dst)) return true;
+        if (spacemit_kernels::rvv::forward_flash_attn_ext_f16_gqa_group(ctx, dst)) return true;
 
         // total rows in q
         const int64_t nr = neq1 * neq2 * neq3;
@@ -2190,6 +2249,18 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
             const auto * traits=ggml_spacemit_get_tensor_traits(node.node);
             return traits&&traits->compute_forward_fused(ctx,node);
         }
+        case SPACEMIT_OP_GDN_SNAPSHOT_DIRECT:
+            if (ocr_gdn_snapshot_store::storage_eligible(node.gdn_snapshots[0], node.gdn_snapshots[1])) {
+                spacemit_kernels::rvv::forward_gated_delta_net_snapshot_store(ctx, node.node,
+                    node.gdn_snapshots[1]);
+                return true;
+            }
+            break;
+        case SPACEMIT_OP_GDN_SNAPSHOT_STORE:
+            if (ocr_gdn_snapshot_store::storage_eligible(node.gdn_snapshots[0], node.gdn_snapshots[1])) {
+                return true;
+            }
+            break;
         case SPACEMIT_OP_GDN_STATE_GATHER:
         case SPACEMIT_OP_GDN_STATE_STORE:
             // nothing to do when the state is updated in place in the cache row
@@ -2348,6 +2419,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_CONT:
             if (op->src[0] && op->type == op->src[0]->type) {
+                if (op->type == GGML_TYPE_I32 && ggml_is_contiguous(op) &&
+                    ggml_nelements(op) == ggml_nelements(op->src[0])) {
+                    return common;
+                }
                 // permute case
                 if (op->nb[0] != op->src[0]->nb[0] && op->nb[0] == op->src[0]->nb[1] &&
                     op->ne[3] * op->ne[2] * op->nb[2] == op->src[0]->ne[3] * op->src[0]->ne[2] * op->src[0]->nb[2]) {
@@ -2419,6 +2494,16 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_GET_ROWS:
+            // The sampler support probe supplies an existing I32 candidate
+            // vector to TOP_K, which gathers candidate IDs by the top indices.
+            if (op->src[0] && op->src[1] && op->src[0]->type == GGML_TYPE_I32 &&
+                op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32 &&
+                ggml_is_matrix(op->src[0]) && ggml_is_vector(op->src[1]) &&
+                op->src[0]->nb[0] == sizeof(int32_t) && op->src[1]->nb[0] == sizeof(int32_t) &&
+                ggml_is_contiguous(op) && op->ne[0] == op->src[0]->ne[0] &&
+                ggml_nrows(op) == ggml_nelements(op->src[1])) {
+                return common;
+            }
             if (op->src[0] && op->src[1] &&
                 (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 op->type == op->src[0]->type &&
@@ -2430,6 +2515,14 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_CONCAT:
+            if (op->src[0] && op->src[1] && ggml_get_op_params_i32(op, 0) == 1 &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_is_matrix(op->src[0]) && ggml_is_matrix(op->src[1]) && ggml_is_matrix(op) &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
+                op->src[0]->ne[0] == op->src[1]->ne[0] && op->ne[0] == op->src[0]->ne[0] &&
+                op->ne[1] == op->src[0]->ne[1] + op->src[1]->ne[1]) {
+                return common;
+            }
             if (op->src[0] && op->src[1] && ggml_get_op_params_i32(op, 0) == 0 &&
                 (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 op->src[1]->type == op->src[0]->type && op->type == op->src[0]->type &&
@@ -2525,6 +2618,21 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_SSM_CONV:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_ARGMAX:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                ggml_is_matrix(op->src[0]) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= INT32_MAX &&
+                op->ne[0] == op->src[0]->ne[1] && ggml_nelements(op) == op->src[0]->ne[1])
+                return common;
+            break;
+        case GGML_OP_TOP_K:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(int32_t) &&
+                op->ne[0] == 10 && op->src[0]->ne[0] >= 10 && op->src[0]->ne[0] <= INT32_MAX &&
+                op->ne[1] == op->src[0]->ne[1] && op->ne[2] == op->src[0]->ne[2] &&
+                op->ne[3] == op->src[0]->ne[3])
                 return common;
             break;
         case GGML_OP_ARGSORT:

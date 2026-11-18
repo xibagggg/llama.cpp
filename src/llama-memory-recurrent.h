@@ -71,7 +71,9 @@ public:
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
-    uint32_t n_rs_seq = 0;
+    uint32_t n_rs_seq = 0; // active budget, changed only after a complete logical clear
+    const uint32_t n_rs_seq_capacity; // immutable allocation budget
+    bool has_allocated_states() const { return !is_empty(); }
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;

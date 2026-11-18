@@ -18,7 +18,7 @@ struct item {
     char name[64];
 };
 struct storage {
-    static constexpr unsigned capacity=8192;
+    static constexpr unsigned capacity=65536;
     struct alignas(128) lane {unsigned used=0;item data[capacity];};
     lane lanes[8];std::atomic<uint64_t> next{0};
     storage(){

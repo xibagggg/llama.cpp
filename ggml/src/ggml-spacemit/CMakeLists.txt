@@ -51,6 +51,8 @@ ggml_add_backend_library(${TARGET_NAME}
     scalar_kernels.cpp
     repack.cpp
     spacemit-context.h
+    spacemit-tcm-ownership.h
+    spacemit-tcm-ownership-linux.h
     spacemit-fused.cpp
     spacemit-fused.h
     spacemit-env.h
@@ -61,7 +63,7 @@ set_target_properties(${TARGET_NAME} PROPERTIES
     C_VISIBILITY_PRESET hidden
     CXX_VISIBILITY_PRESET hidden)
 
-target_link_libraries(${TARGET_NAME} PRIVATE ${SPERT_LIB})
+target_link_libraries(${TARGET_NAME} PRIVATE ${SPERT_LIB} ${CMAKE_DL_LIBS})
 target_link_directories(${TARGET_NAME} PUBLIC "${SPERT_DIR}/lib")
 target_link_options(${TARGET_NAME} PUBLIC "-Wl,-rpath-link,${SPERT_DIR}/lib")
 

@@ -1,0 +1,10 @@
+[
+  "g++",
+  "-std=c++17",
+  "-O2",
+  "-UNDEBUG",
+  "-I/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/gdn/frozen48/fixtures",
+  "/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/gdn/frozen48/fixtures/admission-and-store.cpp",
+  "-o",
+  "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/a06-published-engine-tests-20261118/gdn-admission44-copy8/test"
+]

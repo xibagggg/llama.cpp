@@ -10,6 +10,11 @@
 #include "ocr-concat-tcm-v46.h"
 #include "ocr-worker-events.h"
 #include "paddle-vision-rope-layout.h"
+#include "ocr-gdn-tcm.h"
+#include "ocr-gdn-rollback-tcm.h"
+#include "ocr-gdn-snapshot-store.h"
+#include "ocr-conv-snapshot-copy.h"
+#include "ocr-d2t-scatter.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -52,7 +57,13 @@ std::atomic<bool> paddle_gqa8_exact_admitted{false};
 std::atomic<uint64_t> paddle_gqa8_exact_calls{0};
 bool paddle_gqa8_exact_reported = false; // dispatching host thread only
 constexpr size_t PADDLE_GQA8_EXACT_TCM = 8 * (128 + 128) * sizeof(_Float16);
+// Published by the dispatching host before the worker launch. Workers do not
+// read the environment or initialize a function-local static for this option.
+std::atomic<bool> ocr_concat_decode_segmented_enabled{false};
+std::atomic<bool> ocr_decode_gqa_kv_pack_enabled{false};
+std::atomic<unsigned> ocr_decode_gqa_group_mode{0};
 }
+
 
 void prepare_paddle_fa_gqa8_exact(unsigned workers, size_t shared_bytes, bool pinned_tcm) {
     static const bool requested = [] {
@@ -67,6 +78,8 @@ void prepare_paddle_fa_gqa8_exact(unsigned workers, size_t shared_bytes, bool pi
 
 
 void prepare_ocr_worker_state() {
+    ocr_gdn_tcm::prepare();
+    ocr_conv_snapshot_copy::prepare_on_host();
     // Resolve these guards/environment reads on the dispatching host thread,
     // in this TU (ocr_fa_x8_enabled has internal linkage). No RVV/IME work here.
     (void)ocr_worker_events::get();
@@ -79,6 +92,8 @@ void prepare_ocr_worker_state() {
     (void)ocr_fa_serial_p2_v3::pair_qk_calls();
     (void)ocr_fa_pack_v40::direct_v44();
     (void)ocr_fa_pack_v40::lazy_init();
+    (void)ocr_fa_fullkv::normal_exp_enabled();
+    (void)ocr_fa_fullkv::blocked_softmax_enabled();
     (void)ocr_fa_fullkv::trust_bounds_enabled();
     (void)ocr_fa_fullkv::head_key_cache_enabled();
     (void)ocr_fa_fullkv::head_key_cache_two_pass_enabled();
@@ -101,6 +116,32 @@ void prepare_ocr_worker_state() {
     (void)ocr_fa_x8_enabled();
     (void)paddle_llm_fa_x8::enabled();
     (void)ocr_fa_group_v45::mode();
+    static const bool concat_decode_segmented = [] {
+        const char * option = std::getenv("GGML_SPACEMIT_OCR_CONCAT_DECODE_SEGMENTED");
+        return option && std::strcmp(option, "1") == 0;
+    }();
+    ocr_concat_decode_segmented_enabled.store(concat_decode_segmented, std::memory_order_relaxed);
+    static const bool decode_gqa_kv_pack = [] {
+        const char * option = std::getenv("GGML_SPACEMIT_DECODE_GQA_KV_PACK");
+        return option && std::strcmp(option, "1") == 0;
+    }();
+    ocr_decode_gqa_kv_pack_enabled.store(decode_gqa_kv_pack, std::memory_order_relaxed);
+}
+
+
+void prepare_ocr_gdn_rollback_tcm(unsigned workers, size_t shared_bytes, bool pinned_tcm) {
+    ocr_gdn_rollback_tcm::prepare_on_host(workers, shared_bytes, pinned_tcm);
+}
+
+void prepare_ocr_fa_gqa_group(unsigned workers, size_t shared_bytes, bool pinned_tcm) {
+    const char * option = std::getenv("GGML_SPACEMIT_OCR_FA_GQA_GROUP");
+    unsigned mode = option && std::strcmp(option, "1") == 0 ? 1 :
+                    option && std::strcmp(option, "2") == 0 ? 2 : 0;
+    // Admission is collective and host-side. Per-lane fallback would assign
+    // different output rows after the work-unit reordering.
+    const size_t needed = mode == 1 ? 4096 : 70912;
+    if (workers != 6 || !pinned_tcm || shared_bytes < needed) mode = 0;
+    ocr_decode_gqa_group_mode.store(mode, std::memory_order_relaxed);
 }
 
 void drain_ocr_worker_events() {
@@ -113,6 +154,7 @@ void drain_ocr_worker_events() {
                       PADDLE_GQA8_EXACT_TCM);
         paddle_gqa8_exact_reported = true;
     }
+    ocr_gdn_rollback_tcm::drain_on_host();
     using ocr_worker_events::kind;
     ocr_worker_events::get().drain([](kind event, const ocr_worker_events::values & v) {
         switch(event) {
@@ -130,6 +172,15 @@ void drain_ocr_worker_events() {
                 GGML_LOG_INFO("ocr-fa-group-v45: active qk=%d pv=%d\n",int(v.a),int(v.b));break;
             case kind::pv:
                 GGML_LOG_INFO("ocr-pv-ime2: active passes=%d FP32 probability split, FP32 accumulation\n",int(v.a));break;
+            case kind::concat_segmented:
+                GGML_LOG_INFO("ocr-concat-segmented: active channels=%llu workers=%llu\n",
+                    (unsigned long long)v.a, (unsigned long long)v.b);
+                break;
+            case kind::gqa_proposal:
+            case kind::gqa_verify:
+                GGML_LOG_INFO("ocr-fa-gqa-group: selected mode=%u Q=%u DK=256 DV=256 heads=%u GQA=4 KV=%llu TCM=%zu/%zu\n",
+                    unsigned(v.a), unsigned(v.b), unsigned(v.d), (unsigned long long)v.c, size_t(v.e), size_t(v.f));
+                break;
             case kind::count: break;
         }
     });
@@ -273,6 +324,27 @@ static inline vfloat32m2_t rvv_expf_approx_f32m2(vfloat32m2_t x, size_t vl) {
                                  __riscv_vfmul_vv_f32m2(__riscv_vfmacc_vv_f32m2(s2, s2, j, vl), s1, vl), c, vl);
     return __riscv_vmerge_vvm_f32m2(r1, __riscv_vfmul_vv_f32m2(s1, s1, vl),
                                     __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 192.0f, vl), vl);
+}
+
+// Caller proves every input is in [-80,0], so the original |n|>126
+// slow-range condition is false. Arithmetic and all rounding stay identical.
+static inline vfloat32m2_t rvv_expf_normal_exact_f32m2(vfloat32m2_t x, size_t vl) {
+    const vfloat32m2_t r = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
+    const vfloat32m2_t z = __riscv_vfmacc_vf_f32m2(r, 0x1.715476p+0f, x, vl);
+    const vfloat32m2_t n = __riscv_vfsub_vv_f32m2(z, r, vl);
+    const vfloat32m2_t b =
+        __riscv_vfnmsac_vf_f32m2(__riscv_vfnmsac_vf_f32m2(x, 0x1.62e4p-1f, n, vl), 0x1.7f7d1cp-20f, n, vl);
+    const vuint32m2_t  e = __riscv_vsll_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(z), 23, vl);
+    const vfloat32m2_t k = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(e, 0x3f800000, vl));
+    const vfloat32m2_t u = __riscv_vfmul_vv_f32m2(b, b, vl);
+    const vfloat32m2_t j = __riscv_vfmacc_vv_f32m2(
+        __riscv_vfmul_vf_f32m2(b, 0x1.ffffecp-1f, vl),
+        __riscv_vfmacc_vv_f32m2(
+            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.fffdb6p-2f, vl), 0x1.555e66p-3f, b, vl),
+            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.573e2ep-5f, vl), 0x1.0e4020p-7f, b, vl), u, vl),
+        u, vl);
+
+    return __riscv_vfmacc_vv_f32m2(k, j, k, vl);
 }
 
 static inline vfloat32m2_t rvv_tanh_approx_f32m2(vfloat32m2_t x, size_t vl) {
@@ -916,36 +988,73 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
         float *    mv_tile_pack   = reinterpret_cast<float *>(mv_tile_addr);
 
         const int64_t k_tile_byte_stride = ic_tile_step * (int64_t) sizeof(_Float16);
+        // Decode GQA4 uses the same 64-visible-row groups as the original
+        // path. Only an entirely visible physical tile is packed in bulk;
+        // holes, small tails, other head sizes and verification batches
+        // retain the original row loader and arithmetic below.
+        const bool bulk_decode_pack = QLEN == 4 && n_mask_rows == 1 && DK == 256 && DV == 256 &&
+            ic_tile_step == 64 &&
+            ocr_decode_gqa_kv_pack_enabled.load(std::memory_order_relaxed);
 
         int64_t ic_step = 0;
         for (int64_t ic = 0; ic < nek1; ++ic) {
-            float mvs[16];
-            bool  visible = false;
-            for (int64_t m = 0; m < n_mask_rows; ++m) {
-                mvs[m] = mask_at(m, ic);
-                visible |= mvs[m] != -INFINITY;
+            bool packed_bulk = false;
+            if (bulk_decode_pack && ic_step == 0 && nek1 - ic >= ic_tile_step) {
+                bool all_visible = true;
+                for (int64_t j = 0; j < ic_tile_step; ++j) {
+                    const float mv = mask_at(0, ic + j);
+                    mv_tile_pack[j] = mv;
+                    all_visible = all_visible && mv != -INFINITY;
+                }
+                if (all_visible) {
+                    // This existing segmented-store transpose changes only
+                    // the copy schedule; packed F16 bits are unchanged.
+                    rvv_transposed_s16_mn_to_nm(
+                        reinterpret_cast<int8_t *>(k_tile_pack), k_tile_byte_stride,
+                        const_cast<int8_t *>(reinterpret_cast<const int8_t *>(k_data_row + ic * nbk1)),
+                        nbk1, ic_tile_step, DK);
+                    if (nbv1 == DV * (int64_t) sizeof(_Float16)) {
+                        memcpy1d(v_tile_pack, v_data_row + ic * nbv1,
+                                 ic_tile_step * DV * (int64_t) sizeof(_Float16));
+                    } else {
+                        memcpy2d(v_tile_pack, DV * (int64_t) sizeof(_Float16),
+                                 v_data_row + ic * nbv1, nbv1, ic_tile_step,
+                                 DV * (int64_t) sizeof(_Float16));
+                    }
+                    ic_step = ic_tile_step;
+                    ic += ic_tile_step - 1;
+                    packed_bulk = true;
+                }
             }
-
-            if (visible) {
-                const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
-                const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
-
-                // K tile is stored transposed (d-major), V tile row-major
-                for (int64_t d0 = 0; d0 < DK; d0 += seg) {
-                    const size_t       vl       = __riscv_vsetvl_e16m2(DK - d0);
-                    const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data + d0, vl);
-                    __riscv_vsse16_v_f16m2(k_tile_pack + d0 * ic_tile_step + ic_step, k_tile_byte_stride, k_data_v,
-                                           vl);
-                }
-                for (int64_t d0 = 0; d0 < DV; d0 += seg) {
-                    const size_t       vl       = __riscv_vsetvl_e16m2(DV - d0);
-                    const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data + d0, vl);
-                    __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV + d0, v_data_v, vl);
-                }
+            if (!packed_bulk) {
+                float mvs[16];
+                bool  visible = false;
                 for (int64_t m = 0; m < n_mask_rows; ++m) {
-                    mv_tile_pack[m * ic_tile_step + ic_step] = mvs[m];
+                    mvs[m] = mask_at(m, ic);
+                    visible |= mvs[m] != -INFINITY;
                 }
-                ic_step++;
+
+                if (visible) {
+                    const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
+                    const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
+
+                    // K tile is stored transposed (d-major), V tile row-major
+                    for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+                        const size_t       vl       = __riscv_vsetvl_e16m2(DK - d0);
+                        const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data + d0, vl);
+                        __riscv_vsse16_v_f16m2(k_tile_pack + d0 * ic_tile_step + ic_step, k_tile_byte_stride, k_data_v,
+                                               vl);
+                    }
+                    for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                        const size_t       vl       = __riscv_vsetvl_e16m2(DV - d0);
+                        const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data + d0, vl);
+                        __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV + d0, v_data_v, vl);
+                    }
+                    for (int64_t m = 0; m < n_mask_rows; ++m) {
+                        mv_tile_pack[m * ic_tile_step + ic_step] = mvs[m];
+                    }
+                    ic_step++;
+                }
             }
 
             if (ic_step > 0 && (ic_step == ic_tile_step || ic == (nek1 - 1))) {
@@ -1188,8 +1297,80 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
 }
 
 #include "paddle-fa-gqa8-exact.h"
+#include "ocr-fa-gqa-exact.h"
+#include "ocr-fa-gqa-ime256-r24.h"
 
 }  // namespace
+
+
+void prepare_ocr_fa_gqa_ime256_r24(unsigned workers, size_t bytes, bool pinned) {
+    ocr_fa_gqa_ime256_r24::prepare(workers, bytes, pinned);
+}
+bool forward_flash_attn_ext_f16_gqa_ime256_r24(ggml::spacemit::context & ctx, ggml_tensor * dst) {
+    return ocr_fa_gqa_ime256_r24::forward(ctx, dst);
+}
+void drain_ocr_fa_gqa_ime256_r24() {
+    const unsigned mode = ocr_fa_gqa_ime256_r24::selected_mode.load(std::memory_order_relaxed);
+    const auto panels = ocr_fa_gqa_ime256_r24::selected_panels.load(std::memory_order_relaxed);
+    const auto fallback = ocr_fa_gqa_ime256_r24::fallback_panels.load(std::memory_order_relaxed);
+    if (mode && panels) GGML_LOG_INFO("ocr-fa-gqa-ime256-r24: mode=%u panels=%llu fallback=%llu TCM_required=%zu\n",
+        mode, (unsigned long long)panels, (unsigned long long)fallback, ocr_fa_gqa_ime256_r24::required_bytes(mode));
+}
+
+bool forward_flash_attn_ext_f16_gqa_group(ggml::spacemit::context & ctx, ggml_tensor * dst) {
+    const unsigned mode = ocr_decode_gqa_group_mode.load(std::memory_order_relaxed);
+    if (!mode || !dst) return false;
+    const auto * q = dst->src[0]; const auto * k = dst->src[1]; const auto * v = dst->src[2];
+    const auto * mask = dst->src[3]; const auto * sinks = dst->src[4];
+    const float * params = reinterpret_cast<const float *>(dst->op_params);
+    if (!q || !k || !v || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||
+        (q->ne[1] != 15 && q->ne[1] != 16) || (q->ne[2] != 8 && q->ne[2] != 16) ||
+        q->ne[2] != 4 * k->ne[2] || k->ne[2] != v->ne[2] ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[1] <= 0 || k->ne[1] != v->ne[1] ||
+        q->nb[0] != sizeof(float) || k->nb[0] != sizeof(_Float16) || v->nb[0] != sizeof(_Float16) ||
+        dst->ne[0] != 256 || dst->ne[1] != q->ne[2] || dst->ne[2] != q->ne[1] || dst->ne[3] != 1 ||
+        dst->nb[0] != sizeof(float) || params[1] != 0.f ||
+        (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] ||
+                  mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[0] != sizeof(_Float16))) ||
+        (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
+                   sinks->ne[0] != q->ne[2] || ggml_nelements(sinks) != q->ne[2]))) return false;
+    const size_t needed = mode == 1 ? 4096 : 70912;
+    GGML_ASSERT(ctx.nth == 6 && ctx.shared.data && ctx.shared.size >= needed && __riscv_vlenb() == 128);
+    const int64_t tokens = q->ne[1];
+    float scale = params[0]; const float logit_softcap = params[2];
+    if (logit_softcap != 0.f) scale /= logit_softcap;
+    if (ctx.ith == 0) ocr_worker_events::publish(tokens == 15 ? ocr_worker_events::kind::gqa_proposal :
+        ocr_worker_events::kind::gqa_verify,
+        {mode, uint64_t(tokens), uint64_t(k->ne[1]), uint64_t(q->ne[2]), needed, ctx.shared.size});
+    // Unit=(KV head,token); all four GQA query heads share exact K/V/mask.
+    // Every logical output row belongs to exactly one unit and one AI worker.
+    for (int64_t unit = ctx.ith; unit < k->ne[2] * tokens; unit += ctx.nth) {
+        const int64_t kv_head = unit / tokens, token = unit % tokens;
+        std::array<float *, 4> queries{}, outputs{}, sink_rows{};
+        for (int64_t row = 0; row < 4; ++row) {
+            const int64_t head = 4 * kv_head + row;
+            queries[row] = reinterpret_cast<float *>(static_cast<char *>(q->data) + token * q->nb[1] + head * q->nb[2]);
+            outputs[row] = reinterpret_cast<float *>(static_cast<char *>(dst->data) + (head + token * dst->ne[1]) * dst->nb[1]);
+            sink_rows[row] = sinks ? static_cast<float *>(sinks->data) + head : nullptr;
+        }
+        const auto * mask_row = mask ? reinterpret_cast<const ggml_fp16_t *>(
+            static_cast<const char *>(mask->data) + token * mask->nb[1]) : nullptr;
+        const auto * key = static_cast<const char *>(k->data) + kv_head * k->nb[2];
+        const auto * value = static_cast<const char *>(v->data) + kv_head * v->nb[2];
+        if (mode == 1) {
+            flash_attn_ext_gqa4_exact_inner(queries.data(), key, value, mask_row, sink_rows.data(), outputs.data(),
+                scale, logit_softcap, 1.f, k->ne[1], k->nb[1], v->nb[1], 256, 256, ctx.shared.data, ctx.shared.size);
+        } else {
+            // Explicit approximate mode: original packed mrow4 has a different
+            // QK reduction and tile-online softmax/FP16 update order than m1.
+            flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<4>(queries.data(), key, value, mask_row,
+                sink_rows.data(), outputs.data(), scale, logit_softcap, 1.f,
+                k->ne[1], k->nb[1], v->nb[1], 256, 256, ctx.shared.data, ctx.shared.size);
+        }
+    }
+    return true;
+}
 
 bool forward_flash_attn_ext_f16_paddle_gqa8_exact(ggml::spacemit::context & ctx, ggml_tensor * dst) {
     if (!paddle_gqa8_exact_admitted.load(std::memory_order_relaxed) || !dst) return false;
@@ -1864,7 +2045,7 @@ void cast_pack_ocr_kv(ggml::spacemit::context &ctx,ggml_tensor *op){
     ctx.ocr_prepared_attention=op;
 }
 
-template<bool PROFILE>
+template<bool PROFILE,bool NORMAL_EXP=false>
 static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int capacity,
                             _Float16*high,_Float16*low,int passes,float*inverse){
     const int mode=ocr_fa_fullkv::softmax_pack_mode();
@@ -1892,11 +2073,23 @@ static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int ca
     for(int row=0;row<rows;++row){
         const float*p=scores+size_t(row)*n;
         auto vmax=__riscv_vfmv_v_f_f32m4(-INFINITY,128);
+        auto vmin=__riscv_vfmv_v_f_f32m4(INFINITY,128);
         for(int k=0;k<n;k+=128){const size_t vl=std::min(128,n-k);
-            vmax=__riscv_vfmax_vv_f32m4_tu(vmax,vmax,__riscv_vle32_v_f32m4(p+k,vl),vl);}
+            const auto values=__riscv_vle32_v_f32m4(p+k,vl);
+            vmax=__riscv_vfmax_vv_f32m4_tu(vmax,vmax,values,vl);
+            if constexpr(NORMAL_EXP)vmin=__riscv_vfmin_vv_f32m4_tu(vmin,vmin,values,vl);
+        }
         const float maximum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m4_f32m1(
             vmax,__riscv_vfmv_v_f_f32m1(-INFINITY,1),128));
         if(!std::isfinite(maximum))return false;
+        bool normal_row=false;
+        if constexpr(NORMAL_EXP){
+            const float minimum=__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmin_vs_f32m4_f32m1(
+                vmin,__riscv_vfmv_v_f_f32m1(INFINITY,1),128));
+            // The margin from -80 to the normal exp boundary near -87 makes
+            // the proof conservative across FP32 subtraction/round-to-integer.
+            normal_row=minimum-maximum>=-80.f;
+        }
         float sum=0;auto vsum=__riscv_vfmv_v_f_f32m2(0,64);
         const bool batch_check=ocr_fa_fullkv::batch_check_enabled();
         auto bad_any=__riscv_vmclr_m_b16(64);
@@ -1904,7 +2097,11 @@ static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int ca
         // vsetvl may split the final AVL in (VLMAX,2*VLMAX) into two
         // balanced vectors. Mode 1 retains the original sum grouping.
         for(int k=0;k<n;){const size_t vl=mode==1?__riscv_vsetvl_e32m2(n-k):std::min(64,n-k);
-            const auto f=rvv_expf_approx_f32m2(__riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(p+k,vl),maximum,vl),vl);
+            const auto exponent=__riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(p+k,vl),maximum,vl);
+            const auto f=[&] {
+                if constexpr(NORMAL_EXP)if(normal_row)return rvv_expf_normal_exact_f32m2(exponent,vl);
+                return rvv_expf_approx_f32m2(exponent,vl);
+            }();
             if(!trusted){
                 const auto bad=__riscv_vmor_mm_b16(__riscv_vmfne_vv_f32m2_b16(f,f,vl),
                     __riscv_vmor_mm_b16(__riscv_vmflt_vf_f32m2_b16(f,0.f,vl),__riscv_vmfgt_vf_f32m2_b16(f,1.001f,vl),vl),vl);
@@ -1942,6 +2139,88 @@ static bool ocr_softmax_pack(const float*scores,int rows,int n,int padded,int ca
 }
 
 #include "ocr-fa-serial-p2-v3.h"
+// Native IME2 8x8 scores and probabilities have the same panel layout:
+// [query/8, key/8, query%8, key%8]. Keep it throughout the attention core.
+// Arithmetic stays FP32, FP16 probability/weight precision is unchanged.
+// Parallel lane sums change their reduction grouping and require acceptance.
+static bool ocr_softmax_pack_blocked(const float*scores,int rows,int n,int padded,int capacity,
+                                     _Float16*high,_Float16*low,int passes,float*inverse){
+    if(rows<1||rows>capacity||capacity%8||n<1||padded<n||padded%8||padded-n>=8||
+       (passes!=1&&passes!=2))return false;
+    constexpr size_t vl=64;
+    const auto ids=__riscv_vid_v_u32m2(vl);
+    const auto column=__riscv_vand_vx_u32m2(ids,7,vl);
+    const auto row_index=__riscv_vsrl_vx_u32m2(ids,3,vl);
+    const auto rowbase=__riscv_vand_vx_u32m2(ids,~uint32_t(7),vl);
+    const auto eight=__riscv_vmul_vx_u32m2(__riscv_vid_v_u32m2(8),8,8);
+    const int rounded=(rows+7)/8*8;
+    // Keep the same zero padding contract as the row-major implementation:
+    // PV may read all capacity*padded entries, including the partial key
+    // panel and query rows beyond `rows`.
+    if(rounded<capacity || n!=padded){
+        std::memset(high,0,size_t(capacity)*padded*sizeof(_Float16));
+        if(passes==2)std::memset(low,0,size_t(capacity)*padded*sizeof(_Float16));
+    }
+    for(int first=0;first<rows;first+=8){
+        const auto *p=scores+size_t(first)*padded;
+        auto vmax=__riscv_vfmv_v_f_f32m2(-INFINITY,vl);
+        for(int k=0;k<padded;k+=8){
+            auto x=__riscv_vle32_v_f32m2(p+size_t(k)*8,vl);
+            const auto valid_keys=__riscv_vmsltu_vx_u32m2_b16(column,n-k,vl);
+            if(k+8>n)x=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(-INFINITY,vl),x,valid_keys,vl);
+            vmax=__riscv_vfmax_vv_f32m2(vmax,x,vl);
+        }
+        // Reduce each independent eight-lane row group. A plain reduction
+        // would mix adjacent query rows at the group boundaries.
+        for (int shift : {4,2,1}) {
+            const auto shifted=__riscv_vslidedown_vx_f32m2(vmax,shift,vl);
+            const auto candidate=__riscv_vfmax_vv_f32m2(vmax,shifted,vl);
+            const auto mask=__riscv_vmsltu_vx_u32m2_b16(column,8-shift,vl);
+            vmax=__riscv_vmerge_vvm_f32m2(vmax,candidate,mask,vl);
+        }
+        const auto maximum=__riscv_vrgather_vv_f32m2(vmax,rowbase,vl);
+        const int valid_rows=std::min(8,rows-first);
+        const auto max_valid=__riscv_vrgather_vv_f32m2(vmax,eight,valid_rows);
+        const auto bad_max=__riscv_vmor_mm_b16(__riscv_vmfne_vv_f32m2_b16(max_valid,max_valid,valid_rows),
+            __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(max_valid,valid_rows),3.402823466e38f,valid_rows),valid_rows);
+        if(__riscv_vcpop_m_b16(bad_max,valid_rows))return false;
+        auto sum=__riscv_vfmv_v_f_f32m2(0.f,vl);
+        for(int k=0;k<padded;k+=8){
+            auto x=__riscv_vfsub_vv_f32m2(__riscv_vle32_v_f32m2(p+size_t(k)*8,vl),maximum,vl);
+            const auto valid_keys=__riscv_vmsltu_vx_u32m2_b16(column,n-k,vl);
+            if(k+8>n)x=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(-INFINITY,vl),x,valid_keys,vl);
+            auto f=rvv_expf_approx_f32m2(x,vl);
+            // Do not rely on the approximation's -inf behavior for the
+            // padded key lanes. They must contribute zero and be stored zero.
+            if(k+8>n)f=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(0.f,vl),f,valid_keys,vl);
+            if(valid_rows!=8)f=__riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(0.f,vl),f,
+                __riscv_vmsltu_vx_u32m2_b16(row_index,valid_rows,vl),vl);
+            sum=__riscv_vfadd_vv_f32m2(sum,f,vl);
+            const auto h=__riscv_vfncvt_f_f_w_f16m1(__riscv_vfmul_vf_f32m2(f,1024.f,vl),vl);
+            __riscv_vse16_v_f16m1(high+size_t(first)*padded+size_t(k)*8,h,vl);
+            if(passes==2){
+                const auto restored=__riscv_vfmul_vf_f32m2(__riscv_vfwcvt_f_f_v_f32m2(h,vl),1.f/1024.f,vl);
+                const auto l=__riscv_vfncvt_f_f_w_f16m1(__riscv_vfmul_vf_f32m2(
+                    __riscv_vfsub_vv_f32m2(f,restored,vl),16777216.f,vl),vl);
+                __riscv_vse16_v_f16m1(low+size_t(first)*padded+size_t(k)*8,l,vl);
+            }
+        }
+        for (int shift : {4,2,1}) {
+            const auto shifted=__riscv_vslidedown_vx_f32m2(sum,shift,vl);
+            const auto candidate=__riscv_vfadd_vv_f32m2(sum,shifted,vl);
+            const auto mask=__riscv_vmsltu_vx_u32m2_b16(column,8-shift,vl);
+            sum=__riscv_vmerge_vvm_f32m2(sum,candidate,mask,vl);
+        }
+        const auto sums=__riscv_vrgather_vv_f32m2(sum,eight,valid_rows);
+        float sum_rows[8];
+        __riscv_vse32_v_f32m2(sum_rows,sums,valid_rows);
+        for(int r=0;r<valid_rows;++r){
+            if(!(sum_rows[r]>0.f)||!std::isfinite(sum_rows[r]))return false;
+            inverse[first+r]=1.f/sum_rows[r];
+        }
+    }
+    return true;
+}
 
 template<bool PROFILE>
 static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,int ir0,int ir1){
@@ -1949,6 +2228,8 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     constexpr int D=ocr_fa_fullkv::D;
     const auto *q=dst->src[0];const int n=int(q->ne[1]);
     const int padded=int(ocr_fa_pack_v40::full_k(dst)),passes=ocr_fa_pack_v40::full_kv_mode();
+    const bool blocked=ocr_fa_fullkv::blocked_softmax_enabled();
+    const int score_stride=blocked?padded:n;
     float scale;std::memcpy(&scale,dst->op_params,sizeof(scale));
     const size_t qk_bytes=64*D*sizeof(_Float16)+512*sizeof(float);
     const bool compact=ocr_fa_fullkv::compact_enabled();
@@ -1961,13 +2242,13 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     // QK scratch is dead before probabilities are written, and packed Q is
     // dead before PV starts. Reuse those two regions for the QK/PV results.
     // The saved 4096 bytes let N1008 keep the final padded K tile in TCM too.
-    const size_t all_key_bytes=16*D*sizeof(_Float16)+16*n*sizeof(float)+
+    const size_t all_key_bytes=16*D*sizeof(_Float16)+16*score_stride*sizeof(float)+
         16*padded*sizeof(_Float16)+vd*padded*sizeof(_Float16)+
         size_t(key_tiles)*64*D*sizeof(_Float16);
     const bool all_key_cache=all_key_option&&head_option&&passes==1&&
         ocr_fa_fullkv::direct_pack_enabled()&&all_key_bytes<=ctx.shared.size;
     const auto bytes_for=[&](int queries,bool cache){return (cache?1:2)*queries*D*sizeof(_Float16)+
-        (cache?512*sizeof(float):qk_bytes)+queries*n*sizeof(float)+passes*queries*padded*sizeof(_Float16)+
+        (cache?512*sizeof(float):qk_bytes)+queries*score_stride*sizeof(float)+passes*queries*padded*sizeof(_Float16)+
         vd*padded*sizeof(_Float16)+passes*512*sizeof(float)+(cache?cached_key_bytes:0);};
     // Cache complete K tiles with V, leaving the final K tile transient in
     // the not-yet-written P buffer. Q16 fits without enlarging the TCM grant.
@@ -1984,7 +2265,7 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
     auto *packed_q=head_cache?raw:raw+Q*D;
     void *qk_scratch=packed_q+Q*D;
     auto *scores=reinterpret_cast<float*>(static_cast<char*>(qk_scratch)+(all_key_cache?0:head_cache?512*sizeof(float):qk_bytes));
-    auto *high=reinterpret_cast<_Float16*>(scores+Q*n);
+    auto *high=reinterpret_cast<_Float16*>(scores+Q*score_stride);
     auto *low=high+Q*padded;
     auto *weights=high+passes*Q*padded;
     // The QK helper writes at most 512 floats, before softmax overwrites P.
@@ -2029,12 +2310,21 @@ static bool forward_ocr_full_kv(ggml::spacemit::context &ctx,ggml_tensor *dst,in
             const auto*key=cached?cached_keys+size_t(ic/64)*64*D:pk;
             // Last-tile scratch aliases P only before softmax writes P.
             void*scratch=head_cache&&!cached?static_cast<void*>(high):qk_scratch;
-            if(!ocr_qk_ime2_v53::qk(scores+ic,packed_q,key,n,rows,std::min(64,n-ic),scratch,cached))return false;
+            const bool ok=blocked
+                ?ocr_qk_ime2_v53::qk_blocked(scores+size_t(ic)*8,packed_q,key,score_stride,rows,std::min(64,n-ic),scratch,cached)
+                :ocr_qk_ime2_v53::qk(scores+ic,packed_q,key,n,rows,std::min(64,n-ic),scratch,cached);
+            if(!ok)return false;
         }
         if constexpr(PROFILE)phase.tick(5); // QK includes packed-key copy
         float inverse[32];
-        if(ocr_fa_fullkv::softmax_pack_mode()){
-            if(!ocr_softmax_pack<PROFILE>(scores,rows,n,padded,Q,high,low,passes,inverse))return false;
+        if(blocked){
+            if(!ocr_softmax_pack_blocked(scores,rows,n,padded,Q,high,low,passes,inverse))return false;
+            if constexpr(PROFILE)phase.tick(6);
+        }else if(ocr_fa_fullkv::softmax_pack_mode()){
+            const bool packed=ocr_fa_fullkv::normal_exp_enabled()
+                ?ocr_softmax_pack<PROFILE,true>(scores,rows,n,padded,Q,high,low,passes,inverse)
+                :ocr_softmax_pack<PROFILE>(scores,rows,n,padded,Q,high,low,passes,inverse);
+            if(!packed)return false;
             if constexpr(PROFILE)phase.tick(6); // fused softmax + probability packing
         }else{
         for(int row=0;row<rows;++row){
@@ -4263,16 +4553,16 @@ struct gdn_chunk_args {
 
 // One (head, seq): s_in / s_out are the transposed states (S_v x S_v), attn_data the first token's output.
 static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1, int64_t iv1, int64_t iq3, int64_t ik3,
-                             int64_t iv3, const float * s_in, float * s_out, float * attn_data) {
+                             int64_t iv3, const float * s_in, float * s_out, float * attn_data, float * scratch_workspace) {
     const int64_t D  = a.S_v;
     const int64_t CS = GDN_CHUNK_SIZE;
 
     static thread_local std::vector<float> buf;
     const size_t need = D * D + 7 * CS * D + 3 * CS * CS + 4 * CS + 64;
-    if (buf.size() < need) {
+    if (scratch_workspace == nullptr && buf.size() < need) {
         buf.resize(need);
     }
-    float * S   = buf.data();
+    float * S   = scratch_workspace != nullptr ? scratch_workspace : buf.data();
     float * Qc  = S + D * D;
     float * Kc  = Qc + CS * D;
     float * U   = Kc + CS * D;  // v rows, then U in place
@@ -4367,7 +4657,8 @@ static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1,
     gdn_transpose(D, D, S, D, s_out, D);
 }
 
-static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_rows) {
+static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_rows,
+                                         const ggml_tensor * snapshot_store) {
     const ggml_tensor * src_q     = op->src[0];
     const ggml_tensor * src_k     = op->src[1];
     const ggml_tensor * src_v     = op->src[2];
@@ -4399,6 +4690,14 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
 
     const float scale = 1.0f / sqrtf((float) S_v);
     const bool  kda   = src_g->ne[0] == S_v;
+    if (ocr_gdn_rollback_tcm::debug_enabled.load(std::memory_order_relaxed) && ctx.ith == 0) {
+        fprintf(stderr, "[gdn] S_v=%lld H=%lld T=%lld K=%lld kda=%d vlmax_m4=%lld vlmax_m8=%lld\n",
+                (long long) S_v, (long long) H, (long long) n_tokens, (long long) K, (int) kda,
+                (long long) __riscv_vsetvlmax_e32m4(), (long long) __riscv_vsetvlmax_e32m8());
+        fprintf(stderr, "[gdn] q.ne=[%lld,%lld,%lld,%lld] v.ne=[%lld,%lld,%lld,%lld]\n",
+                (long long) src_q->ne[0], (long long) src_q->ne[1], (long long) src_q->ne[2], (long long) src_q->ne[3],
+                (long long) src_v->ne[0], (long long) src_v->ne[1], (long long) src_v->ne[2], (long long) src_v->ne[3]);
+    }
 
     // prefill: chunkwise form (the token recurrence below handles the remaining cases)
     if (K == 1 && !kda && n_tokens >= 16 && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
@@ -4409,13 +4708,19 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
         const int64_t        rq3c = n_seqs / src_q->ne[3];
         const int64_t        rk3c = n_seqs / src_k->ne[3];
         const gdn_chunk_args args = { src_q, src_k, src_v, src_g, src_beta, S_v, H, n_tokens, scale };
+        float * gdn_scratch = nullptr;
+        if (ocr_gdn_tcm::enabled() && ctx.shared.data != nullptr &&
+            reinterpret_cast<uintptr_t>(ctx.shared.data) % alignof(float) == 0 &&
+            ocr_gdn_tcm::scratch_bytes(S_v) <= ctx.shared.size) {
+            gdn_scratch = static_cast<float *>(ctx.shared.data);
+        }
         for (int64_t ir = ir0; ir < ir1; ++ir) {
             const int64_t iv1 = ir % H;
             const int64_t iv3 = ir / H;
             gdn_chunked_head(args, iv1 % src_q->ne[1], iv1 % src_k->ne[1], iv1, iv3 / rq3c, iv3 / rk3c, iv3,
                              state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v,
                              state_out_base + (iv3 * H + iv1) * S_v * S_v,
-                             attn_out_base + (iv3 * n_tokens * H + iv1) * S_v);
+                             attn_out_base + (iv3 * n_tokens * H + iv1) * S_v, gdn_scratch);
         }
         return;
     }
@@ -4436,8 +4741,14 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
     std::vector<float> state_work((fused && K > 1) ? (size_t) (S_v * S_v) : 0);
     // Two-pass scratch: per-row delta and attention sums, plus its own K > 1
     // working copy of the state.
-    std::vector<float> scratch(!fused ? (size_t) (3 * S_v + (K > 1 ? S_v * S_v : 0)) : 0);
-    float * delta      = !fused ? scratch.data() : nullptr;
+    // Host admitted enough private pinned TCM for this exact K16 shape.
+    // Every scratch float read below is fully written first. Arithmetic and
+    // snapshot stores retain the original order; only storage is changed.
+    float * rollback_tcm = ocr_gdn_rollback_tcm::workspace(op, ctx.shared.data, ctx.shared.size,
+        unsigned(ctx.ith), unsigned(ctx.nth), ctx.check_tcm_view);
+    std::vector<float> scratch(!fused && !rollback_tcm ?
+        (size_t) (3 * S_v + (K > 1 ? S_v * S_v : 0)) : 0);
+    float * delta      = !fused ? (rollback_tcm ? rollback_tcm : scratch.data()) : nullptr;
     float * decay      = !fused ? delta + S_v : nullptr;
     float * state_q    = !fused ? decay + S_v : nullptr;
     float * state_work_tp = (!fused && K > 1) ? state_q + S_v : nullptr;
@@ -4533,8 +4844,9 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
-                    float * state_snapshot = state_out_base + target_slot * state_size_per_snap +
-                                             (iv3 * H + iv1) * S_v * S_v;
+                    float * state_snapshot = snapshot_store != nullptr ?
+                        ocr_gdn_snapshot_store::snapshot_pointer(snapshot_store->data, snapshot_store->nb[2], target_slot, iv1) :
+                        state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                     memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
                 }
             }
@@ -4543,11 +4855,17 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
 }
 
 void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
-    forward_gated_delta_net_impl(ctx, op, nullptr);
+    forward_gated_delta_net_impl(ctx, op, nullptr, nullptr);
 }
 
 void forward_gated_delta_net_inplace(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_row) {
-    forward_gated_delta_net_impl(ctx, op, state_row);
+    forward_gated_delta_net_impl(ctx, op, state_row, nullptr);
+}
+
+void forward_gated_delta_net_snapshot_store(ggml::spacemit::context & ctx, ggml_tensor * op,
+                                           const ggml_tensor * store) {
+    GGML_ASSERT(ocr_gdn_snapshot_store::storage_eligible(op, store));
+    forward_gated_delta_net_impl(ctx, op, nullptr, store);
 }
 
 void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
@@ -4596,6 +4914,10 @@ void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
+
+    // Optional exact-bit segmented gather for speculative rollback row strides.
+    // Keep all unsupported/aliased cases on the original path below.
+    if (ocr_conv_snapshot_copy::copy(src0, dst, unsigned(ctx.ith), unsigned(ctx.nth))) return;
 
     GGML_ASSERT(op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(dst));
@@ -5469,7 +5791,7 @@ void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     forward_mul_mat_f16_f32_impl<false>(ctx, op, nullptr);
 }
 
-// General stride-aware contiguous copy for F32/F16.
+// General stride-aware contiguous copy for F32/F16/I32.
 // src0 may be non-contiguous; dst is always contiguous.
 // Parallel over elements across ctx.nth cores.
 template <typename T>
@@ -5520,6 +5842,7 @@ void forward_cont_general(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
 template void forward_cont_general<float>(ggml::spacemit::context & ctx, ggml_tensor * op);
 template void forward_cont_general<_Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_cont_general<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
@@ -5859,6 +6182,18 @@ void forward_rope(ggml::spacemit::context & ctx, ggml_tensor * op) {
 }
 
 void forward_set_rows(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    // The host catalog admits only immutable, validated unique DSpark I64 IDs.
+    // Generic duplicate/invalid/strided/other-type semantics stay below.
+    if (ctx.d2t_scatter) {
+        if (const auto * plan = ctx.d2t_scatter->find(op)) {
+            ctx.d2t_scatter->record_worker_hit(plan, ctx.ith);
+            ocr_d2t_scatter::copy_unique(
+                static_cast<const uint32_t *>(op->src[0]->data),
+                static_cast<uint32_t *>(op->data), plan->offsets,
+                plan->rows, plan->columns, plan->full_rows, ctx.ith, ctx.nth, plan->mode);
+            return;
+        }
+    }
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
@@ -6196,6 +6531,74 @@ bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * ds
     return true;
 }
 
+// Decode-only state concat: the three old-state fields and the new QKV field
+// form one contiguous four-float output row. Materializing the unused first
+// field as well lets segmented loads/stores replace the strided field copies.
+// No floating-point arithmetic is performed, so all copied bits are preserved.
+static bool forward_concat_decode_segmented_f32(ggml::spacemit::context & ctx, ggml_tensor * op,
+                                                int64_t col0) {
+    if (!ocr_concat_decode_segmented_enabled.load(std::memory_order_relaxed) || col0 != 1 ||
+        !op || !op->src[0] || !op->src[1] || ctx.nth == 0 || ctx.ith >= ctx.nth) {
+        return false;
+    }
+    const ggml_tensor * state = op->src[0];
+    const ggml_tensor * qkv   = op->src[1];
+    const int64_t channels   = op->ne[1];
+    if (ggml_get_op_params_i32(op, 0) != 0 || op->type != GGML_TYPE_F32 ||
+        state->type != GGML_TYPE_F32 || qkv->type != GGML_TYPE_F32 ||
+        op->ne[0] != 4 || state->ne[0] != 3 || qkv->ne[0] != 1 || channels <= 0 ||
+        state->ne[1] != channels || qkv->ne[1] != channels ||
+        op->ne[2] != 1 || op->ne[3] != 1 || state->ne[2] != 1 || state->ne[3] != 1 ||
+        qkv->ne[2] != 1 || qkv->ne[3] != 1 ||
+        op->nb[0] != sizeof(float) || op->nb[1] != 4 * sizeof(float) ||
+        state->nb[0] != sizeof(float) || state->nb[1] != 3 * sizeof(float) ||
+        qkv->nb[1] != sizeof(float) || qkv->nb[0] != size_t(channels) * sizeof(float) ||
+        !op->data || !state->data || !qkv->data) {
+        return false;
+    }
+    const uintptr_t out = reinterpret_cast<uintptr_t>(op->data);
+    const size_t out_bytes = ggml_nbytes(op);
+    if (out % alignof(float) != 0) {
+        return false;
+    }
+    // The full output row is written, so conservatively reject any overlap
+    // with either source, including a source view's physical row gaps.
+    for (const ggml_tensor * source : {state, qkv}) {
+        const uintptr_t in = reinterpret_cast<uintptr_t>(source->data);
+        const size_t in_bytes = ggml_nbytes(source);
+        const bool disjoint = out < in ? in - out >= out_bytes : out - in >= in_bytes;
+        if (in % alignof(float) != 0 || !disjoint) {
+            return false;
+        }
+    }
+    const int64_t dc = (channels + int64_t(ctx.nth) - 1) / int64_t(ctx.nth);
+    const int64_t c1 = std::min(dc * int64_t(ctx.ith + 1), channels);
+    for (int64_t c = dc * int64_t(ctx.ith); c < c1;) {
+        const float * old_row = static_cast<const float *>(state->data) + 3 * c;
+        const float * new_row = static_cast<const float *>(qkv->data) + c;
+        float * out_row = static_cast<float *>(op->data) + 4 * c;
+        size_t vl;
+        // EMUL=2: three loaded fields occupy v8/v10/v12 (v8..v13),
+        // QKV occupies v14..v15, and the four-field store uses v8..v15.
+        // NFIELDS * EMUL = 8 is legal; every group starts at an even register.
+        // Keep vsetvli inside the asm so no compiler VL state is assumed.
+        asm volatile(
+            "vsetvli %[vl], %[remaining], e32, m2, ta, ma\n\t"
+            "vlseg3e32.v v8, (%[old_row])\n\t"
+            "vle32.v v14, (%[new_row])\n\t"
+            "vsseg4e32.v v8, (%[out_row])\n\t"
+            : [vl] "=&r" (vl)
+            : [remaining] "r" (size_t(c1 - c)), [old_row] "r" (old_row),
+              [new_row] "r" (new_row), [out_row] "r" (out_row)
+            : "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "memory");
+        c += int64_t(vl);
+    }
+    if (ctx.ith == 0)
+        ocr_worker_events::publish(ocr_worker_events::kind::concat_segmented,
+                                  {uint64_t(channels), uint64_t(ctx.nth)});
+    return true;
+}
+
 // f32 concat along dim 0 where src1 is a transposed view (nb10 != 4, nb11 == 4), e.g. the delta-net
 // conv_input = concat(conv_states, transpose(qkv_mixed)). Threads split dim 1 (channels); each token's run
 // of channels is loaded contiguously and written to the dst channel rows with a strided store.
@@ -6216,7 +6619,14 @@ bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tens
         return false;
     }
 
-    if (scalar_small && col0 > 0 && ne0 - col0 <= 4) {
+    if (forward_concat_decode_segmented_f32(ctx, op, col0)) {
+        return true;
+    }
+
+    // Only prefer the scalar tail when the new columns are NOT channel-contiguous. When nb11 is the
+    // element size the vector loop below is contiguous loads plus 20-byte-strided stores, which beats
+    // 4-byte scalar copies (the decode [3,6144]+[n_t,6144] concat: 222us -> ~25us per token step).
+    if (scalar_small && col0 > 0 && ne0 - col0 <= 4 && nb11 != sizeof(float)) {
         // Only the trailing columns are read back (the conv state update): a handful of scalar copies
         // per channel instead of strided vector loads / stores.
         const int64_t sdc = (ne1 + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;

@@ -6,7 +6,7 @@
 static size_t ocr_q4_m8(size_t blk_len,const uint8_t * quant_a_ptr,
                         const uint8_t * quant_b_data,const uint8_t * quant_b_zp,
                         float * c_ptr,size_t count_m,size_t count_n,size_t k_blks,size_t ldc) {
-    if(blk_len!=32||quant_b_zp||count_m<8||count_n>32||k_blks!=36)
+    if(blk_len!=32||quant_b_zp||count_m<8||count_n>32||k_blks==0)
         return gemm_kernel_i8i4(blk_len,quant_a_ptr,quant_b_data,quant_b_zp,c_ptr,count_m,count_n,k_blks,ldc);
     GGML_ASSERT(count_n>0);
     const uint8_t * a0=quant_a_ptr;

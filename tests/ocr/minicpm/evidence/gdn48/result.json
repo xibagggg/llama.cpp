@@ -1,0 +1,126 @@
+{
+  "status": "PASS",
+  "created": "2026-11-18T12:23:43.362330+08:00",
+  "host_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "ai_cpus": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ],
+  "compile_command": [
+    "/usr/bin/g++",
+    "-std=gnu++17",
+    "-O3",
+    "-UNDEBUG",
+    "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii",
+    "/tmp/minicpm-gdn-snapshot-direct/snapshot-bench.cpp",
+    "-I/tmp/minicpm-gdn-snapshot-direct/fixtures",
+    "-I/tmp/minicpm-gdn-snapshot-direct",
+    "-I/usr/include",
+    "-L/usr/lib",
+    "-Wl,-rpath,/usr/lib",
+    "-lspert",
+    "-latomic",
+    "-ldl",
+    "-pthread",
+    "-o",
+    "/tmp/minicpm-gdn-snapshot-direct/snapshot-bench"
+  ],
+  "flags_file": "/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/build/ggml/src/ggml-spacemit/CMakeFiles/ggml-spacemit.dir/flags.make",
+  "flags_sha256": "7196571bf8dfe0d0c809f8f1b712c2cb137e1bc422ec2b7776fef06bbecdcf2f",
+  "source_sha256": {
+    "standalone-tcm-smi.py": "2418c8a87628b2f047506d1b4446284db87725ab32feafc52a558548019f7049",
+    "spacemit-tcm-ownership.h": "d552e8ebc7035b0456d63551e55cbb5321fd818ebb39c778ab384d1be89d5588",
+    "spacemit-tcm-ownership-linux.h": "f639bea508db7faadb449ff3bc0358e40df8fe09cbb1c242daa6874daabf6490",
+    "spacemit-resident-scratch.h": "15b6a023801bb60337204fe24cc76366e4b71dc614550ef15e856a585c09d5ed",
+    "snapshot-bench.cpp": "2c2b89ffb50034b72a998b9b2d6358a67b316fdf8dc2dcfc7c1fcffa62b608a1",
+    "run-standalone.py": "3b83d957f89be8fe8ea9889ab9460eeb540d993011013cae4abf720d999010f7",
+    "real-tcm-standalone.h": "0e09d964e3441fbb885b032c623b3c793c9acf6e4f3a0b0c3c6fe61d6df99002",
+    "prepare_local.py": "df0693c944d7efac57de2652f14071f17e7d51c90fc924afb3bbd2a677a01ad5",
+    "ocr-gdn-tcm.h": "0fc6b356ca829edac8d8dd457dab7f0a9de86880ac1eb8576ec4793be6f2e131",
+    "ocr-gdn-snapshot-store.h": "2e9adeaa9b2717189453e38cebc184d20803de1cf5a8906863f36c95e3a08dd5",
+    "ocr-gdn-rollback-tcm.h": "0209310e4925a2ee9b64716acb88478b8539f90724aa04e6b7ee18768d64c7a6",
+    "gdn-snapshot-direct.patch": "f28ac5a5424807745387cb2e7e9d4b0fc63dbf0962f488bc3e5e30284f33774c",
+    "gdn-reference.h": "fe9289b58c595256d0440228c9ac0598a7bccd360bcbfac674cce53333348f08",
+    "gdn-copy-reference.h": "d6d4171c9111be09ae98b9c1f204f8f7e7a2da890044b0fd0e143e4f154e440e",
+    "gdn-candidate.h": "4e5fe528e0fca4495abf3d89194a43ba66d9a46fcc1b5ede659f6b9eb390d595",
+    "fixtures/ggml.h": "9bfd3c6b34ab8e097a061b53b1618be690eca1220147d669a8902ecbf13a8cf2",
+    "fixtures/admission-and-store.cpp": "7960f7248c7df2254639d444ef1a0c8144fc3af6ccd516f547c690fd431164ec"
+  },
+  "environment": {
+    "GGML_SPACEMIT_SHARED_MODE": "PINNED_TCM",
+    "GGML_SPACEMIT_TCM_OWNERSHIP": "1",
+    "GGML_SPACEMIT_WORKERS": "6",
+    "SPACEMIT_PERFER_CORE_ID": "8,9,10,11,12,13",
+    "GGML_SPACEMIT_STRICT_AI_CORES": "1",
+    "SPERT_SHARED_MODE": "TCM",
+    "SPERT_BACKEND": "spacemit-k3",
+    "SPERT_HOST_PREPARE_STACKS": "1",
+    "SPERT_CTX_RVV": "0",
+    "SPERT_HOT_SPIN": "0",
+    "OMP_NUM_THREADS": "6"
+  },
+  "contract": "Frozen existing RVV K16 arithmetic + exact current row-CPY vs direct destination; full cache, attention, padding, inputs, guards. 48 cases.",
+  "tcm_note": "Test claims physical private TCM with production lease; scalar T16 GDN scratch remains DDR under existing policy. No new TCM speed claim.",
+  "build_returncode": 0,
+  "run_command": [
+    "/tmp/minicpm-gdn-snapshot-direct/snapshot-bench",
+    "3",
+    "1500"
+  ],
+  "run_returncode": 0,
+  "cases": 48,
+  "failed_cases": 0,
+  "numerical_pass": true,
+  "tcm_validation": {
+    "production_v2_ownership_pass": true,
+    "smi_six_busy_pass": true,
+    "physical_tcm_verified": true,
+    "smi_samples": 9,
+    "smi_six_busy_samples": 4,
+    "first_six_busy": [
+      {
+        "sample": 1,
+        "time": "2026-11-18T12:23:54.494459+08:00",
+        "block_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "owners": [
+          1237311,
+          1237312,
+          1237313,
+          1237314,
+          1237315,
+          1237316
+        ]
+      }
+    ],
+    "required_block_sets": [
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    ],
+    "requirement": "production catalog mapping/CPU/TID ownership checks AND one SMI snapshot with all six owned blocks busy"
+  },
+  "elapsed_s": 4.447279493993847
+}

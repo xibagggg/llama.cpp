@@ -1,4 +1,5 @@
 #include "server-schema.h"
+#include "server-request-spec.h"
 
 #include "json-schema-to-grammar.h"
 
@@ -193,6 +194,21 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     //
     // Speculative decoding params
     //
+
+    add((new field_json("speculative.enabled"))
+        ->set_desc("Single-slot DSpark request switch; false skips drafting and draft prefill, both modes force full prompt processing")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & enabled = data.at("speculative.enabled");
+            const int mode = server_request_spec::parse_mode(
+                enabled.is_boolean(), enabled.is_boolean() && enabled.get<bool>());
+            if (mode < 0) {
+                throw std::invalid_argument("speculative.enabled must be a boolean");
+            }
+            if (data.contains("speculative.type") || data.contains("speculative.types") || data.contains("speculative")) {
+                throw std::invalid_argument("speculative.enabled cannot change speculative implementation/types");
+            }
+            ctx.params.request_speculation = mode;
+        }));
 
     // TODO: to keep things simple, we disable speculative parameter adjustments for now
 #if 0

@@ -1,0 +1,11 @@
+[
+  "g++",
+  "-std=c++17",
+  "-O2",
+  "-UNDEBUG",
+  "-I/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/mapped/test_mapped_contract_stubs",
+  "-I/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/mapped/contract-headers",
+  "/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/mapped/test_mapped_contract.cpp",
+  "-o",
+  "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/a06-published-engine-tests-20261118/mapped-contract124/test"
+]

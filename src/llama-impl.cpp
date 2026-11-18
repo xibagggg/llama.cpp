@@ -202,3 +202,57 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
 }
+
+// Return the same byte prefix as gguf_kv_to_str without formatting the rest of
+// a potentially large metadata array. The caller still owns log truncation.
+std::string gguf_kv_to_str_bounded(const struct gguf_context * ctx_gguf, int i, size_t max_bytes) {
+    std::string result;
+    result.reserve(std::min(max_bytes, size_t(256)));
+    auto append_byte = [&](char c) {
+        if (result.size() < max_bytes) {
+            result.push_back(c);
+        }
+    };
+    auto append = [&](const char * text) {
+        while (result.size() < max_bytes && *text) {
+            result.push_back(*text++);
+        }
+    };
+
+    if (max_bytes == 0) {
+        return result;
+    }
+    const enum gguf_type type = gguf_get_kv_type(ctx_gguf, i);
+    if (type == GGUF_TYPE_STRING) {
+        append(gguf_get_val_str(ctx_gguf, i));
+    } else if (type == GGUF_TYPE_ARRAY) {
+        const enum gguf_type arr_type = gguf_get_arr_type(ctx_gguf, i);
+        const int arr_n = gguf_get_arr_n(ctx_gguf, i);
+        const void * data = arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx_gguf, i);
+        append_byte('[');
+        for (int j = 0; j < arr_n && result.size() < max_bytes; ++j) {
+            if (arr_type == GGUF_TYPE_STRING) {
+                append_byte('"');
+                const char * val = gguf_get_arr_str(ctx_gguf, i, j);
+                while (result.size() < max_bytes && *val) {
+                    if (*val == '\\' || *val == '"') {
+                        append_byte('\\');
+                    }
+                    append_byte(*val++);
+                }
+                append_byte('"');
+            } else if (arr_type == GGUF_TYPE_ARRAY) {
+                append("???");
+            } else {
+                append(gguf_data_to_str(arr_type, data, j).c_str());
+            }
+            if (j < arr_n - 1) {
+                append(", ");
+            }
+        }
+        append_byte(']');
+    } else {
+        append(gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0).c_str());
+    }
+    return result;
+}

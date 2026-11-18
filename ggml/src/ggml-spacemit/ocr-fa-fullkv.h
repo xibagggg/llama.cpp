@@ -5,6 +5,15 @@
 // no input-address cache is used. The caller validates its TCM capacity.
 namespace ocr_fa_fullkv {
 constexpr int D=72, Q=16, PAD_V=96;
+// Exact original exp polynomial, selected only after one conservative
+// per-row bound proves its normal-range branch would always be taken.
+inline bool normal_exp_enabled() {
+    static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_NORMAL_EXP");return p&&!std::strcmp(p,"1");}();return on;
+}
+// Native IME2 score/P layout. Sum grouping changes, so this remains opt-in.
+inline bool blocked_softmax_enabled() {
+    static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_BLOCKED_SOFTMAX");return p&&!std::strcmp(p,"1");}();return on;
+}
 inline bool trust_bounds_enabled() {
     static const bool on=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_FA_TRUST_BOUNDS");return p&&!std::strcmp(p,"1");}();return on;
 }

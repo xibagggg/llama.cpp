@@ -2,6 +2,7 @@
 #define GGML_COMMON_DECL_CPP
 
 #include "scalar_kernels.h"
+#include "ocr-dspark-sampling.h"
 #include "ggml-common.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -95,6 +96,47 @@ void forward_l2_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+// Contiguous matrices concatenated along dimension 1 occupy two adjacent
+// ranges. Split the destination range across workers and preserve every bit.
+void forward_concat_dim1_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    GGML_ASSERT(a && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_get_op_params_i32(op, 0) == 1 && ggml_is_matrix(a) && ggml_is_matrix(b));
+    GGML_ASSERT(ggml_is_matrix(op) && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op));
+    GGML_ASSERT(a->ne[0] == b->ne[0] && op->ne[0] == a->ne[0] && op->ne[1] == a->ne[1] + b->ne[1]);
+    const int64_t na = ggml_nelements(a), n = ggml_nelements(op);
+    const int64_t begin = n * ctx.ith / ctx.nth, end = n * (ctx.ith + 1) / ctx.nth;
+    auto * dst = static_cast<float *>(op->data);
+    if (begin < na) {
+        const int64_t split = std::min(end, na);
+        memcpy(dst + begin, static_cast<const float *>(a->data) + begin, (split - begin) * sizeof(float));
+    }
+    if (end > na) {
+        const int64_t split = std::max(begin, na);
+        memcpy(dst + split, static_cast<const float *>(b->data) + split - na, (end - split) * sizeof(float));
+    }
+}
+
+// Match the generic CPU ARGMAX exactly, including its last-index tie rule
+// and MAX-macro NaN behavior. Each row belongs to one worker; a single-row
+// DSpark Markov step runs on worker 0 without extra barriers.
+void forward_argmax_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    if (ocr_dspark_sampling::vector_argmax(ctx, op)) return;
+    const ggml_tensor * src = op->src[0];
+    GGML_ASSERT(src && src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_matrix(src) && ggml_is_contiguous(src) && ggml_is_contiguous(op));
+    GGML_ASSERT(src->ne[0] > 0 && src->ne[0] <= INT32_MAX);
+    GGML_ASSERT(op->ne[0] == src->ne[1] && ggml_nelements(op) == src->ne[1]);
+    const auto * x = static_cast<const float *>(src->data);
+    auto * y = static_cast<int32_t *>(op->data);
+    for (int64_t row = ctx.ith; row < src->ne[1]; row += ctx.nth) {
+        int index = 0;
+        ggml_vec_argmax_f32(static_cast<int>(src->ne[0]), &index, x + row * src->ne[0]);
+        y[row] = static_cast<int32_t>(index);
+    }
+}
+
 // ── ARGSORT ──────────────────────────────────────────────────────────────────
 // Same as the generic CPU op (std::sort of the indices per row), so MoE top-k selection matches it exactly and
 // stays on this backend instead of splitting every MoE layer's graph around a CPU node.
@@ -121,6 +163,37 @@ void forward_argsort_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+// DSpark's backend sampler requests ten candidates from the full target
+// vocabulary. Match the CPU TOP_K algorithm, including its deliberate swap
+// of the first two outputs; no floating-point conversion of indices.
+void forward_top_k10_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    if (ocr_dspark_sampling::skip_topk(ctx, op)) return;
+    const ggml_tensor * src = op->src[0];
+    const int64_t n = src->ne[0];
+    const int64_t nr = ggml_nrows(src);
+    constexpr int k = 10;
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32);
+    GGML_ASSERT(n >= k && n <= INT32_MAX && op->ne[0] == k);
+    GGML_ASSERT(src->nb[0] == sizeof(float) && op->nb[0] == sizeof(int32_t));
+    if (ctx.ith >= nr) return;
+    const size_t stride = GGML_PAD((size_t) n * sizeof(int32_t), 64);
+    const size_t lanes = std::min<int64_t>(ctx.nth, nr);
+    GGML_ASSERT(ctx.workspace && ctx.workspace_size >= stride * lanes);
+    int32_t * indices = (int32_t *) ((char *) ctx.workspace + stride * ctx.ith);
+    for (int64_t row = ctx.ith; row < nr; row += ctx.nth) {
+        const int64_t i1 = row % src->ne[1];
+        const int64_t i2 = (row / src->ne[1]) % src->ne[2];
+        const int64_t i3 = row / (src->ne[1] * src->ne[2]);
+        const float * x = (const float *) ((const char *) src->data + i1 * src->nb[1] + i2 * src->nb[2] + i3 * src->nb[3]);
+        int32_t * y = (int32_t *) ((char *) op->data + i1 * op->nb[1] + i2 * op->nb[2] + i3 * op->nb[3]);
+        for (int64_t i = 0; i < n; ++i) indices[i] = (int32_t) i;
+        std::partial_sort(indices, indices + k, indices + n,
+                          [x](int32_t a, int32_t b) { return x[a] > x[b]; });
+        std::copy_n(indices, k, y);
+        std::swap(y[0], y[1]);
+    }
+}
+
 // ── CLAMP ────────────────────────────────────────────────────────────────────
 void forward_clamp_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
@@ -144,6 +217,7 @@ void forward_clamp_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 // ── FILL ─────────────────────────────────────────────────────────────────────
 void forward_fill_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const float c = ggml_get_op_params_f32(op, 0);
+    if (ocr_dspark_sampling::contiguous_fill(ctx, op, c)) return;
 
     const int64_t ne0 = op->ne[0], ne1 = op->ne[1], ne2 = op->ne[2], ne3 = op->ne[3];
     const size_t  nb1 = op->nb[1], nb2 = op->nb[2], nb3 = op->nb[3];

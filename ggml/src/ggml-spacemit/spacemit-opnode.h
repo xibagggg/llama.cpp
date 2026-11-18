@@ -45,6 +45,8 @@ enum spacemit_op_code {
     SPACEMIT_OP_PADDLE_F16_BIAS,  // selected F16 GEMM with its final F32 row-bias ADD
     SPACEMIT_OP_PADDLE_F16_GELU_PACK, // exact GELU -> full-K high/residual pack -> F16 down
     SPACEMIT_OP_PADDLE_PC8_GELU_PACK, // exact biased GELU -> token-wise INT8 pack -> padded PC8 down
+    SPACEMIT_OP_GDN_SNAPSHOT_DIRECT, // original K16 recurrence stores snapshots directly to cache
+    SPACEMIT_OP_GDN_SNAPSHOT_STORE,  // original following CPY; skipped only with the same runtime proof
 };
 
 #define SPACEMIT_OP_MAX_KERN_PARAMS 32
@@ -57,6 +59,7 @@ struct spacemit_opnode {
     ggml_tensor * prepared_attention = nullptr;
     // in-place recurrent state update: {state gather (GET_ROWS), GATED_DELTA_NET, state store (CPY)}
     ggml_tensor * gdn_state[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor * gdn_snapshots[2] = {nullptr, nullptr}; // {GDN, CPY}; original graph remains intact
 
     std::vector<ggml_tensor *> fused;
 
@@ -126,11 +129,14 @@ struct spacemit_opnode {
 
     std::vector<const ggml_tensor *> get_inputs() const {
         if(elided_gelu) {
-            std::vector<const ggml_tensor*> inputs{node->src[0],elided_gelu->src[0]};
-            if(!fused.empty())inputs.push_back(fused[0]->src[1]);
-            if(fused.size()==2) {
-                const auto * residual=fused[1];
-                inputs.push_back(residual->src[0]==fused[0]?residual->src[1]:residual->src[0]);
+            std::vector<const ggml_tensor *> inputs{node->src[0],elided_gelu->src[0]};
+            // Bias and residual remain ordinary external graph inputs. The
+            // elided GELU/PAD/matmul outputs are not materialized dependencies.
+            for(const auto * f:fused)for(const auto * s:f->src) {
+                if(!s||s==node||s==elided_pad||s==elided_gelu||
+                   std::find(fused.begin(),fused.end(),s)!=fused.end()||
+                   std::find(inputs.begin(),inputs.end(),s)!=inputs.end())continue;
+                inputs.push_back(s);
             }
             return inputs;
         }

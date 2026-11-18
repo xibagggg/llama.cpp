@@ -42,10 +42,16 @@ using quantize_a_row_def = std::function<void(size_t, const float *, size_t, uin
 namespace rvv {
 // Host-only preparation and draining around the graph launch/future.
 void prepare_ocr_worker_state();
+void prepare_ocr_gdn_rollback_tcm(unsigned workers, size_t shared_bytes, bool pinned_tcm);
 void drain_ocr_worker_events();
 // Default-off exact GQA8 reuse only for the original m1 Q5..63 control path.
 void prepare_paddle_fa_gqa8_exact(unsigned workers, size_t shared_bytes, bool pinned_tcm);
 bool forward_flash_attn_ext_f16_paddle_gqa8_exact(ggml::spacemit::context & ctx, ggml_tensor * dst);
+void prepare_ocr_fa_gqa_ime256_r24(unsigned workers, size_t bytes, bool pinned);
+bool forward_flash_attn_ext_f16_gqa_ime256_r24(ggml::spacemit::context & ctx, ggml_tensor * dst);
+void drain_ocr_fa_gqa_ime256_r24();
+void prepare_ocr_fa_gqa_group(unsigned workers, size_t shared_bytes, bool pinned_tcm);
+bool forward_flash_attn_ext_f16_gqa_group(ggml::spacemit::context & ctx, ggml_tensor * dst);
 
 void memcpy1d(void * dst, const void * src, int64_t size);
 
@@ -92,6 +98,7 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
 // K == 1, one sequence: the state is read from and written to state_row (the cache row) instead of
 // src[5] / the state region of the op output
 void forward_gated_delta_net_inplace(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_row);
+void forward_gated_delta_net_snapshot_store(ggml::spacemit::context & ctx, ggml_tensor * op, const ggml_tensor * store);
 // dim-0 concat of a contiguous src0 and a transposed src1 (channels contiguous), vectorized over rows;
 // writes columns >= col0 only
 bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0,

@@ -1,0 +1,21 @@
+[
+  "g++",
+  "-std=c++17",
+  "-O3",
+  "-UNDEBUG",
+  "-fno-fast-math",
+  "-fno-tree-vectorize",
+  "-fno-tree-slp-vectorize",
+  "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii",
+  "/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/mapped/test_mapped_argmax.cpp",
+  "-I/home/bianbu/minicpm/minicpm\u4f18\u5316/src/llama.cpp/tests/ocr/minicpm/mapped/reference",
+  "-I/usr/include",
+  "-L/usr/lib",
+  "-Wl,-rpath,/usr/lib",
+  "-lspert",
+  "-latomic",
+  "-ldl",
+  "-pthread",
+  "-o",
+  "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/a06-published-engine-tests-20261118/mapped1326/test_mapped_argmax"
+]
