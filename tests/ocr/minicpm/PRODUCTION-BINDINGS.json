@@ -1,0 +1,37 @@
+{
+  "status": "REFERENCE_BINDINGS_ONLY_NO_CURRENT_DEVICE_RUN_CLAIM",
+  "expected_production_headers": {
+    "ggml/src/ggml-spacemit/ocr-mapped-argmax-rvv.h": {
+      "reference": "mapped/reference/ocr-mapped-argmax-rvv.h",
+      "reference_original_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+      "canonical_lf_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2"
+    },
+    "ggml/src/ggml-spacemit/ocr-dspark-custom-contract.h": {
+      "reference": "mapped/contract-headers/ocr-dspark-custom-contract.h",
+      "reference_original_sha256": "5e68bc469811b1411d1d0190dae6f8b507351c208598d302cc065274f895d915",
+      "canonical_lf_sha256": "871c7554f0f7eefd89acc76407f2fa3448f7703e2b5c02d3db59dccbfb77f1a5"
+    },
+    "ggml/src/ggml-spacemit/ocr-gdn-tcm.h": {
+      "reference": "gdn/frozen48/ocr-gdn-tcm.h",
+      "reference_original_sha256": "0fc6b356ca829edac8d8dd457dab7f0a9de86880ac1eb8576ec4793be6f2e131",
+      "canonical_lf_sha256": "0fc6b356ca829edac8d8dd457dab7f0a9de86880ac1eb8576ec4793be6f2e131"
+    },
+    "ggml/src/ggml-spacemit/ocr-gdn-rollback-tcm.h": {
+      "reference": "gdn/frozen48/ocr-gdn-rollback-tcm.h",
+      "reference_original_sha256": "0209310e4925a2ee9b64716acb88478b8539f90724aa04e6b7ee18768d64c7a6",
+      "canonical_lf_sha256": "0209310e4925a2ee9b64716acb88478b8539f90724aa04e6b7ee18768d64c7a6"
+    },
+    "ggml/src/ggml-spacemit/ocr-gdn-snapshot-store.h": {
+      "reference": "gdn/integrated-reference/ocr-gdn-snapshot-store.h",
+      "reference_original_sha256": "0c0c4782b1c1c053cd45e4d3dc1fa5a97c1aa61ca5ef6ed01b7979eaad13219e",
+      "canonical_lf_sha256": "0c0c4782b1c1c053cd45e4d3dc1fa5a97c1aa61ca5ef6ed01b7979eaad13219e"
+    }
+  },
+  "gdn_region_extraction": "rvv_kernels.cpp from static inline float rvv_gdn_fused_row_f32( through before newline void forward_scale_f32(; wrapped namespace gdn_candidate exactly as original preparation.",
+  "gdn_candidate_region_sha256": "4e5fe528e0fca4495abf3d89194a43ba66d9a46fcc1b5ede659f6b9eb390d595",
+  "gdn_original_reference_sha256": "fe9289b58c595256d0440228c9ac0598a7bccd360bcbfac674cce53333348f08",
+  "gdn_copy_reference_sha256": "d6d4171c9111be09ae98b9c1f204f8f7e7a2da890044b0fd0e143e4f154e440e",
+  "original48_snapshot_header_sha256": "2e9adeaa9b2717189453e38cebc184d20803de1cf5a8906863f36c95e3a08dd5",
+  "integrated_guarded_snapshot_header_sha256": "0c0c4782b1c1c053cd45e4d3dc1fa5a97c1aa61ca5ef6ed01b7979eaad13219e",
+  "rule": "Compare canonical LF text only for binding after existing EOL restoration; original files and historical SHA remain unchanged. GDN48 uses its exact original standalone header; guarded integrated header is a distinct reference and is never substituted into the old result."
+}

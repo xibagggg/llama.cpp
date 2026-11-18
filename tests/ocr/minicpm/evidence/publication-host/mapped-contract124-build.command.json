@@ -1,0 +1,11 @@
+[
+  "g++",
+  "-std=c++17",
+  "-O2",
+  "-UNDEBUG",
+  "-IC:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\engine_minicpm_tests_publish_candidate\\tests\\ocr\\minicpm\\mapped\\test_mapped_contract_stubs",
+  "-IC:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\engine_minicpm_tests_publish_candidate\\tests\\ocr\\minicpm\\mapped\\contract-headers",
+  "C:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\engine_minicpm_tests_publish_candidate\\tests\\ocr\\minicpm\\mapped\\test_mapped_contract.cpp",
+  "-o",
+  "C:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\mosaic_review\\engine-tests-publication-host-20261118-b\\mapped-contract124\\test.exe"
+]

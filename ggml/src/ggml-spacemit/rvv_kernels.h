@@ -95,6 +95,7 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
 // K == 1, one sequence: the state is read from and written to state_row (the cache row) instead of
 // src[5] / the state region of the op output
 void forward_gated_delta_net_inplace(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_row);
+void forward_gated_delta_net_snapshot_store(ggml::spacemit::context & ctx, ggml_tensor * op, const ggml_tensor * store);
 // dim-0 concat of a contiguous src0 and a transposed src1 (channels contiguous), vectorized over rows;
 // writes columns >= col0 only
 bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0,

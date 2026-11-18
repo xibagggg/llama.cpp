@@ -47,6 +47,7 @@
 #include "spacemit-host-memory.h"
 #include "ocr-pv-pipeline.h"
 #include "ocr-quant-phases.h"
+#include "ocr-gdn-snapshot-store.h"
 #include "ocr-dspark-sampling.h"
 #include "ocr-fa-schedule.h"
 #include "spacemit-tcm-ownership-linux.h"
@@ -513,6 +514,55 @@ static int gdn_inplace_mark(const ggml_cgraph * graph, std::vector<spacemit_opno
         n_marked++;
     }
     return n_marked;
+}
+
+// K16 rollback snapshots retain the exact recurrence and original graph lifetime.
+// Only the final snapshot destination is forwarded; neither node is deleted.
+static int gdn_snapshot_store_mark(const ggml_cgraph * graph, std::vector<spacemit_opnode> & nodes) {
+    int count = 0;
+    for (int gi = 0; gi < graph->n_nodes; ++gi) {
+        ggml_tensor * g = graph->nodes[gi];
+        ggml_tensor * store = ocr_gdn_snapshot_store::match_store(graph, gi, op_is_compute);
+        if (store == nullptr) {
+            continue;
+        }
+        size_t positions[2] = {0, 0};
+        int seen[2] = {0, 0};
+        bool plain = true;
+        ggml_tensor * wanted[2] = {g, store};
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const spacemit_opnode & current = nodes[i];
+            for (int w = 0; w < 2; ++w) {
+                if (current.node == wanted[w]) {
+                    plain = plain && current.opcode == SPACEMIT_OP_INVALID && current.fused.empty() &&
+                        current.extra_dsts.empty() && current.packed_im2col == nullptr &&
+                        current.elided_pad == nullptr && current.elided_gelu == nullptr &&
+                        current.prepared_attention == nullptr && current.gdn_state[0] == nullptr &&
+                        current.gdn_snapshots[0] == nullptr;
+                    positions[w] = i;
+                    ++seen[w];
+                }
+                if (current.packed_im2col == wanted[w] || current.elided_pad == wanted[w] ||
+                    current.elided_gelu == wanted[w] || current.prepared_attention == wanted[w]) {
+                    plain = false;
+                }
+                for (const ggml_tensor * fused : current.fused) {
+                    plain = plain && fused != wanted[w];
+                }
+            }
+        }
+        if (!plain || seen[0] != 1 || seen[1] != 1 || positions[0] + 1 != positions[1]) {
+            continue;
+        }
+        nodes[positions[0]].opcode = SPACEMIT_OP_GDN_SNAPSHOT_DIRECT;
+        nodes[positions[1]].opcode = SPACEMIT_OP_GDN_SNAPSHOT_STORE;
+        for (size_t p : positions) {
+            nodes[p].gdn_snapshots[0] = g;
+            nodes[p].gdn_snapshots[1] = store;
+        }
+        ++count;
+    }
+    return count;
 }
 
 // concat(conv_states, transpose(qkv), dim 0) as built by build_conv_state: contiguous F32 rows, the
@@ -1162,6 +1212,13 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
 
         const int n_gdn_inplace = gdn_inplace_enabled() ? gdn_inplace_mark(graph, sess->cached_graph.nodes) : 0;
+        const int n_gdn_snapshots = ocr_gdn_snapshot_store::enabled_on_host() ?
+            gdn_snapshot_store_mark(graph, sess->cached_graph.nodes) : 0;
+        const char * snapshot_trace = std::getenv("GGML_SPACEMIT_OCR_GDN_SNAPSHOT_STORE_TRACE");
+        if (n_gdn_snapshots && snapshot_trace && std::strcmp(snapshot_trace, "1") == 0) {
+            GGML_LOG_INFO("ggml-spacemit: GDN direct snapshot store=%d graph=%llu\n",
+                n_gdn_snapshots, (unsigned long long) graph->uid);
+        }
 
         int n_fused = 0;
         int n_add_gelu = 0;

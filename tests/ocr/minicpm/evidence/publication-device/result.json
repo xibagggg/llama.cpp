@@ -1,0 +1,210 @@
+{
+  "status": "PASS",
+  "runner_kind": "derived publication runner, not the historical measured runner",
+  "runner_sha256": "e5892668f0a9884a102d56867580c4e211974edab5ee53ed2dfdd084375fc662",
+  "case": "all",
+  "package": {
+    "status": "PASS",
+    "files_checked": 53,
+    "issues": [],
+    "scope": "Package byte identities and include closure only; no execution."
+  },
+  "results": {
+    "host": {
+      "mapped-contract124": {
+        "status": "PASS",
+        "metadata_cases": 124
+      },
+      "gdn-admission44-copy8": {
+        "status": "PASS",
+        "admission_cases": 44,
+        "copy_cases": 8,
+        "failures": 0
+      }
+    },
+    "mapped": {
+      "status": "PASS",
+      "cases": 1326,
+      "fast": 948,
+      "fallback": 378,
+      "source_sha256": "35a0db291bc89436a63a7f7befb3f9752b048c9c97e3e95ae36f48f8dcfbd731",
+      "header_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+      "environment": {
+        "GGML_SPACEMIT_WORKERS": "6",
+        "SPACEMIT_PERFER_CORE_ID": "8,9,10,11,12,13",
+        "OMP_NUM_THREADS": "6",
+        "SPERT_BACKEND": "spacemit-k3",
+        "SPERT_CTX_RVV": "0",
+        "SPERT_HOST_PREPARE_STACKS": "1"
+      },
+      "scope": "Frozen standalone exact helper numerical cases only; no model latency or TCM benefit claim."
+    },
+    "gdn": {
+      "status": "PASS",
+      "cases": 48,
+      "source_sha256": "2c2b89ffb50034b72a998b9b2d6358a67b316fdf8dc2dcfc7c1fcffa62b608a1",
+      "tcm_validation": {
+        "production_v2_ownership_pass": true,
+        "smi_six_busy_pass": true,
+        "physical_tcm_verified": true,
+        "smi_samples": 9,
+        "smi_six_busy_samples": 4,
+        "first_six_busy": [
+          {
+            "sample": 1,
+            "time": "2026-11-18T13:42:55.347001+08:00",
+            "block_ids": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "owners": [
+              1320148,
+              1320149,
+              1320150,
+              1320151,
+              1320152,
+              1320153
+            ]
+          }
+        ],
+        "required_block_sets": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        ],
+        "requirement": "production catalog mapping/CPU/TID ownership checks AND one SMI snapshot with all six owned blocks busy"
+      },
+      "environment": {
+        "GGML_SPACEMIT_WORKERS": "6",
+        "SPACEMIT_PERFER_CORE_ID": "8,9,10,11,12,13",
+        "OMP_NUM_THREADS": "6",
+        "SPERT_BACKEND": "spacemit-k3",
+        "SPERT_CTX_RVV": "0",
+        "SPERT_HOST_PREPARE_STACKS": "1",
+        "GGML_SPACEMIT_SHARED_MODE": "PINNED_TCM",
+        "GGML_SPACEMIT_TCM_OWNERSHIP": "1",
+        "GGML_SPACEMIT_STRICT_AI_CORES": "1",
+        "SPERT_SHARED_MODE": "TCM",
+        "SPERT_HOT_SPIN": "0"
+      },
+      "scope": "Frozen original standalone48; integrated trace guard has separate binding. Scalar T16 scratch remains DDR. No model/full-page/E2E benefit claimed."
+    }
+  },
+  "production_binding_before": {
+    "status": "PASS",
+    "issues": [],
+    "files": {
+      "ggml/src/ggml-spacemit/ocr-mapped-argmax-rvv.h": {
+        "actual_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+        "canonical_lf_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+        "reference": "mapped/reference/ocr-mapped-argmax-rvv.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-dspark-custom-contract.h": {
+        "actual_sha256": "871c7554f0f7eefd89acc76407f2fa3448f7703e2b5c02d3db59dccbfb77f1a5",
+        "canonical_lf_sha256": "871c7554f0f7eefd89acc76407f2fa3448f7703e2b5c02d3db59dccbfb77f1a5",
+        "reference": "mapped/contract-headers/ocr-dspark-custom-contract.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-gdn-tcm.h": {
+        "actual_sha256": "0fc6b356ca829edac8d8dd457dab7f0a9de86880ac1eb8576ec4793be6f2e131",
+        "canonical_lf_sha256": "0fc6b356ca829edac8d8dd457dab7f0a9de86880ac1eb8576ec4793be6f2e131",
+        "reference": "gdn/frozen48/ocr-gdn-tcm.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-gdn-rollback-tcm.h": {
+        "actual_sha256": "0209310e4925a2ee9b64716acb88478b8539f90724aa04e6b7ee18768d64c7a6",
+        "canonical_lf_sha256": "0209310e4925a2ee9b64716acb88478b8539f90724aa04e6b7ee18768d64c7a6",
+        "reference": "gdn/frozen48/ocr-gdn-rollback-tcm.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-gdn-snapshot-store.h": {
+        "actual_sha256": "0c0c4782b1c1c053cd45e4d3dc1fa5a97c1aa61ca5ef6ed01b7979eaad13219e",
+        "canonical_lf_sha256": "0c0c4782b1c1c053cd45e4d3dc1fa5a97c1aa61ca5ef6ed01b7979eaad13219e",
+        "reference": "gdn/integrated-reference/ocr-gdn-snapshot-store.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/rvv_kernels.cpp": {
+        "actual_sha256": "06d645e582f2554721f5beb5ee299bd2a7de5e38654c22f0a06c176343bfb1ed",
+        "extracted_candidate_sha256": "4e5fe528e0fca4495abf3d89194a43ba66d9a46fcc1b5ede659f6b9eb390d595",
+        "frozen_candidate_canonical_lf_sha256": "4e5fe528e0fca4495abf3d89194a43ba66d9a46fcc1b5ede659f6b9eb390d595",
+        "candidate_region_exact_allowing_EOL_only": true,
+        "original_copy_region_matches": true
+      }
+    },
+    "scope": "Read-only exact text binding with only CRLF/LF normalization. Historical raw source identities remain separate. No compiler/device/full-graph execution."
+  },
+  "production_flags": {
+    "path": "build/ggml/src/ggml-spacemit/CMakeFiles/ggml-spacemit.dir/flags.make",
+    "sha256": "7196571bf8dfe0d0c809f8f1b712c2cb137e1bc422ec2b7776fef06bbecdcf2f"
+  },
+  "host_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "ai_cpus": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ],
+  "production_binding_after": {
+    "status": "PASS",
+    "issues": [],
+    "files": {
+      "ggml/src/ggml-spacemit/ocr-mapped-argmax-rvv.h": {
+        "actual_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+        "canonical_lf_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+        "reference": "mapped/reference/ocr-mapped-argmax-rvv.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-dspark-custom-contract.h": {
+        "actual_sha256": "871c7554f0f7eefd89acc76407f2fa3448f7703e2b5c02d3db59dccbfb77f1a5",
+        "canonical_lf_sha256": "871c7554f0f7eefd89acc76407f2fa3448f7703e2b5c02d3db59dccbfb77f1a5",
+        "reference": "mapped/contract-headers/ocr-dspark-custom-contract.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-gdn-tcm.h": {
+        "actual_sha256": "0fc6b356ca829edac8d8dd457dab7f0a9de86880ac1eb8576ec4793be6f2e131",
+        "canonical_lf_sha256": "0fc6b356ca829edac8d8dd457dab7f0a9de86880ac1eb8576ec4793be6f2e131",
+        "reference": "gdn/frozen48/ocr-gdn-tcm.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-gdn-rollback-tcm.h": {
+        "actual_sha256": "0209310e4925a2ee9b64716acb88478b8539f90724aa04e6b7ee18768d64c7a6",
+        "canonical_lf_sha256": "0209310e4925a2ee9b64716acb88478b8539f90724aa04e6b7ee18768d64c7a6",
+        "reference": "gdn/frozen48/ocr-gdn-rollback-tcm.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/ocr-gdn-snapshot-store.h": {
+        "actual_sha256": "0c0c4782b1c1c053cd45e4d3dc1fa5a97c1aa61ca5ef6ed01b7979eaad13219e",
+        "canonical_lf_sha256": "0c0c4782b1c1c053cd45e4d3dc1fa5a97c1aa61ca5ef6ed01b7979eaad13219e",
+        "reference": "gdn/integrated-reference/ocr-gdn-snapshot-store.h",
+        "matches_reference_allowing_EOL_only": true
+      },
+      "ggml/src/ggml-spacemit/rvv_kernels.cpp": {
+        "actual_sha256": "06d645e582f2554721f5beb5ee299bd2a7de5e38654c22f0a06c176343bfb1ed",
+        "extracted_candidate_sha256": "4e5fe528e0fca4495abf3d89194a43ba66d9a46fcc1b5ede659f6b9eb390d595",
+        "frozen_candidate_canonical_lf_sha256": "4e5fe528e0fca4495abf3d89194a43ba66d9a46fcc1b5ede659f6b9eb390d595",
+        "candidate_region_exact_allowing_EOL_only": true,
+        "original_copy_region_matches": true
+      }
+    },
+    "scope": "Read-only exact text binding with only CRLF/LF normalization. Historical raw source identities remain separate. No compiler/device/full-graph execution."
+  }
+}

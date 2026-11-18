@@ -1,0 +1,10 @@
+[
+  "g++",
+  "-std=c++17",
+  "-O2",
+  "-UNDEBUG",
+  "-IC:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\engine_minicpm_tests_publish_candidate\\tests\\ocr\\minicpm\\gdn\\frozen48\\fixtures",
+  "C:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\engine_minicpm_tests_publish_candidate\\tests\\ocr\\minicpm\\gdn\\frozen48\\fixtures\\admission-and-store.cpp",
+  "-o",
+  "C:\\Users\\huangjingtao\\Documents\\ChatGPT\\1111\\mosaic_review\\engine-tests-publication-host-20261118-b\\gdn-admission44-copy8\\test.exe"
+]

@@ -1,0 +1,112 @@
+{
+  "created_utc": "2026-11-18T04:38:56.944133+00:00",
+  "status": "EXACT_NO_INLINE_REFERENCE_NUMERICAL_PASS_1326_WITH_OBSERVED_CODEGEN_FAILURE_EXPLAINED",
+  "scope": "Independent source/actual ELF/log audit; parent alone executed the device builds/tests. No optimization round closure.",
+  "supersedes": "Earlier closure/host-stack explanation was an unconfirmed hypothesis. Initial failure cause remains unproven; the canonical/sigaction failure has the actual generated-code mechanism below.",
+  "sigaction_failure": {
+    "source_sha256": "d8366e3903d1ee5999ea67ee7a000b2ec3a252642ebc8e79afdd0370c5403e8e",
+    "header_sha256": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+    "binary_sha256": "9773ba739416891bfeaf5fe1b892de91735549ba5fd83b0524202e2e8c854d79",
+    "numeric_log_sha256": "adc262ab532f971215f655fe26d6ae024a4f8d4e64bacacfc771b510b5da1b36",
+    "observed_fault_address": "0x44",
+    "fault_instruction": "binary+0x19f2 lw a5,0(t1)",
+    "preceding_pointer_assignment": "binary+0x19bc mv t1,t2",
+    "clobbering_instruction": "binary+0x1a08 vsetvli t1,zero,e32,m2,ta,ma writes VL64 to live scalar pointer t1",
+    "next_iteration": "binary+0x1a1a addi t1,t1,4 makes0x44; binary+0x1a1e branches to+0x19f2",
+    "source_location": "Inlined scalar original_callback first non-NaN scan, before full-order NaN fallback. No RVV source exists in that scalar loop.",
+    "canonical_analogue": "Same scalar pointer is clobbered at canonical+0x171e then+0x1730 increments before load+0x1708."
+  },
+  "minimum_harness_change": {
+    "source_sha256": "35a0db291bc89436a63a7f7befb3f9752b048c9c97e3e95ae36f48f8dcfbd731",
+    "actual_binary_sha256": "40e1b9901d0d73d64a63d8a42615006e47ac1fdc4fb9657bee8e0612a4f64e13",
+    "change": "Add __attribute__((noinline,noclone)) to original_callback only; production RVV helper hash unchanged, full vocabulary oracle and run() body unchanged.",
+    "disassembly": "Standalone original_callback symbol at0x145e contains no vector instructions; source-bound numerical run passes.",
+    "result": {
+      "started": "2026-11-18T12:35:03.653336+08:00",
+      "build_command": [
+        "g++",
+        "-std=c++17",
+        "-O3",
+        "-UNDEBUG",
+        "-fno-fast-math",
+        "-fno-tree-vectorize",
+        "-fno-tree-slp-vectorize",
+        "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii",
+        "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/mapped-argmax-a04-20261118/runs/noinline-reference-numeric-20261118-123503/sources/test_mapped_argmax.cpp",
+        "-I/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/mapped-argmax-a04-20261118/runs/noinline-reference-numeric-20261118-123503/sources",
+        "-I/usr/include",
+        "-L/usr/lib",
+        "-Wl,-rpath,/usr/lib",
+        "-lspert",
+        "-latomic",
+        "-ldl",
+        "-pthread",
+        "-o",
+        "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/mapped-argmax-a04-20261118/runs/noinline-reference-numeric-20261118-123503/test_mapped_argmax"
+      ],
+      "sources": {
+        "ocr-mapped-argmax-rvv.h": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+        "test_mapped_argmax.cpp": "35a0db291bc89436a63a7f7befb3f9752b048c9c97e3e95ae36f48f8dcfbd731"
+      },
+      "host_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "ai_affinity": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "environment": {
+        "SPACEMIT_PERFER_CORE_ID": "8,9,10,11,12,13",
+        "GGML_SPACEMIT_WORKERS": "6",
+        "OMP_NUM_THREADS": "6",
+        "SPERT_BACKEND": "spacemit-k3",
+        "SPERT_CTX_RVV": "0",
+        "SPERT_HOST_PREPARE_STACKS": "1"
+      },
+      "scope": "canonical static-storage captureless harness; independent full-vocab oracle; exact helper tested, not OCR latency",
+      "build_returncode": 0,
+      "numeric_returncode": 0,
+      "status": "PASS"
+    },
+    "numeric_log_sha256": "6ed8bf42ad3708aaecac7d0e8133143e0e90f472b81997d822ec3366871ad115",
+    "passed": "AI6 exact cores8–13, VLEN128B, lane0,1326 fixtures=948RVV+378originalNaNfallback,128same-address mutations,guards andinvalid counts/vocabularies.",
+    "does_not_claim": "Old canonical SHA f7cdb9...passed, initial [&] failure fixed by static alone, or a production kernel arithmetic change."
+  },
+  "production_review": {
+    "actual_manifest": {
+      "files": [
+        {
+          "path": "production-source/src/models/dflash.cpp",
+          "sha256": "3838fc3a2b215b6f335bb8068828027a941ccc38bce4a9f6597f5cae2f045766"
+        },
+        {
+          "path": "production-abi/libggml-spacemit.nm.txt",
+          "sha256": "f7490b2536eaadddfe082926b4ee827a64a1cc3dbe46a20cb7450ea0d520a88f"
+        },
+        {
+          "path": "production-abi/libggml-spacemit.objdump.txt",
+          "sha256": "0380b4bd54865f5369cbe26c690310d86166f1fcab883941801c5eee4e13af9b"
+        }
+      ],
+      "binaries": [
+        {
+          "path": "/home/bianbu/minicpm/model-zoo-ocr/thirdparty/llama/bin/libggml-spacemit.so.0.26.0",
+          "sha256": "689616aef5c091b83826bff1243b5185f9b8ce299a7967c57f40cc36894a6ece"
+        }
+      ]
+    },
+    "source_path": "src/models/dflash.cpp dspark_compact_argmax_callback -> scalar dspark_compact_argmax",
+    "observed_abi": "NaN helper branch33f9a->33b4a->33ae6 then indirect callback33af2 jalr a5. Scalar callback lives in libllama, separate from backend RVV TU.",
+    "conclusion": "The observed mixed inline scalar/RVV loop mechanism is absent in this mapped production fallback boundary. This does not prove arbitrary compiler output safe."
+  },
+  "next": "Use exact new harness SHA in reproducible records; retain all old failures and raw ELF text. Keep strict fullpage quality and same-deployment ABBA evidence distinct from numerical tests."
+}

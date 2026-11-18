@@ -11,6 +11,7 @@
 #include "ocr-worker-events.h"
 #include "ocr-gdn-tcm.h"
 #include "ocr-gdn-rollback-tcm.h"
+#include "ocr-gdn-snapshot-store.h"
 #include "ocr-conv-snapshot-copy.h"
 #include "ocr-d2t-scatter.h"
 
@@ -4533,7 +4534,8 @@ static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1,
     gdn_transpose(D, D, S, D, s_out, D);
 }
 
-static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_rows) {
+static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_rows,
+                                         const ggml_tensor * snapshot_store) {
     const ggml_tensor * src_q     = op->src[0];
     const ggml_tensor * src_k     = op->src[1];
     const ggml_tensor * src_v     = op->src[2];
@@ -4719,8 +4721,9 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
-                    float * state_snapshot = state_out_base + target_slot * state_size_per_snap +
-                                             (iv3 * H + iv1) * S_v * S_v;
+                    float * state_snapshot = snapshot_store != nullptr ?
+                        ocr_gdn_snapshot_store::snapshot_pointer(snapshot_store->data, snapshot_store->nb[2], target_slot, iv1) :
+                        state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                     memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
                 }
             }
@@ -4729,11 +4732,17 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
 }
 
 void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
-    forward_gated_delta_net_impl(ctx, op, nullptr);
+    forward_gated_delta_net_impl(ctx, op, nullptr, nullptr);
 }
 
 void forward_gated_delta_net_inplace(ggml::spacemit::context & ctx, ggml_tensor * op, float * state_row) {
-    forward_gated_delta_net_impl(ctx, op, state_row);
+    forward_gated_delta_net_impl(ctx, op, state_row, nullptr);
+}
+
+void forward_gated_delta_net_snapshot_store(ggml::spacemit::context & ctx, ggml_tensor * op,
+                                           const ggml_tensor * store) {
+    GGML_ASSERT(ocr_gdn_snapshot_store::storage_eligible(op, store));
+    forward_gated_delta_net_impl(ctx, op, nullptr, store);
 }
 
 void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {

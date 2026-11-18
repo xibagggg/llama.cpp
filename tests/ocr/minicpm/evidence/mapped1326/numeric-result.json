@@ -1,0 +1,56 @@
+{
+  "started": "2026-11-18T12:35:03.653336+08:00",
+  "build_command": [
+    "g++",
+    "-std=c++17",
+    "-O3",
+    "-UNDEBUG",
+    "-fno-fast-math",
+    "-fno-tree-vectorize",
+    "-fno-tree-slp-vectorize",
+    "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii",
+    "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/mapped-argmax-a04-20261118/runs/noinline-reference-numeric-20261118-123503/sources/test_mapped_argmax.cpp",
+    "-I/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/mapped-argmax-a04-20261118/runs/noinline-reference-numeric-20261118-123503/sources",
+    "-I/usr/include",
+    "-L/usr/lib",
+    "-Wl,-rpath,/usr/lib",
+    "-lspert",
+    "-latomic",
+    "-ldl",
+    "-pthread",
+    "-o",
+    "/home/bianbu/minicpm/model-zoo-ocr/output/minicpm_ocr/candidates/mapped-argmax-a04-20261118/runs/noinline-reference-numeric-20261118-123503/test_mapped_argmax"
+  ],
+  "sources": {
+    "ocr-mapped-argmax-rvv.h": "9b719ce64aa859f5194d9d83ecc2497b8b57789bf088892ede2afa48c8dc23e2",
+    "test_mapped_argmax.cpp": "35a0db291bc89436a63a7f7befb3f9752b048c9c97e3e95ae36f48f8dcfbd731"
+  },
+  "host_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "ai_affinity": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ],
+  "environment": {
+    "SPACEMIT_PERFER_CORE_ID": "8,9,10,11,12,13",
+    "GGML_SPACEMIT_WORKERS": "6",
+    "OMP_NUM_THREADS": "6",
+    "SPERT_BACKEND": "spacemit-k3",
+    "SPERT_CTX_RVV": "0",
+    "SPERT_HOST_PREPARE_STACKS": "1"
+  },
+  "scope": "canonical static-storage captureless harness; independent full-vocab oracle; exact helper tested, not OCR latency",
+  "build_returncode": 0,
+  "numeric_returncode": 0,
+  "status": "PASS"
+}

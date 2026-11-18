@@ -1,0 +1,2 @@
+SPERT status=0 workers=6 cpus= 8 9 10 11 12 13 vlenb=128 executor_lane=0 fast=948 fallback=378
+PASS 1326 independently materialized full-vocab cases; exact mapped target-ID ties, signed zeros, infinities, subnormals, qNaN/sNaN original fallback, VL tails, guards, 128 same-address mutations. No model latency claim.

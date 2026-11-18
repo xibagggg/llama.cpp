@@ -11,6 +11,7 @@
 #include "ocr-norm-affine-rvv.h"
 #include "ocr-fa-schedule.h"
 #include "ocr-quant-phases.h"
+#include "ocr-gdn-snapshot-store.h"
 
 #include "common.h"
 #include "ggml-backend-impl.h"
@@ -2150,6 +2151,18 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
             const auto * traits=ggml_spacemit_get_tensor_traits(node.node);
             return traits&&traits->compute_forward_fused(ctx,node);
         }
+        case SPACEMIT_OP_GDN_SNAPSHOT_DIRECT:
+            if (ocr_gdn_snapshot_store::storage_eligible(node.gdn_snapshots[0], node.gdn_snapshots[1])) {
+                spacemit_kernels::rvv::forward_gated_delta_net_snapshot_store(ctx, node.node,
+                    node.gdn_snapshots[1]);
+                return true;
+            }
+            break;
+        case SPACEMIT_OP_GDN_SNAPSHOT_STORE:
+            if (ocr_gdn_snapshot_store::storage_eligible(node.gdn_snapshots[0], node.gdn_snapshots[1])) {
+                return true;
+            }
+            break;
         case SPACEMIT_OP_GDN_STATE_GATHER:
         case SPACEMIT_OP_GDN_STATE_STORE:
             // nothing to do when the state is updated in place in the cache row

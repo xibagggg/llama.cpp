@@ -275,6 +275,14 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    // Opt-in diagnostics only; none of these fields participate in sampling,
+    // checkpoint policy, prompt state or the existing speculative counters.
+    bool ocr_checkpoint_metrics_v3 = false;
+    int64_t ocr_request_id = -1;
+    uint64_t ocr_round_next = 0;
+    uint64_t ocr_round_id = 0;
+    uint64_t ocr_checkpoint_id = 0;
+    int64_t ocr_anchor_pos = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -389,6 +397,12 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        ocr_checkpoint_metrics_v3 = false;
+        ocr_request_id = -1;
+        ocr_round_next = 0;
+        ocr_round_id = 0;
+        ocr_checkpoint_id = 0;
+        ocr_anchor_pos = -1;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -738,12 +752,22 @@ struct server_slot {
         if (std::getenv("OCR_STAGE_TIMING")) {
             // Output steps are n_gen-1; they are independent of verification
             // input tokens, draft tokens, or the number of backend calls.
-            SLT_INF(*this, "OCR_SPEC kind=request enabled=%d completion_tokens=%llu output_steps=%llu proposals=%llu accepted_proposals=%llu verify_rounds=%llu\n",
-                    int(spec != nullptr), (unsigned long long) stats.n_gen,
-                    (unsigned long long) stats.n_gen_steps(),
-                    (unsigned long long) stats.n_draft_tokens,
-                    (unsigned long long) stats.n_draft_accepted,
-                    (unsigned long long) stats.n_draft_verif_steps);
+            if (ocr_checkpoint_metrics_v3) {
+                SLT_INF(*this, "OCR_SPEC kind=request request_id=%lld enabled=%d completion_tokens=%llu output_steps=%llu proposals=%llu accepted_proposals=%llu verify_rounds=%llu\n",
+                        (long long) ocr_request_id, int(spec != nullptr),
+                        (unsigned long long) stats.n_gen,
+                        (unsigned long long) stats.n_gen_steps(),
+                        (unsigned long long) stats.n_draft_tokens,
+                        (unsigned long long) stats.n_draft_accepted,
+                        (unsigned long long) stats.n_draft_verif_steps);
+            } else {
+                SLT_INF(*this, "OCR_SPEC kind=request enabled=%d completion_tokens=%llu output_steps=%llu proposals=%llu accepted_proposals=%llu verify_rounds=%llu\n",
+                        int(spec != nullptr), (unsigned long long) stats.n_gen,
+                        (unsigned long long) stats.n_gen_steps(),
+                        (unsigned long long) stats.n_draft_tokens,
+                        (unsigned long long) stats.n_draft_accepted,
+                        (unsigned long long) stats.n_draft_verif_steps);
+            }
         }
         common_speculative_print_stats(spec);
     }
@@ -1080,6 +1104,11 @@ private:
         return value && std::strcmp(value, "1") == 0;
     }();
     bool request_graph_config_logged = false;
+    const bool checkpoint_metrics_v3 = [] {
+        const char * value = std::getenv("OCR_CHECKPOINT_METRICS_V3");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    uint64_t checkpoint_metrics_next_id = 1; // never reset between requests
 
     bool add_bos_token = true;
 
@@ -2032,6 +2061,15 @@ private:
             return false;
         }
 
+        // v3 accounting is deliberately restricted to the already supported
+        // single-request DSpark graph mode. Refuse incomplete diagnostics rather
+        // than silently label globally inherited requests as checkpoint trials.
+        if (checkpoint_metrics_v3 && (!std::getenv("OCR_STAGE_TIMING") ||
+                !request_native_graph || !request_spec.clear_contexts)) {
+            send_error(task, "OCR_CHECKPOINT_METRICS_V3 requires OCR_STAGE_TIMING, OCR_DSPARK_REQUEST_NATIVE_GRAPH=1 and managed request speculation", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2169,17 +2207,31 @@ private:
                         send_error(task, "speculative.enabled unexpected initial target graph", ERROR_TYPE_INVALID_REQUEST);
                         return false;
                     }
-                    SRV_INF("OCR_SPEC kind=request_graph_config mode_version=2 rs_capacity=%u target_capture=%u\n",
-                            graph_state.rs_capacity, graph_state.target_capture);
+                    if (checkpoint_metrics_v3) {
+                        SRV_INF("OCR_SPEC kind=request_graph_config mode_version=3 rs_capacity=%u target_capture=%u\n",
+                                graph_state.rs_capacity, graph_state.target_capture);
+                    } else {
+                        SRV_INF("OCR_SPEC kind=request_graph_config mode_version=2 rs_capacity=%u target_capture=%u\n",
+                                graph_state.rs_capacity, graph_state.target_capture);
+                    }
                     request_graph_config_logged = true;
                 }
                 if (!common_speculative_prepare_dspark_request_graph(spec.get(), request_spec.enabled, graph_state)) {
                     send_error(task, "speculative.enabled failed to prepare target request graph", ERROR_TYPE_INVALID_REQUEST);
                     return false;
                 }
-                SLT_INF(slot, "OCR_SPEC kind=request_mode mode_version=2 override=%d enabled=%d full_prefill=1 cache_reuse=0 target_rs=%u rs_capacity=%u target_capture=%u global_extraction_unchanged=0\n",
-                        task.params.request_speculation, int(request_spec.enabled), graph_state.target_rs,
-                        graph_state.rs_capacity, graph_state.target_capture);
+                if (checkpoint_metrics_v3) {
+                    const char * rollback_policy = !request_spec.enabled ? "native" :
+                            graph_state.target_rs == 0 ? "checkpoint" : "history";
+                    SLT_INF(slot, "OCR_SPEC kind=request_mode mode_version=3 request_id=%lld override=%d enabled=%d full_prefill=1 cache_reuse=0 target_rs=%u rs_capacity=%u target_capture=%u global_extraction_unchanged=0 rollback_policy=%s\n",
+                            (long long) task.id, task.params.request_speculation,
+                            int(request_spec.enabled), graph_state.target_rs,
+                            graph_state.rs_capacity, graph_state.target_capture, rollback_policy);
+                } else {
+                    SLT_INF(slot, "OCR_SPEC kind=request_mode mode_version=2 override=%d enabled=%d full_prefill=1 cache_reuse=0 target_rs=%u rs_capacity=%u target_capture=%u global_extraction_unchanged=0\n",
+                            task.params.request_speculation, int(request_spec.enabled), graph_state.target_rs,
+                            graph_state.rs_capacity, graph_state.target_capture);
+                }
             } else {
                 SLT_INF(slot, "OCR_SPEC kind=request_mode override=%d enabled=%d full_prefill=1 cache_reuse=0 target_rs=%u global_extraction_unchanged=1\n",
                         task.params.request_speculation, int(request_spec.enabled), llama_n_rs_seq(ctx_tgt));
@@ -2188,6 +2240,12 @@ private:
         slot.spec = request_spec.enabled ? spec.get() : nullptr;
         slot.request_spec_managed = request_spec.managed;
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.ocr_checkpoint_metrics_v3 = checkpoint_metrics_v3;
+        slot.ocr_request_id = slot.task->id;
+        slot.ocr_round_next = 0;
+        slot.ocr_round_id = 0;
+        slot.ocr_checkpoint_id = 0;
+        slot.ocr_anchor_pos = -1;
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -3671,6 +3729,11 @@ private:
             }
 
             if (!draft.empty()) {
+                if (slot.ocr_checkpoint_metrics_v3) {
+                    slot.ocr_round_id = slot.ocr_round_next++;
+                    slot.ocr_checkpoint_id = 0;
+                    slot.ocr_anchor_pos = (int64_t) ckpt.pos_max + 1;
+                }
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
@@ -3681,7 +3744,20 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    // The timer covers the existing target save only. The
+                    // target blob size is measured after its successful return.
+                    const int64_t ocr_save_start = slot.ocr_checkpoint_metrics_v3 ? ggml_time_us() : 0;
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (slot.ocr_checkpoint_metrics_v3) {
+                        const double ocr_save_seconds = (ggml_time_us() - ocr_save_start) / 1e6;
+                        slot.ocr_checkpoint_id = checkpoint_metrics_next_id++;
+                        SLT_INF(slot, "OCR_SPEC kind=checkpoint_save request_id=%lld round_id=%llu checkpoint_id=%llu pos_min=%lld pos_max=%lld prompt_tokens=%lld bytes=%zu seconds=%.6f\n",
+                                (long long) slot.ocr_request_id,
+                                (unsigned long long) slot.ocr_round_id,
+                                (unsigned long long) slot.ocr_checkpoint_id,
+                                (long long) ckpt.pos_min, (long long) ckpt.pos_max,
+                                (long long) ckpt.n_tokens, ckpt.data_tgt.size(), ocr_save_seconds);
+                    }
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -4710,6 +4786,17 @@ private:
                 return;
             }
 
+            // This path is reached only after successful target decode and
+            // completion of this slot's full verification batch. A replay is
+            // therefore backed by real forward work, never by restore alone.
+            if (slot.ocr_checkpoint_metrics_v3 && slot.spec_is_replay) {
+                SLT_INF(slot, "OCR_SPEC kind=checkpoint_replay request_id=%lld round_id=%llu checkpoint_id=%llu input_tokens=%zu\n",
+                        (long long) slot.ocr_request_id,
+                        (unsigned long long) slot.ocr_round_id,
+                        (unsigned long long) slot.ocr_checkpoint_id,
+                        slot.spec_draft.size() + 1);
+            }
+
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
@@ -4753,9 +4840,27 @@ private:
                     // Work is counted before optional checkpoint replay. A verify
                     // batch includes the anchor plus every proposed token, even
                     // when only a prefix is accepted or output stops inside it.
-                    SLT_INF(slot, "OCR_SPEC kind=verify_result proposals=%zu target_tokens=%zu accepted_candidates=%zu rollback=%u checkpoint_replay=%d replayed=%d\n",
-                            n_draft, n_draft + 1, accepted.size() - 1, n_rollback,
-                            int(n_rollback > 0 && use_ckpt_tgt), int(slot.spec_is_replay));
+                    if (slot.ocr_checkpoint_metrics_v3) {
+                        if (slot.ocr_checkpoint_id != 0) {
+                            SLT_INF(slot, "OCR_SPEC kind=verify_result request_id=%lld round_id=%llu checkpoint_id=%llu anchor_pos=%lld proposals=%zu target_tokens=%zu accepted_candidates=%zu rollback=%u checkpoint_replay=%d replayed=%d\n",
+                                    (long long) slot.ocr_request_id,
+                                    (unsigned long long) slot.ocr_round_id,
+                                    (unsigned long long) slot.ocr_checkpoint_id,
+                                    (long long) slot.ocr_anchor_pos,
+                                    n_draft, n_draft + 1, accepted.size() - 1, n_rollback,
+                                    int(n_rollback > 0 && use_ckpt_tgt), int(slot.spec_is_replay));
+                        } else {
+                            SLT_INF(slot, "OCR_SPEC kind=verify_result request_id=%lld round_id=%llu checkpoint_id=0 anchor_pos=%lld proposals=%zu target_tokens=%zu accepted_candidates=%zu rollback=%u checkpoint_replay=0 replayed=0\n",
+                                    (long long) slot.ocr_request_id,
+                                    (unsigned long long) slot.ocr_round_id,
+                                    (long long) slot.ocr_anchor_pos,
+                                    n_draft, n_draft + 1, accepted.size() - 1, n_rollback);
+                        }
+                    } else {
+                        SLT_INF(slot, "OCR_SPEC kind=verify_result proposals=%zu target_tokens=%zu accepted_candidates=%zu rollback=%u checkpoint_replay=%d replayed=%d\n",
+                                n_draft, n_draft + 1, accepted.size() - 1, n_rollback,
+                                int(n_rollback > 0 && use_ckpt_tgt), int(slot.spec_is_replay));
+                    }
                 }
 
                 // check for partial draft acceptance
@@ -4773,6 +4878,9 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        // Complete-restore boundary: target load through draft
+                        // load, memory trim, prompt trim and sampler restoration.
+                        const int64_t ocr_restore_start = slot.ocr_checkpoint_metrics_v3 ? ggml_time_us() : 0;
                         GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                         if (slot.ctx_dft) {
@@ -4783,6 +4891,15 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        if (slot.ocr_checkpoint_metrics_v3) {
+                            const double ocr_restore_seconds = (ggml_time_us() - ocr_restore_start) / 1e6;
+                            SLT_INF(slot, "OCR_SPEC kind=checkpoint_restore request_id=%lld round_id=%llu checkpoint_id=%llu pos_min=%lld pos_max=%lld prompt_tokens=%lld bytes=%zu seconds=%.6f\n",
+                                    (long long) slot.ocr_request_id,
+                                    (unsigned long long) slot.ocr_round_id,
+                                    (unsigned long long) slot.ocr_checkpoint_id,
+                                    (long long) ckpt.pos_min, (long long) ckpt.pos_max,
+                                    (long long) ckpt.n_tokens, ckpt.data_tgt.size(), ocr_restore_seconds);
+                        }
 
                         return;
                     }

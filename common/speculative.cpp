@@ -2915,7 +2915,13 @@ bool common_speculative_prepare_dspark_request_graph(
     }
     llama_memory_clear(llama_get_memory(ctx_tgt), false);
     llama_memory_clear(llama_get_memory(ctx_dft), false);
-    if (!llama_set_rs_seq_active(ctx_tgt, enabled ? state.rs_capacity : 0)) {
+    // Opt-in diagnostic: preserve capture but use the existing server's
+    // checkpoint/replay rollback protocol instead of K16 history snapshots.
+    // Applied only after both request contexts have been logically cleared.
+    const char * replay_option = std::getenv("OCR_DSPARK_CHECKPOINT_REPLAY");
+    const bool replay = replay_option && std::strcmp(replay_option, "1") == 0;
+    const uint32_t active_rs = enabled && !replay ? state.rs_capacity : 0;
+    if (!llama_set_rs_seq_active(ctx_tgt, active_rs)) {
         return false;
     }
     for (uint32_t k = 0; k < impl->target_layer_ids_n; ++k) {
@@ -2926,7 +2932,7 @@ bool common_speculative_prepare_dspark_request_graph(
     if (!common_speculative_dspark_request_graph_state(spec, state)) {
         return false;
     }
-    return state.target_rs == (enabled ? state.rs_capacity : 0) &&
+    return state.target_rs == active_rs &&
         state.target_capture == (enabled ? state.configured_capture : 0);
 }
 

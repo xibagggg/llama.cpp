@@ -42,6 +42,8 @@ enum spacemit_op_code {
     SPACEMIT_OP_GDN_STATE_GATHER, // get_rows of the recurrent state, skipped when the update runs in place
     SPACEMIT_OP_GDN_INPLACE,      // gated_delta_net updating the cache row in place
     SPACEMIT_OP_GDN_STATE_STORE,  // cpy of the new state to the cache row, skipped when in place
+    SPACEMIT_OP_GDN_SNAPSHOT_DIRECT, // original K16 recurrence stores snapshots directly to cache
+    SPACEMIT_OP_GDN_SNAPSHOT_STORE,  // original following CPY; skipped only with the same runtime proof
 };
 
 #define SPACEMIT_OP_MAX_KERN_PARAMS 32
@@ -54,6 +56,7 @@ struct spacemit_opnode {
     ggml_tensor * prepared_attention = nullptr;
     // in-place recurrent state update: {state gather (GET_ROWS), GATED_DELTA_NET, state store (CPY)}
     ggml_tensor * gdn_state[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor * gdn_snapshots[2] = {nullptr, nullptr}; // {GDN, CPY}; original graph remains intact
 
     std::vector<ggml_tensor *> fused;
 

@@ -1,0 +1,26 @@
+{
+  "status": "PASS",
+  "runner_kind": "derived publication runner, not the historical measured runner",
+  "runner_sha256": "e5892668f0a9884a102d56867580c4e211974edab5ee53ed2dfdd084375fc662",
+  "case": "host",
+  "package": {
+    "status": "PASS",
+    "files_checked": 39,
+    "issues": [],
+    "scope": "Package byte identities and include closure only; no execution."
+  },
+  "results": {
+    "host": {
+      "mapped-contract124": {
+        "status": "PASS",
+        "metadata_cases": 124
+      },
+      "gdn-admission44-copy8": {
+        "status": "PASS",
+        "admission_cases": 44,
+        "copy_cases": 8,
+        "failures": 0
+      }
+    }
+  }
+}

@@ -4,6 +4,7 @@
 // backend. Matrix kernels retain IME2 dispatch; irregular/indexing operators
 // use the AI cores' scalar/vector instruction sets.
 #include "ggml-impl.h"
+#include "ocr-dspark-custom-contract.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -74,7 +75,8 @@ inline void custom(ggml_tensor * t, int ith, int nth) {
     auto tasks = [nth](int requested) { return requested == GGML_N_TASKS_MAX ? nth : std::min(nth, requested); };
     if (t->op == GGML_OP_CUSTOM) {
         ggml_custom_op_params p; memcpy(&p,t->op_params,sizeof(p));
-        const int n = tasks(p.n_tasks); if (ith < n) p.fun(t,ith,n,p.userdata);
+        const int n = tasks(p.n_tasks);
+        if (ith < n && !ocr_dspark_custom_contract::vector_forward(t)) p.fun(t,ith,n,p.userdata);
     } else if (t->op == GGML_OP_MAP_CUSTOM1) {
         ggml_map_custom1_op_params p; memcpy(&p,t->op_params,sizeof(p));
         const int n = tasks(p.n_tasks); if (ith < n) p.fun(t,t->src[0],ith,n,p.userdata);
