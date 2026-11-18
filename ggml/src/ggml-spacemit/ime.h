@@ -9,6 +9,9 @@ bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t *
 bool ggml_spacemit_compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op);
 bool ggml_spacemit_can_fuse_pc8_bias(const ggml_tensor * op);
 bool ggml_spacemit_can_fuse_pc8_pad(const ggml_tensor * op);
+bool ggml_spacemit_can_fuse_paddle_pc8_gelu_pack(int workers,const ggml_tensor * op,
+    const ggml_tensor * gelu,const ggml_tensor * dst,const ggml_tensor * bias=nullptr,
+    const ggml_tensor * residual=nullptr);
 bool ggml_spacemit_can_fuse_paddle_f16_gelu_pack(int workers,const ggml_tensor * op,
     const ggml_tensor * gelu,const ggml_tensor * dst,const ggml_tensor * bias);
 bool ggml_spacemit_can_fuse_paddle_f16_bias(const ggml_tensor * op, const ggml_tensor * add);

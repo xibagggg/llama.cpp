@@ -12,6 +12,7 @@
 #include <riscv_vector.h>
 #include "ocr-pc8-load.h"
 #include "ocr-pc8-options.h"
+#include "paddle-pc8-gelu-pack.h"
 namespace ocr_q4_pc8 {
 __attribute__((noinline)) static void prepack_panel(int8_t*p,int k){
     int blocks=k/32;
@@ -186,6 +187,40 @@ inline bool pad_supported(const ggml_tensor*op){
     for(int i=0;i<8;++i)if(p->op_params[i]!=(i==1?48:0))return false;
     return true;
 }
+// Admit only the Paddle up1152->4304, row bias, GELU, PAD48, down4352->1152 chain.
+// Shape alone never admits a differently repacked or ordinary Q4 tensor.
+inline bool gelu_pack_supported(int workers,const ggml_tensor*op,const ggml_tensor*gelu){
+    if(!gelu_pack()||!pad_supported(op)||!gelu||op->src[1]->src[0]!=gelu||
+       gelu->op!=GGML_OP_UNARY||ggml_get_unary_op(gelu)!=GGML_UNARY_OP_GELU||
+       !gelu->src[0]||gelu->src[0]->op!=GGML_OP_ADD||
+       gelu->view_src||gelu->src[0]->view_src||op->view_src||op->src[1]->view_src||
+       gelu->type!=GGML_TYPE_F32||gelu->src[0]->type!=GGML_TYPE_F32||
+       !ggml_is_contiguous(gelu)||!ggml_is_contiguous(gelu->src[0])||
+       !ggml_are_same_shape(gelu,gelu->src[0])||!gelu->src[0]->data||
+       !op->data||!op->src[0]->data)return false;
+    const auto*added=gelu->src[0];const auto*up=added->src[0];const auto*bias=added->src[1];
+    if(!supported(up)||up->src[0]->ne[0]!=1152||up->ne[0]!=4304||
+       up->ne[1]!=op->ne[1]||!up->src[0]->extra||up->src[0]->extra!=op->src[0]->extra||
+       !bias||bias->op!=GGML_OP_NONE||bias->src[0]||bias->view_src||bias->type!=GGML_TYPE_F32||
+       bias->ne[0]!=4304||bias->ne[1]!=1||bias->ne[2]!=1||bias->ne[3]!=1||
+       !ggml_is_contiguous(bias)||!ggml_are_same_shape(up,added)||
+       !paddle_pc8_gelu_pack::same_layer(up->src[0]->name,op->src[0]->name))return false;
+    static const auto info=spert::backend_info();
+    return paddle_pc8_gelu_pack::eligible(workers,info.core_arch_id,info.vlen,
+        op->src[0]->ne[0],op->ne[0],op->ne[1],info.shared_mem_size);
+}
+inline bool gelu_pack_storage_safe(int workers,const ggml_tensor*op,const ggml_tensor*gelu,
+    const ggml_tensor*dst,const ggml_tensor*bias=nullptr,const ggml_tensor*residual=nullptr){
+    if(!gelu_pack_supported(workers,op,gelu)||!dst||!dst->data||dst->view_src||
+       dst->type!=GGML_TYPE_F32||!ggml_is_contiguous(dst)||!ggml_are_same_shape(dst,op)||
+       (bias&&(!bias->data||bias->type!=GGML_TYPE_F32||!ggml_is_contiguous(bias)))||
+       (residual&&(!residual->data||residual->type!=GGML_TYPE_F32||
+          !ggml_is_contiguous(residual)||!ggml_are_same_shape(residual,op))))return false;
+    return paddle_pc8_gelu_pack::storage_eligible(gelu->src[0]->data,ggml_nbytes(gelu->src[0]),
+        dst->data,ggml_nbytes(dst),op->src[0]->data,nbytes(op->src[0]),
+        bias?bias->data:nullptr,bias?ggml_nbytes(bias):0,
+        residual?residual->data:nullptr,residual?ggml_nbytes(residual):0);
+}
 struct traits final:ggml::spacemit::tensor_traits_base {
     bool work_size(int,const ggml_tensor*op,size_t&size)const override {
         if(!supported(op))return false;
@@ -226,17 +261,22 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             if(node.fused.size()==2)return compute<false,true>(ctx,node.node,node.node->src[1],node.fused[1],node.fused[0]->src[1]);
             return compute<false>(ctx,node.node,node.node->src[1],node.fused[0],node.fused[0]->src[1]);
         }
-        if(node.opcode!=SPACEMIT_OP_PC8_PAD_MUL_MAT||node.elided_pad!=node.node->src[1]||
-           !pad_supported(node.node))return false;
-        if(node.fused.empty())return compute<true>(ctx,node.node,node.elided_pad->src[0]);
-        const auto*bias=node.fused[0]->src[1];
-        if(node.fused.size()==1)return compute<true>(ctx,node.node,node.elided_pad->src[0],node.fused[0],bias);
-        if(node.fused.size()!=2)return false;
-        auto*res=node.fused[1];const bool left=res->src[0]!=node.fused[0];
-        return compute<true>(ctx,node.node,node.elided_pad->src[0],res,bias,res->src[left?0:1],left);
+        const bool producer=node.opcode==SPACEMIT_OP_PADDLE_PC8_GELU_PACK;
+        if(producer&&(!node.extra_dsts.empty()||node.packed_im2col))return false;
+        if((node.opcode!=SPACEMIT_OP_PC8_PAD_MUL_MAT&&!producer)||
+           node.elided_pad!=node.node->src[1]||!pad_supported(node.node)||node.fused.size()>2)return false;
+        const auto*gelu=producer?node.elided_gelu:nullptr;
+        const auto*input=producer?(gelu?gelu->src[0]:nullptr):node.elided_pad->src[0];
+        const auto*bias=node.fused.empty()?nullptr:node.fused[0]->src[1];
+        auto*dst=node.fused.empty()?node.node:node.fused.back();
+        const auto*res=node.fused.size()==2?node.fused[1]:nullptr;
+        const bool left=res&&res->src[0]!=node.fused[0];
+        const auto*skip=res?res->src[left?0:1]:nullptr;
+        if(producer&&!gelu_pack_storage_safe(int(ctx.nth),node.node,gelu,dst,bias,skip))return false;
+        return compute<true>(ctx,node.node,input,dst,bias,skip,left,gelu);
     }
     template<bool PAD,bool GELU=false>
-    bool compute(ggml::spacemit::context&ctx,ggml_tensor*op,const ggml_tensor*input,ggml_tensor*dst=nullptr,const ggml_tensor*bias=nullptr,const ggml_tensor*residual=nullptr,bool residual_left=false)const {
+    bool compute(ggml::spacemit::context&ctx,ggml_tensor*op,const ggml_tensor*input,ggml_tensor*dst=nullptr,const ggml_tensor*bias=nullptr,const ggml_tensor*residual=nullptr,bool residual_left=false,const ggml_tensor*input_gelu=nullptr)const {
         const int K=op->src[0]->ne[0],N=op->ne[0],M=op->ne[1],MP=GGML_PAD(M,4),NP=GGML_PAD(N,32);
         const int input_k=PAD?int(input->ne[0]):K;
         const bool m8=rows8()&&(K==1152||(K==4352&&down_rows8()))&&M>=8&&
@@ -248,8 +288,29 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const bool reuse_enabled=reuse_input();
         const bool reuse=reuse_enabled&&!PAD&&ctx.pc8_packed_source==input;
         if(reuse&&trace_reuse()&&ctx.ith==0)GGML_LOG_INFO("ocr-pc8-reuse: K=%d M=%d\n",K,M);
+        ocr_pc8_phases::scope phases(ctx.ith,K,N,M,input_gelu!=nullptr,reuse,op->src[0]->name);
         ctx.mark_subphase(100); // activation quantization and packing
-        if(!reuse)for(int g=ctx.ith;g<MP/4;g+=ctx.nth)for(int r=0;r<4;++r){
+        if(input_gelu){
+            // Execute at the original GELU position. Every group is packed
+            // before the unchanged all-worker barrier or any down output store.
+            GGML_ASSERT(PAD&&ctx.nth==6&&K==4352&&input_k==4304&&
+                ctx.shared.size>=paddle_pc8_gelu_pack::scratch_bytes);
+            auto*guard=static_cast<unsigned char*>(ctx.shared.data);
+            auto*scratch=reinterpret_cast<float*>(guard+128);
+            GGML_ASSERT(paddle_pc8_gelu_pack::scratch_eligible(guard,ctx.shared.size,
+                x,ggml_nbytes(input),ctx.workspace,ctx.workspace_size,
+                (dst?dst:op)->data,ggml_nbytes(dst?dst:op),op->src[0]->data,nbytes(op->src[0]),
+                bias?bias->data:nullptr,bias?ggml_nbytes(bias):0,
+                residual?residual->data:nullptr,residual?ggml_nbytes(residual):0));
+            std::memset(guard,0xa5,128);
+            std::memset(guard+128+size_t(4)*4304*sizeof(float),0xa5,128);
+            for(int g=int(ctx.ith);g<MP/4;g+=int(ctx.nth))
+                paddle_pc8_gelu_pack::pack_group(x+size_t(g)*4*4304,scratch,
+                    packed+size_t(g)*4*K,scales+g*4,std::min(4,M-g*4));
+            for(int i=0;i<128;++i)GGML_ASSERT(guard[i]==0xa5&&
+                guard[128+size_t(4)*4304*sizeof(float)+i]==0xa5);
+        }
+        else if(!reuse)for(int g=ctx.ith;g<MP/4;g+=ctx.nth)for(int r=0;r<4;++r){
             if(g*4+r>=M){scales[g*4+r]=0;for(int k=0;k<K;k+=32)std::memset(packed+size_t(g)*4*K+k*4+r*32,0,32);continue;}
             auto vmax=__riscv_vfmv_v_f_f32m2(0,64);
             for(int k=0;k<input_k;k+=64){const size_t vl=std::min(64,input_k-k);const auto a=__riscv_vfabs_v_f32m2(__riscv_vle32_v_f32m2(x+size_t(g*4+r)*input_k+k,vl),vl);vmax=__riscv_vfmax_vv_f32m2_tu(vmax,vmax,a,vl);}
@@ -262,8 +323,10 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 const auto q=__riscv_vncvt_x_x_w_i8mf4(__riscv_vfncvt_x_f_w_i16mf2(a,vl),vl);
                 __riscv_vse8_v_i8mf4(target,q,vl);}
         }
+        phases.packed();
         ctx.mark_subphase(101); // grid barrier before consuming packed input
         GGML_ASSERT(ctx.sync()==spert::Status::Ok);
+        phases.synced(m8);
         ctx.mark_subphase(102); // scratch setup
         const auto*ws=reinterpret_cast<const float*>(static_cast<const char*>(op->src[0]->data)+128);
         const auto*weights=reinterpret_cast<const int8_t*>(ws+NP);

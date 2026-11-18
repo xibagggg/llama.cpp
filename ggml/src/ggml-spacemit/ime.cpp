@@ -2130,6 +2130,13 @@ bool ggml_spacemit_can_fuse_pc8_pad(const ggml_tensor * op) {
     return ocr_q4_pc8::pad_supported(op)&&op->src[0]->extra==&ocr_q4_pc8::impl;
 }
 
+bool ggml_spacemit_can_fuse_paddle_pc8_gelu_pack(int workers,const ggml_tensor * op,
+    const ggml_tensor * gelu,const ggml_tensor * dst,const ggml_tensor * bias,
+    const ggml_tensor * residual) {
+    return op&&op->src[0]&&op->src[0]->extra==&ocr_q4_pc8::impl&&
+        ocr_q4_pc8::gelu_pack_storage_safe(workers,op,gelu,dst,bias,residual);
+}
+
 bool ggml_spacemit_can_fuse_paddle_f16_gelu_pack(int workers,const ggml_tensor * op,
     const ggml_tensor * gelu,const ggml_tensor * dst,const ggml_tensor * bias) {
     return op&&op->src[0]&&op->src[0]->extra==&paddle_f16_ime2::impl&&
@@ -2173,6 +2180,7 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
         case SPACEMIT_OP_OCR_CAST_KV_PACK:
             spacemit_kernels::rvv::cast_pack_ocr_kv(ctx,node.prepared_attention);
             return true;
+        case SPACEMIT_OP_PADDLE_PC8_GELU_PACK:
         case SPACEMIT_OP_PC8_PAD_MUL_MAT:
         case SPACEMIT_OP_PC8_MUL_MAT_BIAS:
         case SPACEMIT_OP_PADDLE_F16_BIAS:

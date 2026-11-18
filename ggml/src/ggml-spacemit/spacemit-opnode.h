@@ -44,6 +44,7 @@ enum spacemit_op_code {
     SPACEMIT_OP_GDN_STATE_STORE,  // cpy of the new state to the cache row, skipped when in place
     SPACEMIT_OP_PADDLE_F16_BIAS,  // selected F16 GEMM with its final F32 row-bias ADD
     SPACEMIT_OP_PADDLE_F16_GELU_PACK, // exact GELU -> full-K high/residual pack -> F16 down
+    SPACEMIT_OP_PADDLE_PC8_GELU_PACK, // exact biased GELU -> token-wise INT8 pack -> padded PC8 down
 };
 
 #define SPACEMIT_OP_MAX_KERN_PARAMS 32
@@ -127,6 +128,10 @@ struct spacemit_opnode {
         if(elided_gelu) {
             std::vector<const ggml_tensor*> inputs{node->src[0],elided_gelu->src[0]};
             if(!fused.empty())inputs.push_back(fused[0]->src[1]);
+            if(fused.size()==2) {
+                const auto * residual=fused[1];
+                inputs.push_back(residual->src[0]==fused[0]?residual->src[1]:residual->src[0]);
+            }
             return inputs;
         }
         if(elided_pad)return {node->src[0],elided_pad->src[0]};
@@ -188,7 +193,7 @@ struct spacemit_opnode {
     }
 
     std::string op_name() const {
-        if(elided_gelu)return "GELU+PACK+F16_DOWN";
+        if(elided_gelu)return opcode==SPACEMIT_OP_PADDLE_PC8_GELU_PACK?"GELU+TOKEN_PC8_PACK+PC8_DOWN":"GELU+PACK+F16_DOWN";
         if(elided_pad)return "PAD+PC8_MUL_MAT";
         if(packed_im2col)return "IM2COL+PACK+MUL_MAT";
         if (fused.empty()) {

@@ -702,6 +702,48 @@ static paddle_f16_gelu_pack_plan plan_paddle_f16_gelu_pack(
     return result;
 }
 
+struct paddle_pc8_gelu_pack_plan {
+    int pad=-1,matrix=-1,bias=-1,residual=-1;
+    explicit operator bool()const{return matrix>=0;}
+    int last()const{return residual>=0?residual:bias>=0?bias:matrix;}
+};
+static paddle_pc8_gelu_pack_plan plan_paddle_pc8_gelu_pack(
+    const ggml_cgraph*graph,int gi,int workers){
+    paddle_pc8_gelu_pack_plan result;
+    if(gi<0||gi>=graph->n_nodes||workers!=6)return result;
+    const auto following=[&](int i){++i;while(i<graph->n_nodes&&graph->nodes[i]->op==GGML_OP_NONE)++i;return i;};
+    const int pi=following(gi);if(pi>=graph->n_nodes)return result;
+    auto*gelu=graph->nodes[gi];auto*pad=graph->nodes[pi];
+    if(pad->op!=GGML_OP_PAD||pad->src[0]!=gelu)return result;
+    const int mi=following(pi);if(mi>=graph->n_nodes)return result;
+    auto*matrix=graph->nodes[mi];
+    if(!ggml_spacemit_can_fuse_paddle_pc8_gelu_pack(workers,matrix,gelu,matrix))return result;
+    const int ids[3]={gi,pi,mi};const ggml_op ops[3]={GGML_OP_UNARY,GGML_OP_PAD,GGML_OP_MUL_MAT};
+    if(!ggml_can_fuse_subgraph_ext(graph,ids,3,ops,&mi,1))return result;
+    result.pad=pi;result.matrix=mi;
+    const char*epilogue=getenv("GGML_SPACEMIT_OCR_PC8_DOWN_EPILOGUE");
+    if(!epilogue||strcmp(epilogue,"1"))return result;
+    const int bi=following(mi);if(bi>=graph->n_nodes)return result;
+    auto*b=graph->nodes[bi];
+    const int all[4]={gi,pi,mi,bi};const ggml_op allops[4]={GGML_OP_UNARY,GGML_OP_PAD,GGML_OP_MUL_MAT,GGML_OP_ADD};
+    if(b->op!=GGML_OP_ADD||b->src[0]!=matrix||b->type!=GGML_TYPE_F32||
+       !ggml_are_same_shape(b,matrix)||!ggml_is_contiguous(b)||
+       !ocr_norm_affine::row_weight(b->src[1],b->ne[0])||b->src[1]->op!=GGML_OP_NONE||
+       b->src[1]->src[0]!=nullptr||
+       !ggml_spacemit_can_fuse_paddle_pc8_gelu_pack(workers,matrix,gelu,b,b->src[1])||
+       !ggml_can_fuse_subgraph_ext(graph,all,4,allops,&bi,1))return result;
+    result.bias=bi;
+    const int ri=following(bi);if(ri>=graph->n_nodes)return result;
+    auto*res=graph->nodes[ri];auto*skip=res->src[0]==b?res->src[1]:res->src[1]==b?res->src[0]:nullptr;
+    const int more[5]={gi,pi,mi,bi,ri};const ggml_op moreops[5]={GGML_OP_UNARY,GGML_OP_PAD,GGML_OP_MUL_MAT,GGML_OP_ADD,GGML_OP_ADD};
+    if(res->op==GGML_OP_ADD&&skip&&res->type==GGML_TYPE_F32&&skip->type==GGML_TYPE_F32&&
+       ggml_are_same_shape(res,b)&&ggml_are_same_shape(skip,b)&&ggml_is_contiguous(res)&&ggml_is_contiguous(skip)&&
+       (!ocr_norm_affine::overlaps(res,skip)||res->data==skip->data)&&
+       ggml_spacemit_can_fuse_paddle_pc8_gelu_pack(workers,matrix,gelu,res,b->src[1],skip)&&
+       ggml_can_fuse_subgraph_ext(graph,more,5,moreops,&ri,1))result.residual=ri;
+    return result;
+}
+
 static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
                           std::unordered_set<ggml_tensor *> & emitted,int workers) {
     ggml_tensor * n = graph->nodes[i];
@@ -765,6 +807,14 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
     }
     ggml_tensor * next_node = (next_idx >= 0) ? graph->nodes[next_idx] : nullptr;
 
+    if(const auto plan=plan_paddle_pc8_gelu_pack(graph,i,workers)) {
+        spacemit_opnode fused(graph->nodes[plan.matrix],{},SPACEMIT_OP_PADDLE_PC8_GELU_PACK);
+        fused.elided_gelu=n;fused.elided_pad=graph->nodes[plan.pad];
+        if(plan.bias>=0)fused.add_fused(graph->nodes[plan.bias]);
+        if(plan.residual>=0)fused.add_fused(graph->nodes[plan.residual]);
+        nodes.push_back(std::move(fused));i=plan.last();return true;
+    }
+
     // Execute at the original producer position. All A8 groups are packed
     // before the original all-worker barrier and any down output store.
     if(const auto plan=plan_paddle_f16_gelu_pack(graph,i,workers)) {
@@ -824,7 +874,8 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
                 const char *gelu_option=getenv("GGML_SPACEMIT_OCR_PC8_GELU_FUSE");
                 int gelu_index=-1;
                 for(int j=next_idx+1;j<graph->n_nodes;++j)if(op_is_compute(graph->nodes[j])){gelu_index=j;break;}
-                if(gelu_option&&!strcmp(gelu_option,"1")&&gelu_index>=0) {
+                if(gelu_option&&!strcmp(gelu_option,"1")&&gelu_index>=0&&
+                   !plan_paddle_pc8_gelu_pack(graph,gelu_index,workers)) {
                     auto*gelu=graph->nodes[gelu_index];
                     const int all_idx[3]={i,next_idx,gelu_index};
                     const enum ggml_op all_ops[3]={GGML_OP_MUL_MAT,GGML_OP_ADD,GGML_OP_UNARY};
@@ -906,6 +957,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         const int          idxs[2] = { i, next_idx };
         const enum ggml_op ops[2]  = { GGML_OP_ADD, GGML_OP_UNARY };
         if (!plan_paddle_f16_gelu_pack(graph,next_idx,workers)&&
+            !plan_paddle_pc8_gelu_pack(graph,next_idx,workers)&&
             ggml_can_fuse_ext(graph, idxs, ops, 2) && add_gelu_fusable(n, next_node)) {
             spacemit_opnode node(n, {}, SPACEMIT_OP_ADD_GELU);
             node.add_fused(next_node);
@@ -1251,6 +1303,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         int n_paddle_f16_bias = 0;
         int n_paddle_f16_bias_gelu = 0;
         int n_paddle_f16_gelu_pack = 0;
+        int n_paddle_pc8_gelu_pack = 0;
         int n_im2col_pack = 0;
         int n_norm_affine = 0;
         int n_residual_norm_affine = 0;
@@ -1267,6 +1320,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             n_matmul_add += node.opcode == SPACEMIT_OP_MUL_MAT_ADD;
             n_paddle_f16_bias += node.opcode == SPACEMIT_OP_PADDLE_F16_BIAS;
             n_paddle_f16_gelu_pack += node.opcode == SPACEMIT_OP_PADDLE_F16_GELU_PACK;
+            n_paddle_pc8_gelu_pack += node.opcode == SPACEMIT_OP_PADDLE_PC8_GELU_PACK;
             n_paddle_f16_bias_gelu += node.opcode == SPACEMIT_OP_PADDLE_F16_BIAS && node.fused.size()==2;
             n_im2col_pack += node.opcode == SPACEMIT_OP_IM2COL_MUL_MAT;
             n_norm_affine += node.opcode == SPACEMIT_OP_NORM_AFFINE;
@@ -1293,6 +1347,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             GGML_LOG_INFO("ggml-spacemit: Q4_0 MUL_MAT+BIAS fused=%d graph=%llu\n", n_matmul_add,
                           (unsigned long long) graph->uid);
         }
+        const char*pc8_pack_trace=getenv("GGML_SPACEMIT_PADDLE_PC8_GELU_PACK_TRACE");
+        if(pc8_pack_trace&&!strcmp(pc8_pack_trace,"1"))
+            GGML_LOG_INFO("ggml-spacemit: PADDLE_PC8 GELU+PACK fused=%d graph=%llu\n",
+                n_paddle_pc8_gelu_pack,(unsigned long long)graph->uid);
         const char *gelu_pack_trace=getenv("GGML_SPACEMIT_PADDLE_F16_GELU_PACK_TRACE");
         if(gelu_pack_trace&&!strcmp(gelu_pack_trace,"1"))
             GGML_LOG_INFO("ggml-spacemit: PADDLE_F16 GELU+PACK fused=%d graph=%llu\n",
