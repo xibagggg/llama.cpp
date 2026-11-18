@@ -11,6 +11,8 @@
 #include <vector>
 #include <riscv_vector.h>
 #include "ocr-pc8-load.h"
+#include "ocr-pc8-final-layout.h"
+#include <array>
 #include "ocr-pc8-options.h"
 #include "paddle-pc8-gelu-pack.h"
 namespace ocr_q4_pc8 {
@@ -221,7 +223,7 @@ inline bool gelu_pack_storage_safe(int workers,const ggml_tensor*op,const ggml_t
         bias?bias->data:nullptr,bias?ggml_nbytes(bias):0,
         residual?residual->data:nullptr,residual?ggml_nbytes(residual):0);
 }
-struct traits final:ggml::spacemit::tensor_traits_base {
+template<bool FINAL> struct traits final:ggml::spacemit::tensor_traits_base {
     bool work_size(int,const ggml_tensor*op,size_t&size)const override {
         if(!supported(op))return false;
         size=GGML_PAD(size_t(op->ne[1]),4)*(4+size_t(op->src[0]->ne[0]));return true;
@@ -230,12 +232,21 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         GGML_ASSERT(selected(w)&&bytes==ggml_nbytes(w));
         const int K=w->ne[0],N=w->ne[1],NP=GGML_PAD(N,32);
         const auto*q=static_cast<const block_q4_0*>(data);
-        static const int load_threads=[] {
-            const char * value=std::getenv("GGML_SPACEMIT_OCR_PC8_LOAD_THREADS");
-            return value?std::max(1,std::min(8,std::atoi(value))):1;
-        }();
-        if(load_threads>1) {
-            ocr_pc8_load::repack(q,w->data,K,N,load_threads,
+        const int threads=load_threads();
+        if constexpr(FINAL) {
+            GGML_ASSERT(ocr_pc8_final_layout::eligible(true,K,N,std::fegetround(),threads));
+            // Allocate and touch every worker's small byte scratch on host.
+            std::vector<std::array<uint8_t,1024>> scratch(static_cast<size_t>(threads));
+            ocr_pc8_load::repack(q,w->data,K,N,threads,
+                [](ggml_half h){return ggml_fp16_to_fp32(h);},
+                [&](int8_t *panel,int k,int worker) {
+                    ocr_pc8_final_layout::permute_panel(panel,k,scratch[size_t(worker)].data());
+                });
+            ocr_pc8_final_layout::write_header(w->data,K,N);
+            return 0;
+        }
+        if(threads>1) {
+            ocr_pc8_load::repack(q,w->data,K,N,threads,
                 [](ggml_half h){return ggml_fp16_to_fp32(h);});
             return 0;
         }
@@ -278,6 +289,11 @@ struct traits final:ggml::spacemit::tensor_traits_base {
     template<bool PAD,bool GELU=false>
     bool compute(ggml::spacemit::context&ctx,ggml_tensor*op,const ggml_tensor*input,ggml_tensor*dst=nullptr,const ggml_tensor*bias=nullptr,const ggml_tensor*residual=nullptr,bool residual_left=false,const ggml_tensor*input_gelu=nullptr)const {
         const int K=op->src[0]->ne[0],N=op->ne[0],M=op->ne[1],MP=GGML_PAD(M,4),NP=GGML_PAD(N,32);
+        // Physical identity chooses the kernel; a later option change cannot
+        // reinterpret old weights or apply the permutation twice.
+        GGML_ASSERT(op->src[0]->extra==this&&
+            ocr_pc8_final_layout::valid_header(op->src[0]->data,K,N,FINAL));
+        const bool kernel_is_prepacked=FINAL||prepack();
         const int input_k=PAD?int(input->ne[0]):K;
         const bool m8=rows8()&&(K==1152||(K==4352&&down_rows8()))&&M>=8&&
             ctx.shared.size>=size_t(40*K+8*32*4+256);
@@ -342,7 +358,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 const uint64_t tile = nb + t * ctx.nth;
                 ctx.mark_subphase(200 + tile * 16); // this panel's weight copy
                 std::memcpy(sw+size_t(t)*32*K,weights+size_t(tile)*32*K,32*K);
-                if(prepack()) {
+                if(!FINAL&&prepack()) {
                     ctx.mark_subphase(201 + tile * 16); // this panel's permutation
                     prepack_panel(sw+size_t(t)*32*K,K);
                 }
@@ -353,7 +369,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
                 for(int t=0;t<batch;++t){const int tile=nb+t*ctx.nth,cols=std::min(32,N-tile*32);
                 const auto*w=sw+size_t(t)*32*K;
                 ctx.mark_subphase(0x200000000ull | (uint64_t(tile)<<24) | (uint64_t(g)<<4));
-                if(prepack()) {if(count==8)kernel8_prepacked(sx,sx+4*K,w,temp,K);else kernel_prepacked(sx,w,temp,K);}
+                if(kernel_is_prepacked) {if(count==8)kernel8_prepacked(sx,sx+4*K,w,temp,K);else kernel_prepacked(sx,w,temp,K);}
                 else {if(count==8)kernel8(sx,sx+4*K,w,temp,K);else kernel(sx,w,temp,K);}
                 ctx.mark_subphase(0x300000000ull | (uint64_t(tile)<<24) | (uint64_t(g)<<4));
                 if constexpr(GELU)for(int r=0;r<count;++r){
@@ -391,5 +407,13 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         return true;
     }
 };
-inline const traits impl;
+inline const traits<false> impl;
+inline const traits<true> impl_final;
+inline bool physical_trait(const ggml_tensor *w) {
+    return w&&(w->extra==&impl||w->extra==&impl_final);
+}
+inline bool final_selected(const ggml_tensor *w) {
+    return selected(w)&&ocr_pc8_final_layout::eligible(load_prepack(),int(w->ne[0]),
+        int(w->ne[1]),std::fegetround(),load_threads());
+}
 }

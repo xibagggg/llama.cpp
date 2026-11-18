@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include "ocr-pc8-phases.h"
 
@@ -10,6 +11,8 @@ inline bool down_rows8(){static const bool x=[] {const char*p=std::getenv("GGML_
 inline bool multi_n(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_Q4_PC8_MULTI_N");return p&&std::strcmp(p,"1")==0;}();return x;}
 // Prepare each immutable weight panel once, rather than for every M tile.
 inline bool prepack(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_PREPACK");return p&&std::strcmp(p,"1")==0;}();return x;}
+inline bool load_prepack(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_LOAD_PREPACK");return p&&!std::strcmp(p,"1");}();return x;}
+inline int load_threads(){static const int x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_LOAD_THREADS");return p?std::max(1,std::min(8,std::atoi(p))):1;}();return x;}
 inline bool reuse_input(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_REUSE_INPUT");return p&&!std::strcmp(p,"1");}();return x;}
 inline bool gelu_pack(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_PADDLE_PC8_GELU_PACK");return p&&!std::strcmp(p,"1");}();return x;}
 inline bool trace_reuse(){static const bool x=[] {const char*p=std::getenv("GGML_SPACEMIT_OCR_PC8_REUSE_TRACE");return p&&!std::strcmp(p,"1");}();return x;}
@@ -22,6 +25,8 @@ inline void prepare_options_on_host() {
     (void)down_rows8();
     (void)multi_n();
     (void)prepack();
+    (void)load_prepack();
+    (void)load_threads();
     (void)reuse_input();
     (void)trace_reuse();
     (void)gelu_pack();

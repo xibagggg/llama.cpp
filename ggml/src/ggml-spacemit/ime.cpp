@@ -1877,7 +1877,8 @@ static const tensor_traits_common               rvv_impl;
 
 const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
     if(paddle_f16_ime2::selected(cur))return &paddle_f16_ime2::impl;
-    if(ocr_q4_pc8::selected(cur))return &ocr_q4_pc8::impl;
+    if(ocr_q4_pc8::selected(cur))return ocr_q4_pc8::final_selected(cur)?
+        static_cast<const ggml::spacemit::tensor_traits_base*>(&ocr_q4_pc8::impl_final):&ocr_q4_pc8::impl;
     if(ocr_q4_f16::selected(cur))return &ocr_q4_f16::impl;
     switch (cur->type) {
         case GGML_TYPE_Q2_K:
@@ -2123,17 +2124,17 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
 }
 
 bool ggml_spacemit_can_fuse_pc8_bias(const ggml_tensor * op) {
-    return ocr_q4_pc8::supported(op)&&op->src[0]->extra==&ocr_q4_pc8::impl;
+    return ocr_q4_pc8::supported(op)&&ocr_q4_pc8::physical_trait(op->src[0]);
 }
 
 bool ggml_spacemit_can_fuse_pc8_pad(const ggml_tensor * op) {
-    return ocr_q4_pc8::pad_supported(op)&&op->src[0]->extra==&ocr_q4_pc8::impl;
+    return ocr_q4_pc8::pad_supported(op)&&ocr_q4_pc8::physical_trait(op->src[0]);
 }
 
 bool ggml_spacemit_can_fuse_paddle_pc8_gelu_pack(int workers,const ggml_tensor * op,
     const ggml_tensor * gelu,const ggml_tensor * dst,const ggml_tensor * bias,
     const ggml_tensor * residual) {
-    return op&&op->src[0]&&op->src[0]->extra==&ocr_q4_pc8::impl&&
+    return op&&op->src[0]&&ocr_q4_pc8::physical_trait(op->src[0])&&
         ocr_q4_pc8::gelu_pack_storage_safe(workers,op,gelu,dst,bias,residual);
 }
 

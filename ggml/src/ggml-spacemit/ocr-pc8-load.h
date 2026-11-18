@@ -10,9 +10,10 @@
 #include <vector>
 
 namespace ocr_pc8_load {
-template<class Decode>
+struct no_finalize {void operator()(int8_t*,int,int)const noexcept{}};
+template<class Decode,class Finalize=no_finalize>
 void repack(const block_q4_0 * q, void * output, int k_size, int rows,
-            int requested_threads, Decode decode) {
+            int requested_threads, Decode decode, Finalize finalize={}) {
     const int padded_rows=(rows+31)/32*32;
     const int threads=std::max(1,std::min({requested_threads,8,(rows+31)/32}));
     std::memset(output,0,128+size_t(padded_rows)*(sizeof(float)+k_size));
@@ -48,6 +49,10 @@ void repack(const block_q4_0 * q, void * output, int k_size, int rows,
                 packed[size_t(r/32)*32*k_size+(k/32)*1024+(r%32)*32+j]=
                     int8_t(std::max(-127.0f,std::min(127.0f,std::nearbyint(row[k+j]*inv))));
         }
+        // Entire aligned N32 partitions belong to one host worker. Only the
+        // new final-layout caller supplies a byte-only panel finalizer.
+        for(int group=begin/32;group<(end+31)/32;++group)
+            finalize(packed+size_t(group)*32*k_size,k_size,worker);
     };
     std::vector<std::thread> workers;
     workers.reserve(threads-1);
