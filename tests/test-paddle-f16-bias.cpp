@@ -273,6 +273,8 @@ int main(int argc, char ** argv) {
         cases.push_back({1152, 1152, 9, kind});
     std::mt19937 rng(176);
     bool ok = true;
+    // Existing M212 projector cases remain; M375 is the full-page table shape.
+    for (int n : {4608,1024}) cases.push_back({4608,n,375,graph_kind::eligible});
     for (const auto & test : cases) ok = run_case(test, backend, trace, fusion_enabled, rng, fixture.get(), write) && ok;
     if (write ? std::fflush(fixture.get()) != 0 :
                 (std::fgetc(fixture.get()) != EOF || std::ferror(fixture.get()))) {

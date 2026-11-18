@@ -83,6 +83,9 @@ int main(int argc, char ** argv) {
     // Keep all original cases/RNG order; only the K4304 projection gets
     // the real M848 vision geometry, avoiding huge extra projector cases.
     cases.push_back({4304,1152,848});
+    // Real projector geometries and an odd A8 tail for chunked staging.
+    for (int n : {4608,1024}) for (int m : {212,375})
+        cases.push_back({4608,n,m});
     for (const auto & test : cases) {
         const int k=test.k,n=test.n,m=test.m;
         ggml_init_params params{32*1024*1024,nullptr,true};

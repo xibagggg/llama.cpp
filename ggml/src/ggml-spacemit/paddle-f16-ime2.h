@@ -117,10 +117,26 @@ inline int requested_kblock() {
     }();
     return value;
 }
+// Independent opt-in projector staging using the existing bounded K chunks.
+// Keep high/residual FP32 accumulators in their original K8 order.
+inline int requested_projector_kblock() {
+    static const int value=[] {
+        const char *p=std::getenv("GGML_SPACEMIT_PADDLE_F16_PROJECTOR_KBLOCK");
+        return p&&!std::strcmp(p,"1440")?1440:p&&!std::strcmp(p,"1024")?1024:0;
+    }();
+    return value;
+}
+inline bool projector_kblock_selected(const ggml_tensor *op) {
+    if(!requested_projector_kblock()||!projector_enabled()||!op||!op->src[0])return false;
+    const auto *w=op->src[0];
+    return w->ne[0]==4608 &&
+        ((!std::strcmp(w->name,"mm.1.weight")&&op->ne[0]==4608) ||
+         (!std::strcmp(w->name,"mm.2.weight")&&op->ne[0]==1024));
+}
 inline bool kblock_enabled() {return requested_kblock()!=0;}
 inline bool kblock_selected(const ggml_tensor *op) {
-    return kblock_enabled() && op && op->src[0] && op->src[0]->ne[0]==4304 &&
-           op->ne[0]==1152;
+    return (kblock_enabled() && op && op->src[0] && op->src[0]->ne[0]==4304 &&
+            op->ne[0]==1152) || projector_kblock_selected(op);
 }
 inline size_t activation_workspace_bytes(const ggml_tensor *op) {
     const size_t groups=GGML_PAD(size_t(op->ne[1]),8)/8;
@@ -136,6 +152,7 @@ inline bool selected(const ggml_tensor *w) {
     (void)paddle_qkv_content_cache::enabled();
     (void)paddle_qkv_content_cache::trace_enabled();
     (void)paddle_f16_pipeline::enabled();
+    (void)requested_projector_kblock();
     (void)activation_store64_enabled();
     (void)tcm_copy64_enabled();
     if (!enabled() || !w || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) ||
@@ -567,7 +584,9 @@ struct traits final:ggml::spacemit::tensor_traits_base {
         const auto *pw=reinterpret_cast<const _Float16*>(static_cast<const char*>(op->src[0]->data)+128);
         float wscale;std::memcpy(&wscale,op->src[0]->data,4);
         auto *base=static_cast<uint8_t*>(ctx.shared.data);
-        const auto plan=make_kblock_plan(requested_kblock(),ctx.shared.size);
+        const int block_request=projector_kblock_selected(op)?
+            requested_projector_kblock():requested_kblock();
+        const auto plan=make_kblock_plan(block_request,ctx.shared.size);
         if(kblock_selected(op)&&plan.block_k) {
             const int block_k=plan.block_k, panel_count=plan.panels;
             constexpr int panel_floats=512;
@@ -593,7 +612,7 @@ struct traits final:ggml::spacemit::tensor_traits_base {
             for(int first_nb=int(ctx.ith);first_nb<ntiles;first_nb+=panel_count*int(ctx.nth)) {
                 const int active=std::min(panel_count,1+(ntiles-1-first_nb)/int(ctx.nth));
                 for(int k0=0;k0<K;k0+=block_k) {
-                    const int kb=std::min(block_k,K-k0); // final chunk is208 or1424.
+                    const int kb=std::min(block_k,K-k0); // Preserve every final K8 chunk.
                     GGML_ASSERT(kb>0&&kb%8==0);
                     for(int p=0;p<active;++p) {
                         const int nb=first_nb+p*int(ctx.nth);

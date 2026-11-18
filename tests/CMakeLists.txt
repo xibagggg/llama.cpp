@@ -836,3 +836,27 @@ if (GGML_SPACEMIT)
             FIXTURES_REQUIRED paddle_llm_head_stage_reference RUN_SERIAL TRUE)
     endforeach()
 endif()
+
+# Projector bounded K staging only; default off.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-projector-schedule.cpp LINK ggml)
+    llama_test(test-paddle-projector-schedule LABEL spacemit)
+    set_tests_properties(test-paddle-projector-schedule PROPERTIES RUN_SERIAL TRUE)
+    set(paddle_projector_schedule_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_PADDLE_F16_IME2=1;GGML_SPACEMIT_PADDLE_F16_PROJECTOR=1;GGML_SPACEMIT_PADDLE_F16_PANEL_TILES=4;GGML_SPACEMIT_PADDLE_F16_PACK_WIDTH=64;GGML_SPACEMIT_PADDLE_F16_M16=1;GGML_SPACEMIT_PADDLE_F16_KBLOCK=1440;GGML_SPACEMIT_PADDLE_F16_OUTPUT64=1;GGML_SPACEMIT_PADDLE_F16_PIPELINE16=1;GGML_SPACEMIT_PADDLE_F16_ACT_STORE64=0;GGML_SPACEMIT_PADDLE_F16_TCM_COPY64=0;GGML_SPACEMIT_PADDLE_F16_QKV_CONTENT_CACHE=0")
+    foreach(paddle_projector_schedule_kind IN ITEMS ime2 bias)
+        set(paddle_projector_schedule_binary "test-paddle-f16-${paddle_projector_schedule_kind}")
+        set(paddle_projector_schedule_ref "${CMAKE_CURRENT_BINARY_DIR}/paddle-projector-schedule-${paddle_projector_schedule_kind}-reference.bin")
+        set(paddle_projector_schedule_reference "test-paddle-projector-schedule-${paddle_projector_schedule_kind}-reference")
+        llama_test(${paddle_projector_schedule_binary} NAME "${paddle_projector_schedule_reference}" LABEL spacemit ARGS --write-reference "${paddle_projector_schedule_ref}")
+        set_tests_properties("${paddle_projector_schedule_reference}" PROPERTIES RUN_SERIAL TRUE
+            ENVIRONMENT "${paddle_projector_schedule_env};GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=0;GGML_SPACEMIT_PADDLE_F16_PROJECTOR_KBLOCK=0"
+            FIXTURES_SETUP "paddle_projector_schedule_${paddle_projector_schedule_kind}_reference")
+        foreach(paddle_projector_schedule_kblock IN ITEMS 1024 1440)
+            set(paddle_projector_schedule_name "test-paddle-projector-schedule-${paddle_projector_schedule_kind}-projector${paddle_projector_schedule_kblock}")
+            llama_test(${paddle_projector_schedule_binary} NAME "${paddle_projector_schedule_name}" LABEL spacemit ARGS --compare-reference "${paddle_projector_schedule_ref}")
+            set_tests_properties("${paddle_projector_schedule_name}" PROPERTIES RUN_SERIAL TRUE
+                ENVIRONMENT "${paddle_projector_schedule_env};GGML_SPACEMIT_PADDLE_F16_BIAS_FUSE=1;GGML_SPACEMIT_PADDLE_F16_PROJECTOR_KBLOCK=${paddle_projector_schedule_kblock}"
+                FIXTURES_REQUIRED "paddle_projector_schedule_${paddle_projector_schedule_kind}_reference")
+        endforeach()
+    endforeach()
+endif()
