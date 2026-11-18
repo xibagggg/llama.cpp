@@ -20,6 +20,7 @@
 #include "ggml-impl.h"
 #include "ggml-spacemit.h"
 #include "ocr-ai-complete.h"
+#include "ocr-worker-policy.h"
 #include "paddle-pos-resize.h"
 
 #include "spacemit-session.h"
@@ -96,13 +97,15 @@ spine_env_info::spine_env_info() {
                perfer_core_arch_id == spine_core_arch_id::core_arch_x100;
     use_ime2 = perfer_core_arch_id == spine_core_arch_id::core_arch_a100;
 
-    // Limit this K3 deployment to the six stable AI workers.
+    // Six remains the default. Seven/eight require an explicit bounded experiment.
+    const char * allow_eight_str=getenv("GGML_SPACEMIT_ALLOW_EIGHT_WORKERS");
+    const bool allow_eight=allow_eight_str&&!strcmp(allow_eight_str,"1");
     const char * workers_str = getenv("GGML_SPACEMIT_WORKERS");
     if (workers_str) {
         char * end = nullptr;
         const long requested = strtol(workers_str, &end, 10);
-        if (!end || *end || requested < 1 || requested > 6) {
-            GGML_ABORT("GGML_SPACEMIT_WORKERS must be between 1 and 6 on this K3 deployment\n");
+        if (!end || *end || !ocr_worker_policy::requested_count(requested,info.num_cores,allow_eight)) {
+            GGML_ABORT("GGML_SPACEMIT_WORKERS exceeds available cores or allowed maximum (6; explicit ALLOW_EIGHT_WORKERS=1 permits up to 8)\n");
         }
         num_cores = int(requested);
     } else {
@@ -127,20 +130,35 @@ spine_env_info::spine_env_info() {
             std::string tok = list.substr(start, end - start);
             if (!tok.empty()) {
                 int core_id = atoi(tok.c_str());
+                if(num_cores>6) {
+                    char *core_end=nullptr;
+                    const long parsed=strtol(tok.c_str(),&core_end,10);
+                    if(core_end==tok.c_str()||*core_end||parsed<8||parsed>15)
+                        GGML_ABORT("extended worker core identifiers must be integers8..15\n");
+                    core_id=int(parsed);
+                }
                 if (core_id < 0 || (n_cpus > 0 && core_id >= n_cpus)) {
                     GGML_ABORT("invalid core id %d in SPACEMIT_PERFER_CORE_ID, should be between 0 and %d\n",
                                core_id, n_cpus - 1);
                 }
                 ids.push_back(core_id);
+            } else if(num_cores>6) {
+                GGML_ABORT("extended worker core list contains an empty identifier\n");
             }
             start = end + 1;
         }
         if (!ids.empty()) {
             perfer_core_ids = std::move(ids);
             if (num_cores > (int) perfer_core_ids.size()) {
+                if(num_cores>6)GGML_ABORT("extended worker preferred core list is shorter than requested count\n");
                 num_cores = (int) perfer_core_ids.size();
             }
         }
+    }
+
+    if(num_cores>6&&(perfer_core_ids.size()!=size_t(num_cores)||
+        !ocr_worker_policy::ai_mask(perfer_core_ids.data(),perfer_core_ids.size()))) {
+        GGML_ABORT("extended worker experiment requires one unique preferred AI core ID8..15 per requested worker\n");
     }
 
     vlen = info.vlen;
@@ -1299,6 +1317,14 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         return GGML_STATUS_FAILED;
     }
 
+    const bool extended_workers=sess->num_cores>6;
+    if(extended_workers&&stream.core_count()!=uint32_t(n_threads)) {
+        GGML_LOG_ERROR("ggml-spacemit: extended worker grant mismatch requested=%d actual=%u\n",n_threads,stream.core_count());
+        return GGML_STATUS_FAILED;
+    }
+    std::array<int,8> extended_worker_cpus{};
+    extended_worker_cpus.fill(-1);
+
     FILE * op_hash_trace = nullptr;
     uint64_t op_hash_trace_sequence = 0;
     const char * op_hash_trace_path = getenv("GGML_SPACEMIT_OP_HASH_TRACE_PATH");
@@ -1359,8 +1385,16 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
          attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,
-         op_progress, progress_sequence, tcm_trace, &tcm_views, &tcm_cpus](spert::Context * runtime) {
+         op_progress, progress_sequence, tcm_trace, &tcm_views, &tcm_cpus,
+         extended_workers, &extended_worker_cpus](spert::Context * runtime) {
             const uint32_t ith = runtime->program_id(0);
+            if(extended_workers) {
+                if(ith>=extended_worker_cpus.size()||runtime->grid_dim(0)>8)
+                    throw std::runtime_error("extended worker grid exceeds eight lanes");
+                extended_worker_cpus[ith]=sched_getcpu();
+                if(extended_worker_cpus[ith]<8||extended_worker_cpus[ith]>15)
+                    throw std::runtime_error("extended worker is outside AI cores8..15");
+            }
             if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
                 throw std::runtime_error("inference worker is outside AI cores 8-15");
             ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
@@ -1447,6 +1481,16 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     spacemit_host_trace("graph-launch-end");
     const spert::Status status = fut.sync();
     spacemit_host_trace("graph-sync-end");
+    const bool extended_grant_ok=!extended_workers||ocr_worker_policy::exact_grant(
+        size_t(n_threads),stream.core_count(),stream_cfg.core_ids.data(),stream_cfg.core_ids.size(),
+        extended_worker_cpus.data(),size_t(n_threads));
+    if(!extended_grant_ok)GGML_LOG_ERROR("ggml-spacemit: extended worker actual core set mismatch\n");
+    const char * worker_trace=getenv("GGML_SPACEMIT_EIGHT_WORKER_TRACE");
+    if(extended_workers&&worker_trace&&!strcmp(worker_trace,"1")) {
+        GGML_LOG_INFO("ggml-spacemit: extended workers requested=%d granted=%u expected_mask=0x%x actual_mask=0x%x exact=%d\n",
+            n_threads,stream.core_count(),ocr_worker_policy::ai_mask(stream_cfg.core_ids.data(),stream_cfg.core_ids.size()),
+            ocr_worker_policy::ai_mask(extended_worker_cpus.data(),size_t(n_threads)),int(extended_grant_ok));
+    }
     const bool qkv_content_guards_ok=!qkv_content_view||sess->qkv_content_cache.guards_ok();
     if(qkv_content_view) {
         if(qkv_content_trace)sess->qkv_content_cache.trace();
@@ -1492,7 +1536,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         std::fclose(op_hash_trace);
     }
 
-    if (status != spert::Status::Ok || !qkv_content_guards_ok) {
+    if (status != spert::Status::Ok || !qkv_content_guards_ok || !extended_grant_ok) {
         return GGML_STATUS_FAILED;
     }
     qkv_completion.commit();

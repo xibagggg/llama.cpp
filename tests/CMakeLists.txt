@@ -860,3 +860,10 @@ if (GGML_SPACEMIT)
         endforeach()
     endforeach()
 endif()
+
+# Independent host policy regression; no numerical/runtime side effects.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-worker-policy.cpp LINK ggml)
+    llama_test(test-paddle-worker-policy LABEL spacemit)
+    set_tests_properties(test-paddle-worker-policy PROPERTIES RUN_SERIAL TRUE)
+endif()

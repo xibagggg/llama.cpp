@@ -395,6 +395,8 @@ bool integer_field(const std::string & line, const char * field, uint64_t & valu
 }
 
 bool verify_phases(const std::string & directory) {
+    const char * configured_workers=std::getenv("GGML_SPACEMIT_WORKERS");
+    const uint64_t workers=configured_workers&&!std::strcmp(configured_workers,"8")?8:6;
     std::ifstream file(directory+"/attention-phases.jsonl");
     if (!file) { std::fprintf(stderr,"Missing attention phase trace in %s\n",directory.c_str()); return false; }
     struct counts { uint64_t prepare=0,fullkv=0,headcache=0,compute=0; };
@@ -418,7 +420,7 @@ bool verify_phases(const std::string & directory) {
             std::string name,stage; uint64_t n=0,start=0,end=0;
             if (!string_field(line,"name",name) || !string_field(line,"stage",stage) ||
                 !integer_field(line,"N",n) || !integer_field(line,"start_ns",start) || !integer_field(line,"end_ns",end) ||
-                end < start || !expected_n.count(name) || uint64_t(expected_n[name]) != n || lane >= 6) return false;
+                end < start || !expected_n.count(name) || uint64_t(expected_n[name]) != n || lane >= workers) return false;
             auto & count = observed[name];
             if (stage == "prepare") ++count.prepare;
             else if (stage == "fullkv") ++count.fullkv;
@@ -435,7 +437,7 @@ bool verify_phases(const std::string & directory) {
         const auto name = op_name(id,c,step);
         const auto count = observed[name];
         const uint64_t tasks = uint64_t(H)*uint64_t((c.n+511)/512);
-        uint64_t prepare=6,fullkv=tasks,compute=0;
+        uint64_t prepare=workers,fullkv=tasks,compute=0;
         if (c.n < 64) { prepare=0; fullkv=0; }
         else if (c.n > 1120) { fullkv=0; compute=tasks; }
         else if (invalid_step(c,step)) { compute=c.kind==scenario::reject_q?1:uint64_t((c.n+511)/512); fullkv=tasks-compute; }
@@ -487,6 +489,20 @@ bool configure(bool write, unsigned & option_mask) {
         {"GGML_SPACEMIT_OCR_STRIDED_CAST","0"}, {"GGML_SPACEMIT_PADDLE_CAST_KV_FUSE","0"},
     };
     for (const auto & entry : fixed) if (setenv(entry.first,entry.second,1)) return false;
+    // Independent fixture-only count selection; default remains the original6.
+    const char * workers=std::getenv("GGML_SPACEMIT_TEST_WORKERS");
+    if(workers&&std::strcmp(workers,"6")&&std::strcmp(workers,"8")) {
+        std::fprintf(stderr,"GGML_SPACEMIT_TEST_WORKERS must be 6 or 8\n");return false;
+    }
+    if(workers&&!std::strcmp(workers,"8")) {
+        const char * allow=std::getenv("GGML_SPACEMIT_ALLOW_EIGHT_WORKERS");
+        if(!allow||std::strcmp(allow,"1")) {
+            std::fprintf(stderr,"eight-worker fixture requires explicit ALLOW_EIGHT_WORKERS=1\n");return false;
+        }
+        if(setenv("GGML_SPACEMIT_WORKERS","8",1)||
+           setenv("SPACEMIT_PERFER_CORE_ID","8,9,10,11,12,13,14,15",1))return false;
+    }
+    std::printf("effective AI workers=%s preferred=%s\n",std::getenv("GGML_SPACEMIT_WORKERS"),std::getenv("SPACEMIT_PERFER_CORE_ID"));
     return true;
 }
 } // namespace
