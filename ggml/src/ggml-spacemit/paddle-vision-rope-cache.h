@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "spacemit-opnode.h"
 #include "paddle-vision-rope-layout.h"
+#include "paddle-vision-rope-content-cache.h"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -44,10 +45,11 @@ struct entry {
 struct launch_tables {
     std::vector<entry> entries;
     std::vector<const float *> nodes;
-    launch_tables(const ggml_cgraph * graph,const std::vector<spacemit_opnode> & ops) {
+    launch_tables(const ggml_cgraph * graph,const std::vector<spacemit_opnode> & ops,content_cache * content=nullptr) {
         const char * trace=std::getenv("GGML_SPACEMIT_VISION_ROPE_TRACE");
         if(trace&&!std::strcmp(trace,"1"))std::fprintf(stderr,"paddle-vision-rope: host enabled=%d nodes=%zu\n",int(table_enabled()),ops.size());
         if(!table_enabled())return;
+        if(content)content->begin_launch();
         const bool planar=planar_enabled(); // initialize on the host
         nodes.resize(ops.size(),nullptr);
         for(size_t i=0;i<ops.size();++i) {
@@ -72,9 +74,13 @@ struct launch_tables {
                     immutable=false;break;
                 }
             }
-            if(!immutable)continue;
+            if(!immutable){if(content)++content->rejected_writes;continue;}
             for(const auto & e:entries)if(e.positions==pos&&e.planar==use_planar)nodes[i]=e.values.data();
             if(nodes[i])continue;
+            if(content) {
+                nodes[i]=content->find(op,use_planar);
+                if(nodes[i])continue;
+            }
             const int64_t n=op->ne[2];
             if(n<=0||uint64_t(n)>SIZE_MAX/(72*sizeof(float)))continue;
             entries.push_back({pos,use_planar,std::vector<float>(size_t(n)*72)});
@@ -100,6 +106,7 @@ struct launch_tables {
                 }
             }
             nodes[i]=table.data();
+            if(content)content->store(op,use_planar,table);
         }
         if(trace&&!std::strcmp(trace,"1")&&!entries.empty()) {
             size_t hits=0;for(const auto * p:nodes)hits+=p!=nullptr;

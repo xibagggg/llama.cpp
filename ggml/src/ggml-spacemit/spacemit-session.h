@@ -5,6 +5,7 @@
 #include "spacemit-context.h"
 #include "spacemit-resident-scratch.h"
 #include "paddle-qkv-content-cache.h"
+#include "paddle-vision-rope-content-cache.h"
 
 #include <cstdint>
 #include <mutex>
@@ -30,6 +31,8 @@ struct spacemit_session {
     // Separate DDR owner; survives graph splits, never ordinary workspace.
     // Every hit validates complete current source bytes, shape and rounding.
     paddle_qkv_content_cache::owner qkv_content_cache;
+    // Stream-serialized immutable angle cache; complete input bytes on each hit.
+    paddle_vision_rope::content_cache vision_rope_content_cache;
 
     void * workspace = nullptr;
     size_t workspace_size = 0;

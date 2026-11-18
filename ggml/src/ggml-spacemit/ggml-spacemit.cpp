@@ -1262,8 +1262,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                           (unsigned long long)graph->uid);
     }
     const auto & opnodes = sess->cached_graph.nodes;
-    // Fresh tables from current positions: no graph-UID or address-only cache.
-    const paddle_vision_rope::launch_tables vision_rope_tables(graph,opnodes);
+    // Fresh or complete-byte-verified angles; never graph-UID/address-only reuse.
+    auto * vision_rope_content=paddle_vision_rope::table_enabled() &&
+        paddle_vision_rope::content_enabled()?&sess->vision_rope_content_cache:nullptr;
+    const paddle_vision_rope::launch_tables vision_rope_tables(graph,opnodes,vision_rope_content);
 
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
     size_t workspace_size = 0;
@@ -1491,6 +1493,9 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             n_threads,stream.core_count(),ocr_worker_policy::ai_mask(stream_cfg.core_ids.data(),stream_cfg.core_ids.size()),
             ocr_worker_policy::ai_mask(extended_worker_cpus.data(),size_t(n_threads)),int(extended_grant_ok));
     }
+    const bool vision_rope_content_guards_ok=!vision_rope_content||vision_rope_content->guards_ok();
+    if(vision_rope_content)vision_rope_content->trace();
+    if(!vision_rope_content_guards_ok)GGML_LOG_ERROR("ggml-spacemit: vision RoPE content guard changed\n");
     const bool qkv_content_guards_ok=!qkv_content_view||sess->qkv_content_cache.guards_ok();
     if(qkv_content_view) {
         if(qkv_content_trace)sess->qkv_content_cache.trace();
@@ -1536,7 +1541,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         std::fclose(op_hash_trace);
     }
 
-    if (status != spert::Status::Ok || !qkv_content_guards_ok || !extended_grant_ok) {
+    if (status != spert::Status::Ok || !qkv_content_guards_ok || !extended_grant_ok || !vision_rope_content_guards_ok) {
         return GGML_STATUS_FAILED;
     }
     qkv_completion.commit();

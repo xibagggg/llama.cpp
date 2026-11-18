@@ -867,3 +867,31 @@ if (GGML_SPACEMIT)
     llama_test(test-paddle-worker-policy LABEL spacemit)
     set_tests_properties(test-paddle-worker-policy PROPERTIES RUN_SERIAL TRUE)
 endif()
+
+
+
+# Full-byte output regression and cross-graph content/alias guards.
+if (GGML_SPACEMIT)
+    llama_build(test-paddle-vision-rope-content.cpp LINK ggml)
+    target_include_directories(test-paddle-vision-rope-content PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src")
+    set(paddle_vision_content_ref "${CMAKE_CURRENT_BINARY_DIR}/paddle-vision-rope-content-reference.bin")
+    set(paddle_vision_content_env "GGML_SPACEMIT_BACKEND=1;GGML_SPACEMIT_WORKERS=6;SPACEMIT_PERFER_CORE_ID=8,9,10,11,12,13;GGML_SPACEMIT_SHARED_MODE=PINNED_TCM;GGML_SPACEMIT_STRICT_AI_CORES=1;SPERT_SHARED_MODE=TCM;SPERT_BACKEND=spacemit-k3;SPERT_RT_PRIO=0;GGML_SPACEMIT_VISION_ROPE=1;GGML_SPACEMIT_VISION_ROPE_CONTENT_TRACE=1")
+    llama_test(test-paddle-vision-rope-content NAME test-paddle-vision-rope-content-reference LABEL spacemit ARGS --write-reference "${paddle_vision_content_ref}")
+    set_tests_properties(test-paddle-vision-rope-content-reference PROPERTIES RUN_SERIAL TRUE
+        ENVIRONMENT "${paddle_vision_content_env};GGML_SPACEMIT_VISION_ROPE_CACHE=0;GGML_SPACEMIT_VISION_ROPE_CONTENT_CACHE=0;GGML_SPACEMIT_PADDLE_ROPE_PLANAR=0"
+        FIXTURES_SETUP paddle_vision_content_reference)
+    foreach(paddle_vision_content_mode IN ITEMS fresh content planar)
+        set(paddle_vision_content_enabled 1)
+        set(paddle_vision_content_planar 0)
+        if(paddle_vision_content_mode STREQUAL "fresh")
+            set(paddle_vision_content_enabled 0)
+        elseif(paddle_vision_content_mode STREQUAL "planar")
+            set(paddle_vision_content_planar 1)
+        endif()
+        set(paddle_vision_content_name "test-paddle-vision-rope-content-${paddle_vision_content_mode}")
+        llama_test(test-paddle-vision-rope-content NAME "${paddle_vision_content_name}" LABEL spacemit ARGS --compare-reference "${paddle_vision_content_ref}")
+        set_tests_properties("${paddle_vision_content_name}" PROPERTIES RUN_SERIAL TRUE
+            ENVIRONMENT "${paddle_vision_content_env};GGML_SPACEMIT_VISION_ROPE_CACHE=1;GGML_SPACEMIT_VISION_ROPE_CONTENT_CACHE=${paddle_vision_content_enabled};GGML_SPACEMIT_PADDLE_ROPE_PLANAR=${paddle_vision_content_planar}"
+            FIXTURES_REQUIRED paddle_vision_content_reference)
+    endforeach()
+endif()
