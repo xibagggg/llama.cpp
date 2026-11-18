@@ -11,11 +11,14 @@
 
 struct spacemit_opnode;  // forward declaration (defined in spacemit-opnode.h)
 
+namespace ocr_d2t_scatter { struct launch_catalog; }
+
 namespace ggml::spacemit {
 
 inline constexpr size_t cache_line_size_f32 = 64 / sizeof(float);
 
 struct context {
+    const ocr_d2t_scatter::launch_catalog * d2t_scatter = nullptr;
     spert::Context *        runtime       = nullptr;
     uint32_t                ith           = 0;
     uint32_t                nth           = 0;
@@ -38,6 +41,7 @@ struct context {
                std::atomic<int64_t> * work_queue_in = nullptr, bool check_tcm_view_in = false) {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
+        d2t_scatter = nullptr;
         runtime        = &runtime_in;
         ith            = ith_in;
         nth            = nth_in;
@@ -52,6 +56,7 @@ struct context {
     void clear() {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
+        d2t_scatter = nullptr;
         runtime        = nullptr;
         ith            = 0;
         nth            = 0;

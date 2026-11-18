@@ -47,6 +47,7 @@
 #include "spacemit-host-memory.h"
 #include "ocr-pv-pipeline.h"
 #include "ocr-quant-phases.h"
+#include "ocr-dspark-sampling.h"
 #include "ocr-fa-schedule.h"
 #include "spacemit-tcm-ownership-linux.h"
 
@@ -1324,11 +1325,19 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     const char * pc8_host_options = std::getenv("GGML_SPACEMIT_PC8_HOST_OPTIONS");
     if (!pc8_host_options || std::strcmp(pc8_host_options, "0") != 0)
         ocr_q4_pc8::prepare_options_on_host();
+    sess->d2t_scatter.prepare(opnodes, unsigned(n_threads), graph);
     spacemit_kernels::rvv::prepare_ocr_worker_state();
+    spacemit_kernels::rvv::prepare_ocr_gdn_rollback_tcm(unsigned(n_threads), shared_mem_size,
+        scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+    spacemit_kernels::rvv::prepare_ocr_fa_gqa_ime256_r24(unsigned(n_threads), shared_mem_size,
+        scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
+    spacemit_kernels::rvv::prepare_ocr_fa_gqa_group(unsigned(n_threads), shared_mem_size,
+        scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
     ocr_q4_head_prepared::prepare_on_host();
     (void)ocr_fa_schedule::configured_rows(ggml_fa_tile_config::Q);
     (void)ocr_fa_schedule::separate_barrier_enabled();
     ocr_quant_phases::prepare_on_host();
+    ocr_dspark_sampling::prepare_on_host();
     spacemit_host_trace("graph-launch-begin");
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
@@ -1336,6 +1345,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
          shared_mem_size, scratch_mode, ddr_scratch = &sess->ddr_scratch, graph_nodes = graph->n_nodes,
          op_hash_trace, op_hash_trace_sequence, graph_uid = graph->uid,
          attention_work_queue = &sess->attention_work_queue,op_timing,op_timing_sequence,op_stats,
+         d2t_scatter = &sess->d2t_scatter,
          op_progress, progress_sequence,
          tcm_values = tcm_ownership_enabled ? &tcm_catalog : nullptr,
          tcm_state = &tcm_result](spert::Context * runtime) {
@@ -1382,6 +1392,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                       attention_work_queue, !use_ddr && shared_mem_size > 0 &&
                           scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
 
+            ctx.d2t_scatter = d2t_scatter;
             ctx.diagnostic_subphase = op_progress ? &op_progress->lanes[ith].subphase : nullptr;
 
             size_t node_index = 0;
@@ -1445,9 +1456,11 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     spacemit_host_trace("graph-launch-end");
     const spert::Status status = fut.sync();
+    sess->d2t_scatter.report_worker_hits();
     if (op_stats) op_stats->finish(opnodes, status == spert::Status::Ok);
     spacemit_host_trace("graph-sync-end");
     spacemit_kernels::rvv::drain_ocr_worker_events();
+    spacemit_kernels::rvv::drain_ocr_fa_gqa_ime256_r24();
 
     if (op_hash_trace != nullptr) {
         std::fprintf(op_hash_trace, "E,%llu,%d\n",
@@ -1773,9 +1786,10 @@ static ggml_backend_dev_t ggml_backend_spacemit_reg_get_device(ggml_backend_reg_
 }
 
 static void * ggml_backend_spacemit_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    return NULL;
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (name && std::strcmp(name, "ggml_backend_spacemit_register_dspark_compact_argmax_v1") == 0)
+        return reinterpret_cast<void *>(ocr_dspark_custom_contract::register_callback);
+    return nullptr;
 }
 
 static void ggml_spacemit_init(ggml_backend_reg * reg) {

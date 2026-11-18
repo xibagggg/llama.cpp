@@ -42,7 +42,13 @@ using quantize_a_row_def = std::function<void(size_t, const float *, size_t, uin
 namespace rvv {
 // Host-only preparation and draining around the graph launch/future.
 void prepare_ocr_worker_state();
+void prepare_ocr_gdn_rollback_tcm(unsigned workers, size_t shared_bytes, bool pinned_tcm);
 void drain_ocr_worker_events();
+void prepare_ocr_fa_gqa_ime256_r24(unsigned workers, size_t bytes, bool pinned);
+bool forward_flash_attn_ext_f16_gqa_ime256_r24(ggml::spacemit::context & ctx, ggml_tensor * dst);
+void drain_ocr_fa_gqa_ime256_r24();
+void prepare_ocr_fa_gqa_group(unsigned workers, size_t shared_bytes, bool pinned_tcm);
+bool forward_flash_attn_ext_f16_gqa_group(ggml::spacemit::context & ctx, ggml_tensor * dst);
 
 void memcpy1d(void * dst, const void * src, int64_t size);
 

@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -1575,6 +1576,17 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     if (llama_n_rs_seq(ctx) > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
         return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    }
+
+    // Explicit opt-in for the owned OCR startup profile. Defer the first
+    // decode to the real request and conservatively keep checkpoint/replay
+    // semantics instead of claiming partial sequence removal support.
+    const char * skip_seq_rm_probe = std::getenv("OCR_SKIP_SEQ_RM_PROBE");
+    if (skip_seq_rm_probe && std::strcmp(skip_seq_rm_probe, "1") == 0) {
+        llama_memory_clear(mem, true);
+        llama_synchronize(ctx);
+        COM_INF("%s", "OCR_STARTUP seq_rm_probe=skipped conservative=FULL\n");
+        return COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
     }
 
     common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;

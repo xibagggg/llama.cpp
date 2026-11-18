@@ -4,6 +4,7 @@
 #include "spacemit-opnode.h"
 #include "spacemit-context.h"
 #include "spacemit-resident-scratch.h"
+#include "ocr-d2t-scatter.h"
 
 #include <cstdint>
 #include <mutex>
@@ -29,6 +30,7 @@ struct spacemit_session {
     void * workspace = nullptr;
     size_t workspace_size = 0;
     std::vector<ggml::spacemit::context> contexts;
+    ocr_d2t_scatter::launch_catalog d2t_scatter;
     ggml::spacemit::resident_scratch ddr_scratch;
     // Graph calls on this session are serialized by stream_mutex. The counter
     // is reset and synchronized before each dynamic attention dispatch.

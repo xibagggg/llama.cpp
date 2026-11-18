@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -1331,6 +1333,59 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
             }
         }
     }
+}
+
+uint32_t llama_context::get_rs_seq_capacity() const {
+    const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory.get());
+    const auto * recurrent = hybrid ? hybrid->get_mem_recr() : nullptr;
+    return recurrent && recurrent->has_allocated_states() ? recurrent->n_rs_seq_capacity : 0;
+}
+
+uint32_t llama_context::get_target_capture_count() const {
+    uint32_t count = cparams.embeddings_nextn ? 1 : 0;
+    for (bool enabled : cparams.embeddings_layer_inp) {
+        count += enabled ? 1 : 0;
+    }
+    return count;
+}
+
+bool llama_context::set_rs_seq_active(uint32_t value) {
+    if (cparams.n_seq_max != 1) {
+        return false;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    auto * recurrent = hybrid ? hybrid->get_mem_recr() : nullptr;
+    if (!recurrent || !recurrent->has_allocated_states() || recurrent->n_rs_seq_capacity == 0 ||
+            (value != 0 && value != recurrent->n_rs_seq_capacity)) {
+        return false;
+    }
+    synchronize();
+    // This is a request-boundary API, not a way to reinterpret live snapshots.
+    if (memory->seq_pos_min(0) != -1 || memory->seq_pos_max(0) != -1 || recurrent->used != 0) {
+        return false;
+    }
+    for (const auto & cell : recurrent->cells) {
+        if (!cell.is_empty() || cell.pos != -1 || cell.src != -1 || cell.tail != -1) {
+            return false;
+        }
+    }
+    for (uint32_t idx : recurrent->rs_idx) {
+        if (idx != 0) {
+            return false;
+        }
+    }
+    cparams.n_rs_seq = value;
+    recurrent->n_rs_seq = value;
+    // Allocation widths and snapshot-plane stride stay exactly as constructed.
+    // Rebuild both cached graphs and reserve with the new active graph policy.
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+    sched_need_reserve = true;
+    return true;
 }
 
 void llama_context::set_embeddings(bool value) {
@@ -4167,6 +4222,18 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
+}
+
+bool llama_set_rs_seq_active(llama_context * ctx, uint32_t value) {
+    return ctx && ctx->set_rs_seq_active(value);
+}
+
+uint32_t llama_n_rs_seq_capacity(const llama_context * ctx) {
+    return ctx ? ctx->get_rs_seq_capacity() : 0;
+}
+
+uint32_t llama_get_target_capture_count(const llama_context * ctx) {
+    return ctx ? ctx->get_target_capture_count() : 0;
 }
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {

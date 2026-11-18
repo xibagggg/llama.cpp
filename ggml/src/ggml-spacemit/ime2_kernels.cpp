@@ -2433,6 +2433,7 @@ void gemm_kernel_i8i3k_m4(size_t          blk_len,
     }
 }
 
+
 void gemm_kernel_i8i4_m1(size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,

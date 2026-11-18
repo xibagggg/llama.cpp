@@ -17,6 +17,13 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Request-boundary-only hybrid single-sequence policy. Capacity never changes.
+// Only 0 and the allocated capacity are accepted; live memory is rejected.
+LLAMA_API bool llama_set_rs_seq_active(struct llama_context * ctx, uint32_t value);
+LLAMA_API uint32_t llama_n_rs_seq_capacity(const struct llama_context * ctx);
+// Actual enabled target layer-input outputs plus optional nextn output.
+LLAMA_API uint32_t llama_get_target_capture_count(const struct llama_context * ctx);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

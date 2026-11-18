@@ -78,6 +78,7 @@ struct task_params {
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
+    int request_speculation = -1; // -1 inherits global; explicit 0/1 is single-slot DSpark only
 
     // response formatting
     bool               verbose  = false;

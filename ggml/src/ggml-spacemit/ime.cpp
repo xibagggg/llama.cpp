@@ -1745,6 +1745,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             return false;
         }
 
+        if (spacemit_kernels::rvv::forward_flash_attn_ext_f16_gqa_ime256_r24(ctx, dst)) return true;
+        if (spacemit_kernels::rvv::forward_flash_attn_ext_f16_gqa_group(ctx, dst)) return true;
+
         // total rows in q
         const int64_t nr = neq1 * neq2 * neq3;
 

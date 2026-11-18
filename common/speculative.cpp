@@ -2845,6 +2845,91 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     return result.release();
 }
 
+bool common_speculative_is_single_dspark(const common_speculative * spec) {
+    return spec && spec->impls.size() == 1 && spec->synth_probs.empty() &&
+        spec->impls.front()->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+bool common_speculative_reset_dspark_request(common_speculative * spec, llama_seq_id seq_id) {
+    if (!common_speculative_is_single_dspark(spec) || seq_id < 0 ||
+            size_t(seq_id) >= spec->dparams.size() || size_t(seq_id) >= spec->impl_last.size()) {
+        return false;
+    }
+    // DSpark's accept() is a no-op, draft() resets its sampler each round, and
+    // process() overwrites the feature scratch. Its persistent request state
+    // is the caller-owned KV plus these wrapper pointers/implementation owner.
+    spec->dparams[seq_id] = {};
+    spec->impl_last[seq_id] = nullptr;
+    return true;
+}
+
+bool common_speculative_dspark_request_graph_state(
+        const common_speculative * spec, common_speculative_request_graph_state & state) {
+    state = {};
+    if (!common_speculative_is_single_dspark(spec) || spec->dparams.size() != 1) {
+        return false;
+    }
+    const auto * impl = static_cast<const common_speculative_impl_draft_dflash *>(spec->impls.front().get());
+    auto * ctx_tgt = impl->params.ctx_tgt;
+    auto * ctx_dft = impl->params.ctx_dft;
+    if (!ctx_tgt || !ctx_dft || llama_n_seq_max(ctx_tgt) != 1 || llama_n_seq_max(ctx_dft) != 1) {
+        return false;
+    }
+    state.rs_capacity = llama_n_rs_seq_capacity(ctx_tgt);
+    state.target_rs = llama_n_rs_seq(ctx_tgt);
+    state.target_capture = llama_get_target_capture_count(ctx_tgt);
+    const int32_t n_layer = llama_model_n_layer(llama_get_model(ctx_tgt));
+    std::vector<int32_t> ids;
+    for (uint32_t k = 0; k < impl->target_layer_ids_n; ++k) {
+        const int32_t lid = impl->target_layer_ids[k];
+        if (lid < 0 || lid > n_layer) {
+            return false;
+        }
+        if (std::find(ids.begin(), ids.end(), lid) == ids.end()) {
+            ids.push_back(lid);
+        }
+    }
+    state.configured_capture = (uint32_t) ids.size();
+    return state.rs_capacity > 0 && state.configured_capture > 0 &&
+        (state.target_rs == 0 || state.target_rs == state.rs_capacity) &&
+        (state.target_capture == 0 || state.target_capture == state.configured_capture);
+}
+
+bool common_speculative_prepare_dspark_request_graph(
+        common_speculative * spec, bool enabled, common_speculative_request_graph_state & state) {
+    if (!common_speculative_dspark_request_graph_state(spec, state)) {
+        return false;
+    }
+    auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->impls.front().get());
+    auto * ctx_tgt = impl->params.ctx_tgt;
+    auto * ctx_dft = impl->params.ctx_dft;
+    llama_synchronize(ctx_tgt);
+    llama_synchronize(ctx_dft);
+    // Caller must already have discarded both prompts and wrapper references.
+    // Refuse a live sequence before performing either full logical clear.
+    for (auto * ctx : {ctx_tgt, ctx_dft}) {
+        if (llama_memory_seq_pos_min(llama_get_memory(ctx), 0) != -1 ||
+                llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != -1) {
+            return false;
+        }
+    }
+    llama_memory_clear(llama_get_memory(ctx_tgt), false);
+    llama_memory_clear(llama_get_memory(ctx_dft), false);
+    if (!llama_set_rs_seq_active(ctx_tgt, enabled ? state.rs_capacity : 0)) {
+        return false;
+    }
+    for (uint32_t k = 0; k < impl->target_layer_ids_n; ++k) {
+        llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) impl->target_layer_ids[k], enabled);
+    }
+    // DSpark captures layer inputs; it never consumes target nextn output.
+    llama_set_embeddings_nextn(ctx_tgt, false, false);
+    if (!common_speculative_dspark_request_graph_state(spec, state)) {
+        return false;
+    }
+    return state.target_rs == (enabled ? state.rs_capacity : 0) &&
+        state.target_capture == (enabled ? state.configured_capture : 0);
+}
+
 void common_speculative_free(common_speculative * spec) {
     if (spec == nullptr) {
         return;

@@ -20,12 +20,15 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "server-request-spec.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -262,6 +265,7 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+    bool request_spec_managed = false; // once opted in, never reuse prompt caches in this slot
 
     llama_tokens spec_draft;
 
@@ -394,10 +398,9 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (can_speculate()) {
-            spec_draft.clear();
-            spec_i_batch.clear();
-            spec_ckpt.clear();
+        server_request_spec::clear_candidates(*this);
+        if (request_spec_managed && spec) {
+            GGML_ASSERT(common_speculative_reset_dspark_request(spec, id));
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -1072,6 +1075,11 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    const bool request_native_graph = [] {
+        const char * value = std::getenv("OCR_DSPARK_REQUEST_NATIVE_GRAPH");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    bool request_graph_config_logged = false;
 
     bool add_bos_token = true;
 
@@ -1573,6 +1581,12 @@ private:
             return false;
         }
 
+        if (std::getenv("OCR_STAGE_TIMING")) {
+            const auto types = common_speculative_type_name_str(params_base.speculative.types);
+            SRV_INF("OCR_SPEC kind=config enabled=%d has_draft_context=%d types=%s\n",
+                    int(spec != nullptr), int(ctx_dft != nullptr), types.empty() ? "none" : types.c_str());
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1938,6 +1952,8 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+            // Never restore a target-only prefix as a complete draft cache.
+            update_cache = update_cache && task.params.request_speculation == -1 && !ret->request_spec_managed;
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -2005,6 +2021,17 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        const auto request_spec = server_request_spec::resolve(
+            task.params.request_speculation, slot.request_spec_managed, bool(spec), {
+                int(params_base.n_parallel), task.params.n_cmpl,
+                task.type == SERVER_TASK_TYPE_COMPLETION, task.is_child(), task.is_parent(),
+                task.n_tokens_shared != 0, ctx_dft != nullptr,
+                common_speculative_is_single_dspark(spec.get()) });
+        if (request_spec.error) {
+            send_error(task, request_spec.error, ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2117,6 +2144,49 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        if (request_spec.clear_contexts) {
+            // Clear target AND draft before every opted-in request, including
+            // after cancellation, same-mode repeats and a return to inheritance.
+            // begin() cannot repair a draft prefix skipped by a native request.
+            slot.prompt_clear();
+            server_request_spec::clear_candidates(slot);
+            if (!common_speculative_reset_dspark_request(spec.get(), slot.id)) {
+                send_error(task, "speculative.enabled failed to reset DSpark request state", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            task.params.cache_prompt = false;
+            task.params.n_cache_reuse = 0;
+            if (request_native_graph) {
+                common_speculative_request_graph_state graph_state;
+                if (!common_speculative_dspark_request_graph_state(spec.get(), graph_state)) {
+                    send_error(task, "speculative.enabled native graph configuration is unsupported", ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+                if (!request_graph_config_logged) {
+                    // Freeze independently read startup configuration before the first mode switch.
+                    if (graph_state.target_rs != graph_state.rs_capacity ||
+                            graph_state.target_capture != graph_state.configured_capture) {
+                        send_error(task, "speculative.enabled unexpected initial target graph", ERROR_TYPE_INVALID_REQUEST);
+                        return false;
+                    }
+                    SRV_INF("OCR_SPEC kind=request_graph_config mode_version=2 rs_capacity=%u target_capture=%u\n",
+                            graph_state.rs_capacity, graph_state.target_capture);
+                    request_graph_config_logged = true;
+                }
+                if (!common_speculative_prepare_dspark_request_graph(spec.get(), request_spec.enabled, graph_state)) {
+                    send_error(task, "speculative.enabled failed to prepare target request graph", ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+                SLT_INF(slot, "OCR_SPEC kind=request_mode mode_version=2 override=%d enabled=%d full_prefill=1 cache_reuse=0 target_rs=%u rs_capacity=%u target_capture=%u global_extraction_unchanged=0\n",
+                        task.params.request_speculation, int(request_spec.enabled), graph_state.target_rs,
+                        graph_state.rs_capacity, graph_state.target_capture);
+            } else {
+                SLT_INF(slot, "OCR_SPEC kind=request_mode override=%d enabled=%d full_prefill=1 cache_reuse=0 target_rs=%u global_extraction_unchanged=1\n",
+                        task.params.request_speculation, int(request_spec.enabled), llama_n_rs_seq(ctx_tgt));
+            }
+        }
+        slot.spec = request_spec.enabled ? spec.get() : nullptr;
+        slot.request_spec_managed = request_spec.managed;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -4342,7 +4412,17 @@ private:
 
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
-        if (spec && batch.has_embd()) {
+        // Explicit request switching is admitted only for a single slot.
+        // Capture the gate before target decode/yield; image prefill uses the
+        // same slot.spec pointer and get_n_draft_max/begin/accept use can_speculate().
+        common_speculative * batch_spec = spec.get();
+        if (slots.size() == 1 && slots[0].request_spec_managed) {
+            for (int i = off; i < off + batch.view.size(); ++i) {
+                GGML_ASSERT(batch.tokens[i].id_slot == slots[0].id);
+            }
+            batch_spec = slots[0].spec;
+        }
+        if (batch_spec && batch.has_embd()) {
             if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
@@ -4445,7 +4525,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        if (batch_spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 const bool ocr_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
@@ -4458,7 +4538,7 @@ private:
                     }
                 }
                 const int64_t ocr_process_start = ocr_timing ? ggml_time_us() : 0;
-                ok = common_speculative_process(spec.get(), batch.view);
+                ok = common_speculative_process(batch_spec, batch.view);
                 if (ocr_timing) {
                     const char * phase = prompt_tokens == 0 ? "decode" : decode_tokens == 0 ? "prefill" : "mixed";
                     SRV_INF("OCR_STAGE kind=spec_process phase=%s included_by=none seconds=%.6f tokens=%zu result=%d prompt_tokens=%zu decode_tokens=%zu\n",

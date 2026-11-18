@@ -2,6 +2,7 @@
 #define GGML_COMMON_DECL_CPP
 
 #include "scalar_kernels.h"
+#include "ocr-dspark-sampling.h"
 #include "ggml-common.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -121,6 +122,7 @@ void forward_concat_dim1_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 // and MAX-macro NaN behavior. Each row belongs to one worker; a single-row
 // DSpark Markov step runs on worker 0 without extra barriers.
 void forward_argmax_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    if (ocr_dspark_sampling::vector_argmax(ctx, op)) return;
     const ggml_tensor * src = op->src[0];
     GGML_ASSERT(src && src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_matrix(src) && ggml_is_contiguous(src) && ggml_is_contiguous(op));
@@ -165,6 +167,7 @@ void forward_argsort_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 // vocabulary. Match the CPU TOP_K algorithm, including its deliberate swap
 // of the first two outputs; no floating-point conversion of indices.
 void forward_top_k10_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    if (ocr_dspark_sampling::skip_topk(ctx, op)) return;
     const ggml_tensor * src = op->src[0];
     const int64_t n = src->ne[0];
     const int64_t nr = ggml_nrows(src);
@@ -214,6 +217,7 @@ void forward_clamp_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 // ── FILL ─────────────────────────────────────────────────────────────────────
 void forward_fill_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const float c = ggml_get_op_params_f32(op, 0);
+    if (ocr_dspark_sampling::contiguous_fill(ctx, op, c)) return;
 
     const int64_t ne0 = op->ne[0], ne1 = op->ne[1], ne2 = op->ne[2], ne3 = op->ne[3];
     const size_t  nb1 = op->nb[1], nb2 = op->nb[2], nb3 = op->nb[3];

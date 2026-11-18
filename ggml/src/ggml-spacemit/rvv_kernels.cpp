@@ -10,6 +10,9 @@
 #include "ocr-concat-tcm-v46.h"
 #include "ocr-worker-events.h"
 #include "ocr-gdn-tcm.h"
+#include "ocr-gdn-rollback-tcm.h"
+#include "ocr-conv-snapshot-copy.h"
+#include "ocr-d2t-scatter.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -51,10 +54,12 @@ namespace {
 // read the environment or initialize a function-local static for this option.
 std::atomic<bool> ocr_concat_decode_segmented_enabled{false};
 std::atomic<bool> ocr_decode_gqa_kv_pack_enabled{false};
+std::atomic<unsigned> ocr_decode_gqa_group_mode{0};
 }
 
 void prepare_ocr_worker_state() {
     ocr_gdn_tcm::prepare();
+    ocr_conv_snapshot_copy::prepare_on_host();
     // Resolve these guards/environment reads on the dispatching host thread,
     // in this TU (ocr_fa_x8_enabled has internal linkage). No RVV/IME work here.
     (void)ocr_worker_events::get();
@@ -98,7 +103,24 @@ void prepare_ocr_worker_state() {
     ocr_decode_gqa_kv_pack_enabled.store(decode_gqa_kv_pack, std::memory_order_relaxed);
 }
 
+
+void prepare_ocr_gdn_rollback_tcm(unsigned workers, size_t shared_bytes, bool pinned_tcm) {
+    ocr_gdn_rollback_tcm::prepare_on_host(workers, shared_bytes, pinned_tcm);
+}
+
+void prepare_ocr_fa_gqa_group(unsigned workers, size_t shared_bytes, bool pinned_tcm) {
+    const char * option = std::getenv("GGML_SPACEMIT_OCR_FA_GQA_GROUP");
+    unsigned mode = option && std::strcmp(option, "1") == 0 ? 1 :
+                    option && std::strcmp(option, "2") == 0 ? 2 : 0;
+    // Admission is collective and host-side. Per-lane fallback would assign
+    // different output rows after the work-unit reordering.
+    const size_t needed = mode == 1 ? 4096 : 70912;
+    if (workers != 6 || !pinned_tcm || shared_bytes < needed) mode = 0;
+    ocr_decode_gqa_group_mode.store(mode, std::memory_order_relaxed);
+}
+
 void drain_ocr_worker_events() {
+    ocr_gdn_rollback_tcm::drain_on_host();
     using ocr_worker_events::kind;
     ocr_worker_events::get().drain([](kind event, const ocr_worker_events::values & v) {
         switch(event) {
@@ -119,6 +141,11 @@ void drain_ocr_worker_events() {
             case kind::concat_segmented:
                 GGML_LOG_INFO("ocr-concat-segmented: active channels=%llu workers=%llu\n",
                     (unsigned long long)v.a, (unsigned long long)v.b);
+                break;
+            case kind::gqa_proposal:
+            case kind::gqa_verify:
+                GGML_LOG_INFO("ocr-fa-gqa-group: selected mode=%u Q=%u DK=256 DV=256 heads=%u GQA=4 KV=%llu TCM=%zu/%zu\n",
+                    unsigned(v.a), unsigned(v.b), unsigned(v.d), (unsigned long long)v.c, size_t(v.e), size_t(v.f));
                 break;
             case kind::count: break;
         }
@@ -1235,7 +1262,80 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
     flash_attn_ext_finalize_row_f16(dst, VKQ16, DV, S, M, sinks);
 }
 
+#include "ocr-fa-gqa-exact.h"
+#include "ocr-fa-gqa-ime256-r24.h"
+
 }  // namespace
+
+
+void prepare_ocr_fa_gqa_ime256_r24(unsigned workers, size_t bytes, bool pinned) {
+    ocr_fa_gqa_ime256_r24::prepare(workers, bytes, pinned);
+}
+bool forward_flash_attn_ext_f16_gqa_ime256_r24(ggml::spacemit::context & ctx, ggml_tensor * dst) {
+    return ocr_fa_gqa_ime256_r24::forward(ctx, dst);
+}
+void drain_ocr_fa_gqa_ime256_r24() {
+    const unsigned mode = ocr_fa_gqa_ime256_r24::selected_mode.load(std::memory_order_relaxed);
+    const auto panels = ocr_fa_gqa_ime256_r24::selected_panels.load(std::memory_order_relaxed);
+    const auto fallback = ocr_fa_gqa_ime256_r24::fallback_panels.load(std::memory_order_relaxed);
+    if (mode && panels) GGML_LOG_INFO("ocr-fa-gqa-ime256-r24: mode=%u panels=%llu fallback=%llu TCM_required=%zu\n",
+        mode, (unsigned long long)panels, (unsigned long long)fallback, ocr_fa_gqa_ime256_r24::required_bytes(mode));
+}
+
+bool forward_flash_attn_ext_f16_gqa_group(ggml::spacemit::context & ctx, ggml_tensor * dst) {
+    const unsigned mode = ocr_decode_gqa_group_mode.load(std::memory_order_relaxed);
+    if (!mode || !dst) return false;
+    const auto * q = dst->src[0]; const auto * k = dst->src[1]; const auto * v = dst->src[2];
+    const auto * mask = dst->src[3]; const auto * sinks = dst->src[4];
+    const float * params = reinterpret_cast<const float *>(dst->op_params);
+    if (!q || !k || !v || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||
+        (q->ne[1] != 15 && q->ne[1] != 16) || (q->ne[2] != 8 && q->ne[2] != 16) ||
+        q->ne[2] != 4 * k->ne[2] || k->ne[2] != v->ne[2] ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[1] <= 0 || k->ne[1] != v->ne[1] ||
+        q->nb[0] != sizeof(float) || k->nb[0] != sizeof(_Float16) || v->nb[0] != sizeof(_Float16) ||
+        dst->ne[0] != 256 || dst->ne[1] != q->ne[2] || dst->ne[2] != q->ne[1] || dst->ne[3] != 1 ||
+        dst->nb[0] != sizeof(float) || params[1] != 0.f ||
+        (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] ||
+                  mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[0] != sizeof(_Float16))) ||
+        (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
+                   sinks->ne[0] != q->ne[2] || ggml_nelements(sinks) != q->ne[2]))) return false;
+    const size_t needed = mode == 1 ? 4096 : 70912;
+    GGML_ASSERT(ctx.nth == 6 && ctx.shared.data && ctx.shared.size >= needed && __riscv_vlenb() == 128);
+    const int64_t tokens = q->ne[1];
+    float scale = params[0]; const float logit_softcap = params[2];
+    if (logit_softcap != 0.f) scale /= logit_softcap;
+    if (ctx.ith == 0) ocr_worker_events::publish(tokens == 15 ? ocr_worker_events::kind::gqa_proposal :
+        ocr_worker_events::kind::gqa_verify,
+        {mode, uint64_t(tokens), uint64_t(k->ne[1]), uint64_t(q->ne[2]), needed, ctx.shared.size});
+    // Unit=(KV head,token); all four GQA query heads share exact K/V/mask.
+    // Every logical output row belongs to exactly one unit and one AI worker.
+    for (int64_t unit = ctx.ith; unit < k->ne[2] * tokens; unit += ctx.nth) {
+        const int64_t kv_head = unit / tokens, token = unit % tokens;
+        std::array<float *, 4> queries{}, outputs{}, sink_rows{};
+        for (int64_t row = 0; row < 4; ++row) {
+            const int64_t head = 4 * kv_head + row;
+            queries[row] = reinterpret_cast<float *>(static_cast<char *>(q->data) + token * q->nb[1] + head * q->nb[2]);
+            outputs[row] = reinterpret_cast<float *>(static_cast<char *>(dst->data) + (head + token * dst->ne[1]) * dst->nb[1]);
+            sink_rows[row] = sinks ? static_cast<float *>(sinks->data) + head : nullptr;
+        }
+        const auto * mask_row = mask ? reinterpret_cast<const ggml_fp16_t *>(
+            static_cast<const char *>(mask->data) + token * mask->nb[1]) : nullptr;
+        const auto * key = static_cast<const char *>(k->data) + kv_head * k->nb[2];
+        const auto * value = static_cast<const char *>(v->data) + kv_head * v->nb[2];
+        if (mode == 1) {
+            flash_attn_ext_gqa4_exact_inner(queries.data(), key, value, mask_row, sink_rows.data(), outputs.data(),
+                scale, logit_softcap, 1.f, k->ne[1], k->nb[1], v->nb[1], 256, 256, ctx.shared.data, ctx.shared.size);
+        } else {
+            // Explicit approximate mode: original packed mrow4 has a different
+            // QK reduction and tile-online softmax/FP16 update order than m1.
+            flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<4>(queries.data(), key, value, mask_row,
+                sink_rows.data(), outputs.data(), scale, logit_softcap, 1.f,
+                k->ne[1], k->nb[1], v->nb[1], 256, 256, ctx.shared.data, ctx.shared.size);
+        }
+    }
+    return true;
+}
 
 void memcpy1d(void * dst, const void * src, int64_t size) {
     if (size <= 0) {
@@ -4465,7 +4565,7 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
 
     const float scale = 1.0f / sqrtf((float) S_v);
     const bool  kda   = src_g->ne[0] == S_v;
-    if (std::getenv("GGML_SPACEMIT_GDN_DEBUG") && ctx.ith == 0) {
+    if (ocr_gdn_rollback_tcm::debug_enabled.load(std::memory_order_relaxed) && ctx.ith == 0) {
         fprintf(stderr, "[gdn] S_v=%lld H=%lld T=%lld K=%lld kda=%d vlmax_m4=%lld vlmax_m8=%lld\n",
                 (long long) S_v, (long long) H, (long long) n_tokens, (long long) K, (int) kda,
                 (long long) __riscv_vsetvlmax_e32m4(), (long long) __riscv_vsetvlmax_e32m8());
@@ -4516,8 +4616,14 @@ static void forward_gated_delta_net_impl(ggml::spacemit::context & ctx, ggml_ten
     std::vector<float> state_work((fused && K > 1) ? (size_t) (S_v * S_v) : 0);
     // Two-pass scratch: per-row delta and attention sums, plus its own K > 1
     // working copy of the state.
-    std::vector<float> scratch(!fused ? (size_t) (3 * S_v + (K > 1 ? S_v * S_v : 0)) : 0);
-    float * delta      = !fused ? scratch.data() : nullptr;
+    // Host admitted enough private pinned TCM for this exact K16 shape.
+    // Every scratch float read below is fully written first. Arithmetic and
+    // snapshot stores retain the original order; only storage is changed.
+    float * rollback_tcm = ocr_gdn_rollback_tcm::workspace(op, ctx.shared.data, ctx.shared.size,
+        unsigned(ctx.ith), unsigned(ctx.nth), ctx.check_tcm_view);
+    std::vector<float> scratch(!fused && !rollback_tcm ?
+        (size_t) (3 * S_v + (K > 1 ? S_v * S_v : 0)) : 0);
+    float * delta      = !fused ? (rollback_tcm ? rollback_tcm : scratch.data()) : nullptr;
     float * decay      = !fused ? delta + S_v : nullptr;
     float * state_q    = !fused ? decay + S_v : nullptr;
     float * state_work_tp = (!fused && K > 1) ? state_q + S_v : nullptr;
@@ -4676,6 +4782,10 @@ void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
+
+    // Optional exact-bit segmented gather for speculative rollback row strides.
+    // Keep all unsupported/aliased cases on the original path below.
+    if (ocr_conv_snapshot_copy::copy(src0, dst, unsigned(ctx.ith), unsigned(ctx.nth))) return;
 
     GGML_ASSERT(op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(dst));
@@ -5883,6 +5993,18 @@ void forward_rope(ggml::spacemit::context & ctx, ggml_tensor * op) {
 }
 
 void forward_set_rows(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    // The host catalog admits only immutable, validated unique DSpark I64 IDs.
+    // Generic duplicate/invalid/strided/other-type semantics stay below.
+    if (ctx.d2t_scatter) {
+        if (const auto * plan = ctx.d2t_scatter->find(op)) {
+            ctx.d2t_scatter->record_worker_hit(plan, ctx.ith);
+            ocr_d2t_scatter::copy_unique(
+                static_cast<const uint32_t *>(op->src[0]->data),
+                static_cast<uint32_t *>(op->data), plan->offsets,
+                plan->rows, plan->columns, plan->full_rows, ctx.ith, ctx.nth, plan->mode);
+            return;
+        }
+    }
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
