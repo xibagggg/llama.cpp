@@ -49,6 +49,7 @@
 #include "ocr-pv-pipeline.h"
 #include "ocr-quant-phases.h"
 #include "ocr-fa-schedule.h"
+#include "ocr-startup-gate.h"
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -1157,6 +1158,7 @@ static void ggml_spacemit_trace_op_output(FILE * file, uint64_t sequence, uint64
 static std::mutex g_spacemit_execution_mutex;
 
 void ggml_backend_spacemit_acquire(void) {
+    ocr_startup_gate::wait(spacemit_host_trace);
     g_spacemit_execution_mutex.lock();
 }
 
@@ -1165,6 +1167,7 @@ void ggml_backend_spacemit_release(void) {
 }
 
 static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    ocr_startup_gate::wait(spacemit_host_trace);
     std::lock_guard<std::mutex> execution_lock(g_spacemit_execution_mutex);
     auto sess = static_cast<spacemit_session *>(backend->context);
     // Serialize hardware use across backend handles. Streams are graph-scoped

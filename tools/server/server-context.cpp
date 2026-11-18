@@ -22,6 +22,10 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#if defined(__linux__)
+#include "ggml/src/ggml-spacemit/ocr-startup-gate.h"
+#include <chrono>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -1498,6 +1502,19 @@ private:
         }
 
         slots.clear();
+
+#if defined(__linux__)
+        // All host model/media loading may overlap OCR Layout. The first
+        // compatibility probe below computes even with --no-warmup, and
+        // may include CPU fallback, so wait here before any such probe.
+        // Only the owned OCR SDK launch supplies the private descriptor.
+        ocr_startup_gate::wait([](const char * stage, size_t) {
+            const double now = std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::fprintf(stderr, "paddle-host-startup-gate: %.9f stage=%s\n", now, stage);
+            std::fflush(stderr);
+        });
+#endif
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
