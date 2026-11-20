@@ -1609,6 +1609,11 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         scratch_mode == ggml::spacemit::scratch_mode::pinned_tcm);
     ocr_q4_head_prepared::prepare_on_host();
     ocr_dspark_sampling::prepare_on_host();
+    // Lane-invariant options are read here, once per launch, instead of on the lanes: the direct
+    // GEMV path would otherwise scan the environment on every decode matrix product.
+    const char * gemv_tile_option = getenv("GGML_SPACEMIT_GEMV_TILE");
+    const int64_t gemv_tile_cols = gemv_tile_option ? std::max<int64_t>(32, atoi(gemv_tile_option)) : 0;
+    const bool strict_ai_cores = getenv("GGML_SPACEMIT_STRICT_AI_CORES") != nullptr;
     spacemit_host_trace("graph-launch-begin");
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
@@ -1621,7 +1626,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
          tcm_values = tcm_ownership_enabled ? &tcm_catalog : nullptr,
          tcm_state = &tcm_result,
          op_progress, progress_sequence, tcm_trace, &tcm_views, &tcm_cpus,
-         extended_workers, &extended_worker_cpus](spert::Context * runtime) {
+         extended_workers, &extended_worker_cpus, gemv_tile_cols, strict_ai_cores](spert::Context * runtime) {
             const uint32_t ith = runtime->program_id(0);
             if(extended_workers) {
                 if(ith>=extended_worker_cpus.size()||runtime->grid_dim(0)>8)
@@ -1630,7 +1635,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 if(extended_worker_cpus[ith]<8||extended_worker_cpus[ith]>15)
                     throw std::runtime_error("extended worker is outside AI cores8..15");
             }
-            if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
+            if (strict_ai_cores && (sched_getcpu() < 8 || sched_getcpu() > 15))
                 throw std::runtime_error("inference worker is outside AI cores 8-15");
             ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
             const bool use_ddr = scratch_mode == ggml::spacemit::scratch_mode::locked_ddr;
@@ -1641,7 +1646,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             spert::SharedBufferView shared{};
             auto preparation = ggml::spacemit::tcm_ownership::error::ok;
             try {
-                if (getenv("GGML_SPACEMIT_STRICT_AI_CORES") && (sched_getcpu() < 8 || sched_getcpu() > 15))
+                if (strict_ai_cores && (sched_getcpu() < 8 || sched_getcpu() > 15))
                     throw std::runtime_error("inference worker is outside AI cores 8-15");
                 ocr_op_progress::record(op_progress,ith,progress_sequence,UINT32_MAX,10,nullptr);
                 pool_lease.emplace(*runtime, shared_mem_size,
@@ -1680,6 +1685,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 tcm_cpus[ith] = sched_getcpu();
             }
             ctx.qkv_content_cache=qkv_content_view;
+            ctx.gemv_tile_cols = gemv_tile_cols;
             ctx.d2t_scatter = d2t_scatter;
             ctx.diagnostic_subphase = op_progress ? &op_progress->lanes[ith].subphase : nullptr;
 

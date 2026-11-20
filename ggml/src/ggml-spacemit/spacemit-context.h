@@ -38,6 +38,10 @@ struct context {
     const ggml_tensor * ocr_prepared_attention = nullptr;
     const float * prepared_vision_rope = nullptr;
     paddle_qkv_content_cache::view * qkv_content_cache = nullptr;
+    // GGML_SPACEMIT_GEMV_TILE as the host parsed it before this graph launch, 0 when unset. The
+    // direct GEMV path runs once per lane on every decode matrix product, so it must not scan the
+    // environment itself.
+    int64_t gemv_tile_cols = 0;
 
     void reset(spert::Context & runtime_in, uint32_t ith_in, uint32_t nth_in,
                void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in,
@@ -46,6 +50,7 @@ struct context {
         ocr_prepared_attention = nullptr;
         prepared_vision_rope = nullptr;
         qkv_content_cache = nullptr;
+        gemv_tile_cols = 0;
         d2t_scatter = nullptr;
         runtime        = &runtime_in;
         ith            = ith_in;
@@ -63,6 +68,7 @@ struct context {
         ocr_prepared_attention = nullptr;
         prepared_vision_rope = nullptr;
         qkv_content_cache = nullptr;
+        gemv_tile_cols = 0;
         d2t_scatter = nullptr;
         runtime        = nullptr;
         ith            = 0;
