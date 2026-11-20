@@ -800,11 +800,50 @@ static paddle_pc8_gelu_pack_plan plan_paddle_pc8_gelu_pack(
     return result;
 }
 
+// The switches try_fuse_node tests on every graph node. They are read once per opnode list build
+// rather than once per node: a list is rebuilt whenever the graph changes, and scanning the
+// environment for every node of every rebuild is measurable on the host thread. Switches that only
+// matter after a pattern has matched are still read where they are used.
+struct fuse_switches {
+    bool fa_lean_prepare = false;
+    bool fa_full_pack    = false;
+    bool norm_affine     = false;
+    bool im2col_pack     = false;
+    bool paddle_f16_bias = false;
+    bool pc8_bias        = false;
+    bool pc8_pad         = false;
+    bool gelu_pc8_pack   = false;
+    bool add_gelu        = false;
+    bool mul_mat_add     = false;
+};
+
+static bool env_is_one(const char * name) {
+    const char * value = getenv(name);
+    return value && strcmp(value, "1") == 0;
+}
+
+static fuse_switches read_fuse_switches() {
+    fuse_switches sw;
+    sw.fa_lean_prepare = env_is_one("GGML_SPACEMIT_OCR_FA_LEAN_PREPARE");
+    sw.fa_full_pack    = env_is_one("GGML_SPACEMIT_OCR_FA_FULL_PACK");
+    sw.norm_affine     = env_is_one("GGML_SPACEMIT_NORM_AFFINE");
+    const char * quant_capture = getenv("GGML_SPACEMIT_OCR_QUANT_CAPTURE");
+    sw.im2col_pack     = env_is_one("GGML_SPACEMIT_IM2COL_PACK") && (!quant_capture || !*quant_capture);
+    sw.paddle_f16_bias = paddle_f16_bias_fusion_enabled();
+    sw.pc8_bias        = env_is_one("GGML_SPACEMIT_OCR_PC8_BIAS_FUSE");
+    sw.pc8_pad         = env_is_one("GGML_SPACEMIT_OCR_PC8_PAD_FUSE");
+    sw.gelu_pc8_pack   = env_is_one("GGML_SPACEMIT_OCR_GELU_PC8_PACK");
+    sw.add_gelu        = add_gelu_fusion_enabled();
+    sw.mul_mat_add     = matmul_add_fusion_enabled();
+    return sw;
+}
+
 static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
-                          std::unordered_set<ggml_tensor *> & emitted,int workers) {
+                          std::unordered_set<ggml_tensor *> & emitted, int workers,
+                          const fuse_switches & sw) {
     ggml_tensor * n = graph->nodes[i];
 
-    if (const auto plan = ocr_cast_kv_pack::match(graph,i)) {
+    if (const auto plan = ocr_cast_kv_pack::match(graph, i, sw.fa_lean_prepare, sw.fa_full_pack)) {
         spacemit_opnode fused(n,{},SPACEMIT_OP_OCR_CAST_KV_PACK);
         fused.add_fused(graph->nodes[plan.value_index],true);
         fused.prepared_attention=plan.attention;
@@ -813,8 +852,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         return true;
     }
 
-    const char * norm_option = getenv("GGML_SPACEMIT_NORM_AFFINE");
-    if (norm_option && strcmp(norm_option, "1") == 0) {
+    if (sw.norm_affine) {
         const auto plan = ocr_norm_affine::match(graph, i);
         if (plan && ocr_norm_affine::storage_safe(plan)) {
             spacemit_opnode fused(n, {}, plan.residual ? SPACEMIT_OP_RESIDUAL_NORM_AFFINE : SPACEMIT_OP_NORM_AFFINE);
@@ -828,9 +866,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         }
     }
 
-    const char * pack_option=getenv("GGML_SPACEMIT_IM2COL_PACK");
-    const char * quant_capture=getenv("GGML_SPACEMIT_OCR_QUANT_CAPTURE");
-    if(pack_option&&strcmp(pack_option,"1")==0&&(!quant_capture||!*quant_capture)) {
+    if(sw.im2col_pack) {
         const int matrix_index=ocr_im2col_pack::match(graph,i);
         if(matrix_index>=0) {
             auto * matrix=graph->nodes[matrix_index];
@@ -883,7 +919,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
     // Keep full-K high/residual arithmetic and add row bias only at writeback.
     // The helper requires the physical Paddle trait and safe constant storage;
     // shape alone never admits an ordinary F16 matrix to this fused path.
-    if (paddle_f16_bias_fusion_enabled() && next_node &&
+    if (sw.paddle_f16_bias && next_node &&
         ggml_spacemit_can_fuse_paddle_f16_bias(n, next_node)) {
         const char *gelu_option=getenv("GGML_SPACEMIT_PADDLE_F16_GELU_FUSE");
         int gelu_idx=-1;
@@ -917,8 +953,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
 
     // PC8 INT32 epilogue applies the separate F32 bias add before writeback.
     // Keep the ordinary ggml use/output/view guards and constant row bias only.
-    const char *pc8_bias=getenv("GGML_SPACEMIT_OCR_PC8_BIAS_FUSE");
-    if(pc8_bias&&!strcmp(pc8_bias,"1")&&n->op==GGML_OP_MUL_MAT&&next_node&&
+    if(sw.pc8_bias&&n->op==GGML_OP_MUL_MAT&&next_node&&
        next_node->op==GGML_OP_ADD&&next_node->src[0]==n&&
        ggml_spacemit_can_fuse_pc8_bias(n)&&next_node->type==GGML_TYPE_F32&&
        ggml_are_same_shape(n,next_node)&&ggml_is_contiguous(next_node)) {
@@ -954,15 +989,13 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
     // allocations and perform every source read before the packing barrier;
     // only then may the down-projection overwrite any reused activation buffer.
     const auto following_pc8=[&](int x){for(int j=x+1;j<graph->n_nodes;++j)if(op_is_compute(graph->nodes[j]))return j;return -1;};
-    const char * pc8_pad=getenv("GGML_SPACEMIT_OCR_PC8_PAD_FUSE");
-    const char * gelu_pack=getenv("GGML_SPACEMIT_OCR_GELU_PC8_PACK");
     ggml_tensor * gelu_node=nullptr;
     ggml_tensor * pad_node=n;
     ggml_tensor * down_node=next_node;
     int pad_index=i,down_index=next_idx;
     std::vector<int> pc8_ids;
     std::vector<ggml_op> pc8_ops;
-    if(gelu_pack&&!strcmp(gelu_pack,"1")&&n->op==GGML_OP_UNARY&&
+    if(sw.gelu_pc8_pack&&n->op==GGML_OP_UNARY&&
        ggml_get_unary_op(n)==GGML_UNARY_OP_GELU&&n->src[0]&&
        n->type==GGML_TYPE_F32&&n->src[0]->type==GGML_TYPE_F32&&
        !n->view_src&&!n->src[0]->view_src&&
@@ -974,7 +1007,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         down_node=down_index<0?nullptr:graph->nodes[down_index];
         pc8_ids.push_back(i);pc8_ops.push_back(GGML_OP_UNARY);
     }
-    if(pc8_pad&&!strcmp(pc8_pad,"1")&&pad_node->op==GGML_OP_PAD&&down_node&&
+    if(sw.pc8_pad&&pad_node->op==GGML_OP_PAD&&down_node&&
        down_node->src[1]==pad_node&&ggml_spacemit_can_fuse_pc8_pad(down_node)) {
         pc8_ids.push_back(pad_index);pc8_ops.push_back(GGML_OP_PAD);
         pc8_ids.push_back(down_index);pc8_ops.push_back(GGML_OP_MUL_MAT);
@@ -1028,7 +1061,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
 
     // Pattern 2: ADD + GELU. The fused kernel reads ADD's two inputs and writes the final activation
     // directly, avoiding a full-size pre-activation materialization and an inter-node barrier.
-    if (add_gelu_fusion_enabled() && n->op == GGML_OP_ADD && next_node && next_node->op == GGML_OP_UNARY &&
+    if (sw.add_gelu && n->op == GGML_OP_ADD && next_node && next_node->op == GGML_OP_UNARY &&
         ggml_get_unary_op(next_node) == GGML_UNARY_OP_GELU) {
         const int          idxs[2] = { i, next_idx };
         const enum ggml_op ops[2]  = { GGML_OP_ADD, GGML_OP_UNARY };
@@ -1045,7 +1078,7 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
 
     // Pattern 4: Q4_0 MUL_MAT + constant row-bias ADD. The fused op retains
     // the matmul's graph position but writes its tile to the final Add output.
-    if (matmul_add_fusion_enabled() && n->op == GGML_OP_MUL_MAT && next_node && next_node->op == GGML_OP_ADD &&
+    if (sw.mul_mat_add && n->op == GGML_OP_MUL_MAT && next_node && next_node->op == GGML_OP_ADD &&
         matmul_add_bias_fusable(n, next_node)) {
         const int          idxs[2] = { i, next_idx };
         const enum ggml_op ops[2]  = { GGML_OP_MUL_MAT, GGML_OP_ADD };
@@ -1358,6 +1391,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         sess->cached_graph.nodes.clear();
         sess->cached_graph.nodes.reserve(graph->n_nodes);
         std::unordered_set<ggml_tensor *> emitted;  // nodes already emitted by try_fuse_node
+        const fuse_switches switches = read_fuse_switches();
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
             if (!op_is_compute(n)) {
@@ -1365,7 +1399,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             }
             // On a match, try_fuse_node pushes the fused opnodes and advances i past
             // the nodes it consumed; otherwise the node is appended as a single op.
-            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted,sess->num_cores)) {
+            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted, sess->num_cores, switches)) {
                 continue;
             }
             sess->cached_graph.nodes.emplace_back(n);

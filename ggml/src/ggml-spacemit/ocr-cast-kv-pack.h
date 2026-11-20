@@ -34,16 +34,17 @@ inline int next_compute(const ggml_cgraph * g,int i) {
     while (++i < g->n_nodes) if (!ggml_op_is_empty(g->nodes[i]->op)) return i;
     return -1;
 }
-inline plan match(const ggml_cgraph * g, int i) {
+// lean_prepare and full_pack are GGML_SPACEMIT_OCR_FA_LEAN_PREPARE=1 and
+// GGML_SPACEMIT_OCR_FA_FULL_PACK=1. This runs on every graph node, so the caller
+// reads them once per opnode list build.
+inline plan match(const ggml_cgraph * g, int i, bool lean_prepare, bool full_pack) {
     if (!enabled()) return {};
     const int vi=next_compute(g,i),fi=vi<0?-1:next_compute(g,vi);
     if(fi<0)return {};
     auto * k = g->nodes[i];
     auto * v = g->nodes[vi];
     auto * fa = g->nodes[fi];
-    const char * lean = std::getenv("GGML_SPACEMIT_OCR_FA_LEAN_PREPARE");
-    const char * direct = std::getenv("GGML_SPACEMIT_OCR_FA_FULL_PACK");
-    if (!lean || std::strcmp(lean,"1") || !direct || std::strcmp(direct,"1") ||
+    if (!lean_prepare || !full_pack ||
         !cast(k) || !cast(v) || !ocr_fa_pack_v40::full_kv(fa) ||
         fa->src[1] != k || fa->src[2] != v ||
         !disjoint(k,v) || !disjoint(k,k->src[0]) || !disjoint(k,v->src[0]) ||
