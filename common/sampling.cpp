@@ -3,6 +3,7 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+#include "ocr-top1-argmax.h"
 #include "reasoning-budget.h"
 
 #include "ggml.h"
@@ -11,6 +12,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -125,6 +127,9 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // OCR_SAMPLER_TOP1_ARGMAX=1 and top-k(1) is the first active sampler of the chain
+    bool top1_argmax = false;
+
     void reset() {
         prev.clear();
 
@@ -163,6 +168,38 @@ struct common_sampler {
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // Stands in for set_logits() when top1_argmax is set. Only the largest logit survives
+    // top-k(1), so when that logit is unique the chain can start from the one candidate
+    // top-k(1) would keep, {token, logit, p = 0}, and the full list is never built.
+    // Returns false when the full list is needed: a backend sampler has results for this
+    // output, a logit is NaN or the maximum is tied.
+    bool set_logits_top1(struct llama_context * ctx, int idx) {
+        if (llama_get_sampled_probs_ith (ctx, idx) != nullptr ||
+            llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
+            llama_get_sampled_token_ith (ctx, idx) != LLAMA_TOKEN_NULL) {
+            return false;
+        }
+
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+
+        const auto * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        size_t best = 0;
+        if (!ocr_top1_argmax::unique_max(logits, (size_t) llama_vocab_n_tokens(vocab), &best)) {
+            LOG_TRC("%s: NaN or tied maximum, building the full candidate list\n", __func__);
+            return false;
+        }
+
+        cur.resize(1);
+        cur[0] = llama_token_data{(llama_token) best, logits[best], 0.0f};
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+
+        return true;
     }
 
     common_time_meas tm() {
@@ -443,6 +480,20 @@ struct common_sampler * common_sampler_init(
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
+    // OCR_SAMPLER_TOP1_ARGMAX=1: when top-k(1) is the first active sampler, find the candidate
+    // by argmax over the raw logits instead of building and sorting the full list. Anything
+    // that edits or reports the full list keeps the regular path.
+    {
+        const char * v = std::getenv("OCR_SAMPLER_TOP1_ARGMAX");
+        if (v && std::strcmp(v, "1") == 0) {
+            result->top1_argmax =
+                grmr == nullptr && rbudget == nullptr && !params.backend_sampling &&
+                params.mirostat == 0 && params.n_probs == 0 && params.top_k == 1 &&
+                ocr_top1_argmax::chain_starts_with_top_k(chain);
+            LOG_TRC("%s: top-1 argmax: %s\n", __func__, result->top1_argmax ? "on" : "off, the chain needs the full candidate list");
+        }
+    }
+
     return result;
 }
 
@@ -517,14 +568,15 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
-        /* .rng     = */ gsmpl->rng,
+        /* .params      = */ gsmpl->params,
+        /* .grmr        = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget     = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain       = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev        = */ gsmpl->prev,
+        /* .cur         = */ gsmpl->cur,
+        /* .cur_p       = */ gsmpl->cur_p,
+        /* .rng         = */ gsmpl->rng,
+        /* .top1_argmax = */ gsmpl->top1_argmax,
     };
 }
 
@@ -547,6 +599,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
+
+    dst->top1_argmax = src->top1_argmax;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -616,7 +670,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    if (!gsmpl->top1_argmax || !gsmpl->set_logits_top1(ctx, idx)) {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
