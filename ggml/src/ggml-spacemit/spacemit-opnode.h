@@ -60,6 +60,12 @@ struct spacemit_opnode {
     // in-place recurrent state update: {state gather (GET_ROWS), GATED_DELTA_NET, state store (CPY)}
     ggml_tensor * gdn_state[3] = {nullptr, nullptr, nullptr};
     ggml_tensor * gdn_snapshots[2] = {nullptr, nullptr}; // {GDN, CPY}; original graph remains intact
+    // in-place conv state update of a single-token recurrent layer, set on all of its opnodes:
+    // {state gather (GET_ROWS), CONCAT, state store (CPY), SSM_CONV, SILU merged into SSM_CONV or nullptr}
+    ggml_tensor * conv_state[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    // diagnostics: 1 keeps the regular path and compares the in-place kernel with it bit for bit,
+    // 2 runs in place and fills the outputs of the skipped gather and concat with NaN
+    int           conv_state_check = 0;
 
     std::vector<ggml_tensor *> fused;
 

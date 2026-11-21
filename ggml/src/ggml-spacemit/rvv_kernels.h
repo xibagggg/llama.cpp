@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace spacemit_kernels {
 
@@ -107,6 +108,22 @@ bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tens
 bool forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
 // ssm_conv reading its concat(conv_states, transpose(qkv)) inputs directly (fused conv)
 bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst, bool scalar_small = false);
+// One token, one sequence, conv state updated in place: reads the previous state from state_row (the cache
+// row) and the new token from the second input of the concat feeding dst, writes the ssm_conv output to dst
+// and the shifted state back to state_row. silu also applies the SILU that follows, in place on dst.
+void forward_ssm_conv_state_inplace_f32(ggml::spacemit::context & ctx, ggml_tensor * dst, float * state_row,
+                                        bool silu);
+// GGML_SPACEMIT_CONV_INPLACE_VERIFY diagnostics. check_*: the regular nodes have run, replay the in-place
+// kernel on private buffers and abort unless it reproduces their results bit for bit. poison_*: fill the
+// output of a node the in-place path skips with NaN. report_*: host only, logs the number of comparisons.
+void check_ssm_conv_state_inplace_f32(ggml::spacemit::context & ctx, const ggml_tensor * dst,
+                                      const float * state_row);
+void expect_ssm_conv_state_silu_f32(ggml::spacemit::context & ctx, const ggml_tensor * silu,
+                                    std::vector<float> & expect);
+void check_ssm_conv_state_silu_f32(ggml::spacemit::context & ctx, const ggml_tensor * silu,
+                                   const std::vector<float> & expect);
+void poison_ssm_conv_state_skipped_f32(ggml::spacemit::context & ctx, ggml_tensor * skipped);
+void report_conv_state_checks(bool final);
 // RMS_NORM followed by MUL with a weight row, written to the MUL's dst
 void forward_rms_norm_mul_f32(ggml::spacemit::context & ctx, const ggml_tensor * rms, ggml_tensor * mul);
 // Continuous F32 ADD followed by GELU, with scalar/row bias, written to GELU dst.

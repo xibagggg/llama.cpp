@@ -342,6 +342,29 @@ static bool gdn_inplace_enabled() {
     return value && strcmp(value, "1") == 0;
 }
 
+// GGML_SPACEMIT_CONV_INPLACE=1: the conv state of a single-token recurrent layer is updated in place in
+// its cache row (conv_inplace_match). Builds on the concat + ssm_conv fusion. Host thread only.
+static bool conv_inplace_enabled() {
+    const char * value = getenv("GGML_SPACEMIT_CONV_INPLACE");
+    return value && strcmp(value, "1") == 0 && conv_fuse_mode() >= 1;
+}
+
+// GGML_SPACEMIT_CONV_INPLACE_VERIFY=1|2: diagnostics of the in-place conv state update, see
+// spacemit_opnode::conv_state_check. Host thread only.
+static int conv_inplace_check_mode() {
+    const char * value = getenv("GGML_SPACEMIT_CONV_INPLACE_VERIFY");
+    if (value == nullptr) {
+        return 0;
+    }
+    if (strcmp(value, "1") == 0) {
+        return 1;
+    }
+    if (strcmp(value, "2") == 0) {
+        return 2;
+    }
+    return 0;
+}
+
 static bool byte_ranges_overlap(const void * a, size_t an, const void * b, size_t bn) {
     const char * a0 = (const char *) a;
     const char * b0 = (const char *) b;
@@ -724,6 +747,281 @@ static bool ssm_conv_concat_inputs_intact(const ggml_cgraph * graph, int ci, int
         }
     }
     return true;
+}
+
+struct conv_inplace_plan {
+    ggml_tensor * gather      = nullptr;  // R
+    ggml_tensor * store       = nullptr;  // C
+    ggml_tensor * ssm         = nullptr;  // S
+    ggml_tensor * silu        = nullptr;  // U, nullptr when it cannot be merged into S
+    size_t        state_bytes = 0;        // size of the cache row
+};
+
+// In-place conv state update of a single-token recurrent layer. Graph shape (build_rs + build_conv_state):
+//   R   = get_rows(states {3 * d, n_rs}, ids {1})                  copy of the previous state out of the cache
+//   CAT = concat(view(R) {3, d, 1}, transpose(qkv) {1, d, 1})      [s0 s1 s2 x] per channel
+//   C   = cpy(view(CAT, columns 1..3), view(states, row kv_head))  new state [s1 s2 x] back into the cache
+//   S   = ssm_conv(CAT, kernel {4, d})                             s0 * w0 + s1 * w1 + s2 * w2 + x * w3
+//   U   = silu(S)
+// When the gathered row is the row C writes (single sequence), R, CAT and C only carry the state out of
+// the cache, through two buffers and back. S can then read the previous state in the cache row and leave
+// the new one there, and R, CAT and C have nothing to do; U is merged into S when it follows S directly
+// and runs in place. Unlike in the graph, the cache row then holds the previous state until S instead of
+// until C, the outputs of R and CAT are never written, and with U merged the output of S holds the SILU
+// from the start. This matcher proves on the graph that R and CAT have no other reader and S, for the
+// merge, none but U; conv_inplace_mark proves on the opnode list that the cache row is neither written
+// between R and S nor read between C and S. As for the fusions above, that covers the graph handed to
+// this backend. The row identity itself is checked at run time (ggml_spacemit_compute_opnode), the row
+// index being a graph input.
+static bool conv_inplace_match(const ggml_cgraph * graph, int ci, conv_inplace_plan * plan) {
+    ggml_tensor *       cat = graph->nodes[ci];
+    const ggml_tensor * st  = cat->src[0];
+    const ggml_tensor * qk  = cat->src[1];
+    // one token of one sequence; tested first, no other concat needs the graph scans below
+    if (st == nullptr || qk == nullptr || cat->ne[0] != 4 || cat->ne[2] != 1 || qk->ne[0] != 1) {
+        return false;
+    }
+    ggml_tensor * ssm     = nullptr;
+    int           ssm_idx = -1;
+    int64_t       col0    = 0;
+    // the concat + ssm_conv fusion, in the variant that keeps the concat inputs alive through graph_optimize
+    if (!ssm_conv_concat_fusable(graph, ci, &ssm, &ssm_idx, &col0) || col0 != 1 || ssm->src[2] != nullptr ||
+        ssm->src[3] != nullptr || !ssm_conv_concat_inputs_intact(graph, ci, ssm_idx)) {
+        return false;
+    }
+    const ggml_tensor * w           = ssm->src[1];
+    const int64_t       d           = cat->ne[1];
+    const int64_t       state_elems = 3 * d;
+    const size_t        state_bytes = (size_t) state_elems * sizeof(float);
+
+    // the layouts forward_ssm_conv_state_inplace_f32 indexes
+    if (cat->view_src != nullptr || cat->data == nullptr || !ggml_is_contiguous(cat) || qk->data == nullptr ||
+        w->data == nullptr || w->ne[1] != d || ggml_nelements(w) != 4 * d || !ggml_is_contiguous(w) ||
+        ssm->view_src != nullptr || ssm->data == nullptr || ggml_nelements(ssm) != d ||
+        !ggml_is_contiguous(ssm) || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    // the state input: a plain window on the whole gathered copy
+    ggml_tensor * r = st->view_src;
+    if (r == nullptr || r->op != GGML_OP_GET_ROWS || st->view_offs != 0 || !ggml_is_contiguous(st) ||
+        ggml_nelements(st) != state_elems) {
+        return false;
+    }
+    if (r->type != GGML_TYPE_F32 || r->view_src != nullptr || r->data == nullptr ||
+        (r->flags & GGML_TENSOR_FLAG_OUTPUT) || r->ne[0] != state_elems || ggml_nelements(r) != state_elems) {
+        return false;
+    }
+    const ggml_tensor * states = r->src[0];
+    const ggml_tensor * ids    = r->src[1];
+    if (states == nullptr || ids == nullptr || states->type != GGML_TYPE_F32 || states->data == nullptr ||
+        states->ne[0] != state_elems || states->nb[0] != sizeof(float) || states->nb[1] != state_bytes ||
+        states->ne[2] != 1 || states->ne[3] != 1 || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 ||
+        ids->data == nullptr) {
+        return false;
+    }
+
+    // readers of R and CAT, whose outputs are no longer written
+    ggml_tensor * store = nullptr;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * t = graph->nodes[i];
+        if ((t->view_src == r || t->view_src == cat) &&
+            ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || op_is_compute(t))) {
+            return false;  // a window on one of them that is an output or is computed in place
+        }
+        if (!op_is_compute(t)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * x = t->src[j];
+            if (x == nullptr) {
+                continue;
+            }
+            if (x == r || x->view_src == r) {
+                if (t != cat || j != 0 || x != st) {
+                    return false;  // the gathered copy has another reader
+                }
+            } else if (x == cat) {
+                if (t != ssm || j != 0) {
+                    return false;  // the concat has another reader
+                }
+            } else if (x->view_src == cat) {
+                // the only window read on the concat is the new state, stored into the cache
+                if (store != nullptr || t->op != GGML_OP_CPY || j != 0 || x->view_offs != sizeof(float) ||
+                    x->type != GGML_TYPE_F32 || x->ne[0] != 3 || x->ne[1] != d ||
+                    ggml_nelements(x) != state_elems || x->nb[0] != sizeof(float) || x->nb[1] != cat->nb[1]) {
+                    return false;
+                }
+                store = t;
+            }
+        }
+    }
+    if (store == nullptr || store->type != GGML_TYPE_F32 || store->data == nullptr ||
+        !ggml_is_contiguous(store) || ggml_nelements(store) != state_elems) {
+        return false;
+    }
+
+    // the cache row written by C must not hold anything else S reads or writes
+    const void *        row     = store->data;
+    const ggml_tensor * qk_root = qk->view_src ? qk->view_src : qk;
+    const ggml_tensor * w_root  = w->view_src ? w->view_src : w;
+    if (qk_root->data == nullptr || w_root->data == nullptr ||
+        byte_ranges_overlap(ssm->data, ggml_nbytes(ssm), row, state_bytes) ||
+        byte_ranges_overlap(qk_root->data, ggml_nbytes(qk_root), row, state_bytes) ||
+        byte_ranges_overlap(w_root->data, ggml_nbytes(w_root), row, state_bytes)) {
+        return false;
+    }
+
+    // U: the next compute node, a SILU of S computed in the buffer of S, and the only reader of S
+    ggml_tensor * silu = nullptr;
+    for (int i = ssm_idx + 1; i < graph->n_nodes && silu == nullptr; ++i) {
+        if (op_is_compute(graph->nodes[i])) {
+            silu = graph->nodes[i];
+        }
+    }
+    if (silu != nullptr &&
+        (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != ssm ||
+         silu->type != GGML_TYPE_F32 || silu->view_src != nullptr || silu->data != ssm->data ||
+         !ggml_are_same_shape(silu, ssm))) {
+        silu = nullptr;
+    }
+    for (int i = 0; i < graph->n_nodes && silu != nullptr; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        if (t->view_src == ssm) {
+            silu = nullptr;
+        }
+        for (int j = 0; j < GGML_MAX_SRC && silu != nullptr; ++j) {
+            const ggml_tensor * x = t->src[j];
+            if (x != nullptr && (x == ssm || x->view_src == ssm) && t != silu) {
+                silu = nullptr;
+            }
+        }
+    }
+
+    plan->gather      = r;
+    plan->store       = store;
+    plan->ssm         = ssm;
+    plan->silu        = silu;
+    plan->state_bytes = state_bytes;
+    return true;
+}
+
+// Position of the opnode that computes t on its own, with the given opcode and no other role, or -1.
+static int conv_inplace_opnode(const std::vector<spacemit_opnode> & nodes, const ggml_tensor * t,
+                               spacemit_op_code opcode) {
+    int pos = -1;
+    for (size_t k = 0; k < nodes.size(); ++k) {
+        const spacemit_opnode & on = nodes[k];
+        if (on.packed_im2col == t || on.elided_pad == t || on.elided_gelu == t || on.prepared_attention == t ||
+            std::find(on.fused.begin(), on.fused.end(), t) != on.fused.end()) {
+            return -1;  // computed or prepared by another opnode
+        }
+        if (on.node != t) {
+            continue;
+        }
+        if (pos >= 0 || on.opcode != opcode || !on.fused.empty() || !on.extra_dsts.empty() ||
+            on.packed_im2col != nullptr || on.elided_pad != nullptr || on.elided_gelu != nullptr ||
+            on.prepared_attention != nullptr || on.gdn_state[0] != nullptr || on.gdn_snapshots[0] != nullptr ||
+            on.conv_state[0] != nullptr) {
+            return -1;
+        }
+        pos = (int) k;
+    }
+    return pos;
+}
+
+// True when the opnode writes into the bytes [row, row + size) or, with reads set, reads a buffer that
+// holds some of them. Every tensor the opnode computes, prepares or elides counts, and so do the nodes of
+// an in-place or snapshot gated_delta_net update, which write their state rows from another position.
+static bool conv_inplace_opnode_touches(const spacemit_opnode & on, const void * row, size_t size, bool reads) {
+    std::vector<const ggml_tensor *> members = {on.node,           on.packed_im2col,    on.elided_pad,
+                                                on.elided_gelu,    on.prepared_attention, on.gdn_state[0],
+                                                on.gdn_state[1],   on.gdn_state[2],     on.gdn_snapshots[0],
+                                                on.gdn_snapshots[1]};
+    members.insert(members.end(), on.fused.begin(), on.fused.end());
+    members.insert(members.end(), on.extra_dsts.begin(), on.extra_dsts.end());
+    for (const ggml_tensor * m : members) {
+        if (m == nullptr) {
+            continue;
+        }
+        if (m->data == nullptr || byte_ranges_overlap(m->data, ggml_nbytes(m), row, size)) {
+            return true;
+        }
+        for (int j = 0; reads && j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * in = m->src[j];
+            if (in == nullptr) {
+                continue;
+            }
+            const ggml_tensor * root = in->view_src ? in->view_src : in;
+            if (root->data == nullptr || byte_ranges_overlap(root->data, ggml_nbytes(root), row, size)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Marks the opnodes of every recurrent layer whose conv state can be updated in place: R, C and U must be
+// plain single-op opnodes, CAT and S the two halves of the concat + ssm_conv fusion. The opnode list is the
+// execution order and a fused opnode runs its later nodes early, so the two conditions on the cache row are
+// proven here, on the list. The layers must not interleave: the workers keep the run-time decision taken at
+// R in a single slot. Returns the number of layers marked, *n_silu the number of them with a merged SILU.
+static int conv_inplace_mark(const ggml_cgraph * graph, std::vector<spacemit_opnode> & nodes, int check,
+                             int * n_silu) {
+    int              n_marked = 0;
+    std::vector<int> spans;  // first and last opnode of every marked layer
+    *n_silu = 0;
+    for (int ci = 0; ci < graph->n_nodes; ++ci) {
+        ggml_tensor * cat = graph->nodes[ci];
+        if (cat->op != GGML_OP_CONCAT || !op_is_compute(cat)) {
+            continue;
+        }
+        conv_inplace_plan plan;
+        if (!conv_inplace_match(graph, ci, &plan)) {
+            continue;
+        }
+        const int pr = conv_inplace_opnode(nodes, plan.gather, SPACEMIT_OP_INVALID);
+        const int pc = conv_inplace_opnode(nodes, cat, SPACEMIT_OP_CONCAT_STATE);
+        const int pw = conv_inplace_opnode(nodes, plan.store, SPACEMIT_OP_INVALID);
+        const int ps = conv_inplace_opnode(nodes, plan.ssm, SPACEMIT_OP_SSM_CONV_CONCAT);
+        if (pr < 0 || !(pr < pc && pc < pw && pw < ps)) {
+            continue;
+        }
+        int pu = plan.silu != nullptr ? conv_inplace_opnode(nodes, plan.silu, SPACEMIT_OP_INVALID) : -1;
+        if (pu != ps + 1) {
+            pu = -1;  // not the next opnode: the SILU stays a node of its own
+        }
+        const int last = pu >= 0 ? pu : ps;
+
+        // C is the only writer of the cache row between R and S, and nothing reads the row after C: its
+        // content now changes at S
+        bool ok = true;
+        for (int k = pr + 1; k < ps && ok; ++k) {
+            ok = k == pc || k == pw ||
+                 !conv_inplace_opnode_touches(nodes[k], plan.store->data, plan.state_bytes, k > pw);
+        }
+        for (size_t s = 0; s + 1 < spans.size() && ok; s += 2) {
+            ok = last < spans[s] || spans[s + 1] < pr;
+        }
+        if (!ok) {
+            continue;
+        }
+
+        ggml_tensor * const chain[5] = {plan.gather, cat, plan.store, plan.ssm, pu >= 0 ? plan.silu : nullptr};
+        const int           where[5] = {pr, pc, pw, ps, pu};
+        for (int p : where) {
+            if (p < 0) {
+                continue;
+            }
+            std::copy(chain, chain + 5, nodes[p].conv_state);
+            nodes[p].conv_state_check = check;
+        }
+        spans.push_back(pr);
+        spans.push_back(last);
+        *n_silu += pu >= 0;
+        n_marked++;
+    }
+    return n_marked;
 }
 
 struct paddle_f16_gelu_pack_plan {
@@ -1291,6 +1589,8 @@ static const char * ggml_backend_spacemit_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_spacemit_free(ggml_backend_t backend) {
+    // Last totals of the GGML_SPACEMIT_CONV_INPLACE_VERIFY diagnostics; silent when they did not run.
+    spacemit_kernels::rvv::report_conv_state_checks(true);
     // The device registry owns the shared session.
     delete backend;
 }
@@ -1408,6 +1708,12 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         const int n_gdn_inplace = gdn_inplace_enabled() ? gdn_inplace_mark(graph, sess->cached_graph.nodes) : 0;
         const int n_gdn_snapshots = ocr_gdn_snapshot_store::enabled_on_host() ?
             gdn_snapshot_store_mark(graph, sess->cached_graph.nodes) : 0;
+        int           n_conv_inplace_silu = 0;
+        const int     conv_inplace_check  = conv_inplace_check_mode();
+        const int64_t conv_inplace_t0     = ggml_time_us();
+        const int     n_conv_inplace      = conv_inplace_enabled() ?
+            conv_inplace_mark(graph, sess->cached_graph.nodes, conv_inplace_check, &n_conv_inplace_silu) : 0;
+        const int64_t conv_inplace_us     = ggml_time_us() - conv_inplace_t0;  // cost of the proof, traced
         const char * snapshot_trace = std::getenv("GGML_SPACEMIT_OCR_GDN_SNAPSHOT_STORE_TRACE");
         if (n_gdn_snapshots && snapshot_trace && std::strcmp(snapshot_trace, "1") == 0) {
             GGML_LOG_INFO("ggml-spacemit: GDN direct snapshot store=%d graph=%llu\n",
@@ -1459,6 +1765,12 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             GGML_LOG_INFO("ggml-spacemit: recurrent conv fused=%d/%d scalar=%d gdn in-place=%d/%d graph=%llu\n",
                           n_conv_fused, n_conv_seen, n_conv_scalar, n_gdn_inplace, n_gdn_seen,
                           (unsigned long long) graph->uid);
+        }
+        if (recurrent_trace && strcmp(recurrent_trace, "1") == 0 && n_gdn_seen > 0 && conv_inplace_enabled()) {
+            GGML_LOG_INFO("ggml-spacemit: recurrent conv in-place=%d/%d silu=%d verify=%d match_us=%lld "
+                          "graph=%llu\n",
+                          n_conv_inplace, n_conv_seen, n_conv_inplace_silu, conv_inplace_check,
+                          (long long) conv_inplace_us, (unsigned long long) graph->uid);
         }
         const char * trace = getenv("GGML_SPACEMIT_ADD_GELU_TRACE");
         if (n_add_gelu > 0 && trace && strcmp(trace, "1") == 0) {

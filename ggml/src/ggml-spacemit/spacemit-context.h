@@ -36,6 +36,11 @@ struct context {
     // Produced by the immediately preceding cast-pair node only. Never persists
     // across a graph launch or an intervening workspace-writing operation.
     const ggml_tensor * ocr_prepared_attention = nullptr;
+    // The conv state GET_ROWS of the recurrent layer whose conv state is updated in place (see
+    // conv_inplace_match), set when that node is reached and compared by the later opnodes of the
+    // layer. The row index is only guaranteed to be readable at that position: its last reader
+    // comes before the SSM_CONV, and the allocator may reuse its buffer after that.
+    const ggml_tensor * conv_state_inplace = nullptr;
     const float * prepared_vision_rope = nullptr;
     paddle_qkv_content_cache::view * qkv_content_cache = nullptr;
     // GGML_SPACEMIT_GEMV_TILE as the host parsed it before this graph launch, 0 when unset. The
@@ -48,6 +53,7 @@ struct context {
                std::atomic<int64_t> * work_queue_in = nullptr, bool check_tcm_view_in = false) {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
+        conv_state_inplace = nullptr;
         prepared_vision_rope = nullptr;
         qkv_content_cache = nullptr;
         gemv_tile_cols = 0;
@@ -66,6 +72,7 @@ struct context {
     void clear() {
         pc8_packed_source = nullptr;
         ocr_prepared_attention = nullptr;
+        conv_state_inplace = nullptr;
         prepared_vision_rope = nullptr;
         qkv_content_cache = nullptr;
         gemv_tile_cols = 0;

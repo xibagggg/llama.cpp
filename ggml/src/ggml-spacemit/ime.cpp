@@ -2230,8 +2230,8 @@ static bool ggml_spacemit_gdn_inplace_now(const spacemit_opnode & node) {
            (const char *) states->data + row * (int64_t) states->nb[1] == (const char *) store->data;
 }
 
-bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_opnode & node) {
-    if (ctx.ocr_prepared_attention != node.node) ctx.ocr_prepared_attention = nullptr;
+// The opnode as the opnode list describes it. ggml_spacemit_compute_opnode below is the entry point.
+static bool ggml_spacemit_compute_opnode_regular(ggml::spacemit::context & ctx, const spacemit_opnode & node) {
     // Single-op opnodes with a special opcode: the two halves of the concat -> ssm_conv fusion.
     // They run at their original graph positions (see try_fuse_node); the allocator plans buffer
     // reuse on that order, so they must not be merged into one opnode at the concat position.
@@ -2297,6 +2297,68 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
         return ggml_spacemit_compute_fused(ctx, node);
     }
     return ggml_spacemit_compute_forward(ctx, node.node);
+}
+
+// In-place conv state update (see conv_inplace_match in ggml-spacemit.cpp): true when the row gathered by
+// the conv state GET_ROWS is the cache row that the conv state CPY writes back. The row index is a graph
+// input that is rewritten before every compute, so this is evaluated at run time, once per layer, when the
+// GET_ROWS itself is reached: that node reads the index, so the index is valid there, while the allocator
+// may hand the index buffer to a later tensor before the SSM_CONV runs. All workers read the same value.
+static bool ggml_spacemit_conv_inplace_now(const spacemit_opnode & node) {
+    const ggml_tensor * gather = node.conv_state[0];
+    const ggml_tensor * store  = node.conv_state[2];
+    const ggml_tensor * states = gather->src[0];
+    const int64_t       row    = *(const int32_t *) gather->src[1]->data;
+    return row >= 0 && row < states->ne[1] &&
+           (const char *) states->data + row * (int64_t) states->nb[1] == (const char *) store->data;
+}
+
+bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_opnode & node) {
+    if (ctx.ocr_prepared_attention != node.node) ctx.ocr_prepared_attention = nullptr;
+    if (node.conv_state[0] == nullptr) {
+        return ggml_spacemit_compute_opnode_regular(ctx, node);
+    }
+
+    // One of the opnodes of a recurrent layer whose conv state can be updated in place: the state gather,
+    // the concat, the state store, the ssm_conv and, when it is merged, the SILU after it. The gather comes
+    // first and decides for all of them; the layers do not interleave (conv_inplace_mark).
+    if (node.node == node.conv_state[0]) {
+        ctx.conv_state_inplace = ggml_spacemit_conv_inplace_now(node) ? node.node : nullptr;
+    }
+    if (ctx.conv_state_inplace != node.conv_state[0]) {
+        return ggml_spacemit_compute_opnode_regular(ctx, node);  // another row is gathered
+    }
+
+    float *    state_row = (float *) node.conv_state[2]->data;
+    const bool is_conv   = node.node == node.conv_state[3];
+    const bool is_silu   = node.node == node.conv_state[4];
+    if (node.conv_state_check == 1) {
+        // Diagnostic: every node takes the regular path, and the in-place kernels are replayed on private
+        // buffers and compared with it. Each worker compares the channels it has just written itself.
+        std::vector<float> expect;
+        if (is_silu) {
+            spacemit_kernels::rvv::expect_ssm_conv_state_silu_f32(ctx, node.node, expect);
+        }
+        if (!ggml_spacemit_compute_opnode_regular(ctx, node)) {
+            return false;
+        }
+        if (is_conv) {
+            spacemit_kernels::rvv::check_ssm_conv_state_inplace_f32(ctx, node.node, state_row);
+        } else if (is_silu) {
+            spacemit_kernels::rvv::check_ssm_conv_state_silu_f32(ctx, node.node, expect);
+        }
+        return true;
+    }
+    if (is_conv) {
+        spacemit_kernels::rvv::forward_ssm_conv_state_inplace_f32(ctx, node.node, state_row,
+                                                                  node.conv_state[4] != nullptr);
+    } else if (node.conv_state_check == 2 &&
+               (node.node == node.conv_state[0] || node.node == node.conv_state[1])) {
+        // Diagnostic: nobody may read the output of the gather and of the concat any more.
+        spacemit_kernels::rvv::poison_ssm_conv_state_skipped_f32(ctx, node.node);
+    }
+    // The gather, the concat, the store and a merged SILU have nothing left to do.
+    return true;
 }
 
 const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const ggml_tensor * op) {

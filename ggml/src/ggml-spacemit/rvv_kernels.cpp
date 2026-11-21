@@ -62,6 +62,11 @@ constexpr size_t PADDLE_GQA8_EXACT_TCM = 8 * (128 + 128) * sizeof(_Float16);
 std::atomic<bool> ocr_concat_decode_segmented_enabled{false};
 std::atomic<bool> ocr_decode_gqa_kv_pack_enabled{false};
 std::atomic<unsigned> ocr_decode_gqa_group_mode{0};
+// GGML_SPACEMIT_CONV_INPLACE_VERIFY diagnostics: counted by worker 0, reported by the host.
+std::atomic<uint64_t> conv_state_checked_conv{0};
+std::atomic<uint64_t> conv_state_checked_silu{0};
+std::atomic<uint64_t> conv_state_poisoned{0};
+std::atomic<uint64_t> conv_state_checks_reported{0};  // their sum at the last report
 }
 
 
@@ -155,6 +160,7 @@ void drain_ocr_worker_events() {
         paddle_gqa8_exact_reported = true;
     }
     ocr_gdn_rollback_tcm::drain_on_host();
+    report_conv_state_checks(false);
     using ocr_worker_events::kind;
     ocr_worker_events::get().drain([](kind event, const ocr_worker_events::values & v) {
         switch(event) {
@@ -180,6 +186,10 @@ void drain_ocr_worker_events() {
             case kind::gqa_verify:
                 GGML_LOG_INFO("ocr-fa-gqa-group: selected mode=%u Q=%u DK=256 DV=256 heads=%u GQA=4 KV=%llu TCM=%zu/%zu\n",
                     unsigned(v.a), unsigned(v.b), unsigned(v.d), (unsigned long long)v.c, size_t(v.e), size_t(v.f));
+                break;
+            case kind::conv_state_inplace:
+                GGML_LOG_INFO("ocr-conv-state-inplace: active channels=%llu workers=%llu silu=%llu\n",
+                    (unsigned long long)v.a, (unsigned long long)v.b, (unsigned long long)v.c);
                 break;
             case kind::count: break;
         }
@@ -6533,6 +6543,168 @@ bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * ds
         }
     }
     return true;
+}
+
+// In-place conv state update of a single-token recurrent layer (GGML_SPACEMIT_CONV_INPLACE, see
+// conv_inplace_match in ggml-spacemit.cpp). The channel range of a worker, the split of the ssm_conv and
+// silu kernels.
+static inline void ssm_conv_state_lane(const ggml::spacemit::context & ctx, int64_t channels, int64_t & c0,
+                                       int64_t & c1) {
+    const int64_t dc = (channels + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
+    c0               = std::min(dc * (int64_t) ctx.ith, channels);
+    c1               = std::min(c0 + dc, channels);
+}
+
+// n channels: y = s0 * w0 + s1 * w1 + s2 * w2 + x * w3, one multiply and three fused multiply-adds in tap
+// order as in forward_ssm_conv_concat_f32 (bitwise identical), and the state row advances from [s0 s1 s2]
+// to [s1 s2 x]. The four taps and the three state fields of a channel are adjacent, so both are unit-stride
+// segment loads. state_out may be state_in: every step loads its channels before it stores them.
+static inline void ssm_conv_state_block_f32(const float * w, const float * state_in, const float * x,
+                                            float * state_out, float * y, int64_t n) {
+    for (int64_t c = 0; c < n;) {
+        const size_t         vl = __riscv_vsetvl_e32m2(n - c);
+        const vfloat32m2x4_t wt = __riscv_vlseg4e32_v_f32m2x4(w + 4 * c, vl);
+        vfloat32m2x3_t       st = __riscv_vlseg3e32_v_f32m2x3(state_in + 3 * c, vl);
+        const vfloat32m2_t   s1 = __riscv_vget_v_f32m2x3_f32m2(st, 1);
+        const vfloat32m2_t   s2 = __riscv_vget_v_f32m2x3_f32m2(st, 2);
+        const vfloat32m2_t   x3 = __riscv_vle32_v_f32m2(x + c, vl);
+
+        vfloat32m2_t acc = __riscv_vfmul_vv_f32m2(__riscv_vget_v_f32m2x3_f32m2(st, 0),
+                                                  __riscv_vget_v_f32m2x4_f32m2(wt, 0), vl);
+        acc              = __riscv_vfmacc_vv_f32m2(acc, s1, __riscv_vget_v_f32m2x4_f32m2(wt, 1), vl);
+        acc              = __riscv_vfmacc_vv_f32m2(acc, s2, __riscv_vget_v_f32m2x4_f32m2(wt, 2), vl);
+        acc              = __riscv_vfmacc_vv_f32m2(acc, x3, __riscv_vget_v_f32m2x4_f32m2(wt, 3), vl);
+        __riscv_vse32_v_f32m2(y + c, acc, vl);
+
+        st = __riscv_vset_v_f32m2_f32m2x3(st, 0, s1);
+        st = __riscv_vset_v_f32m2_f32m2x3(st, 1, s2);
+        st = __riscv_vset_v_f32m2_f32m2x3(st, 2, x3);
+        __riscv_vsseg3e32_v_f32m2x3(state_out + 3 * c, st, vl);
+        c += vl;
+    }
+}
+
+// The loop of forward_unary_silu_f32, in place.
+static inline void ssm_conv_state_silu_f32(float * p, int64_t n) {
+    for (int64_t i = 0; i < n;) {
+        const size_t       vl      = __riscv_vsetvl_e32m2(n - i);
+        const vfloat32m2_t x       = __riscv_vle32_v_f32m2(p + i, vl);
+        const vfloat32m2_t neg_x   = __riscv_vfneg_v_f32m2(x, vl);
+        const vfloat32m2_t exp_neg = rvv_expf_approx_f32m2(neg_x, vl);
+        const vfloat32m2_t denom   = __riscv_vfadd_vf_f32m2(exp_neg, 1.0f, vl);
+        __riscv_vse32_v_f32m2(p + i, __riscv_vfdiv_vv_f32m2(x, denom, vl), vl);
+        i += vl;
+    }
+}
+
+void forward_ssm_conv_state_inplace_f32(ggml::spacemit::context & ctx, ggml_tensor * dst, float * state_row,
+                                        bool silu) {
+    const ggml_tensor * cat = dst->src[0];  // concat {4, d_inner, 1}, not materialized
+    const ggml_tensor * qk  = cat->src[1];  // transposed qkv view {1, d_inner, 1}, channels contiguous
+    const ggml_tensor * w   = dst->src[1];  // conv1d.weight {4, d_inner}
+
+    int64_t c0 = 0;
+    int64_t c1 = 0;
+    ssm_conv_state_lane(ctx, cat->ne[1], c0, c1);
+    if (c0 < c1) {
+        float * y = (float *) dst->data + c0;
+        ssm_conv_state_block_f32((const float *) w->data + 4 * c0, state_row + 3 * c0,
+                                 (const float *) qk->data + c0, state_row + 3 * c0, y, c1 - c0);
+        if (silu) {
+            ssm_conv_state_silu_f32(y, c1 - c0);
+        }
+    }
+    if (ctx.ith == 0) {
+        ocr_worker_events::publish(ocr_worker_events::kind::conv_state_inplace,
+                                   {uint64_t(cat->ne[1]), uint64_t(ctx.nth), uint64_t(silu)});
+    }
+}
+
+// After the regular SSM_CONV: the gathered copy still holds the previous state and the regular store has
+// written the new one to the cache row, so the in-place kernel is replayed from the same inputs into
+// private buffers and both of its results must equal what the regular nodes produced.
+void check_ssm_conv_state_inplace_f32(ggml::spacemit::context & ctx, const ggml_tensor * dst,
+                                      const float * state_row) {
+    const ggml_tensor * cat = dst->src[0];
+    const ggml_tensor * st  = cat->src[0];
+    const ggml_tensor * qk  = cat->src[1];
+    const ggml_tensor * w   = dst->src[1];
+
+    int64_t c0 = 0;
+    int64_t c1 = 0;
+    ssm_conv_state_lane(ctx, cat->ne[1], c0, c1);
+    if (c0 < c1) {
+        const size_t       n = (size_t) (c1 - c0);
+        std::vector<float> y(n);
+        std::vector<float> state(3 * n);
+        ssm_conv_state_block_f32((const float *) w->data + 4 * c0, (const float *) st->data + 3 * c0,
+                                 (const float *) qk->data + c0, state.data(), y.data(), c1 - c0);
+        if (memcmp(y.data(), (const float *) dst->data + c0, n * sizeof(float)) != 0 ||
+            memcmp(state.data(), state_row + 3 * c0, 3 * n * sizeof(float)) != 0) {
+            GGML_ABORT("ocr-conv-state-inplace: %s differs from the regular path in channels [%lld, %lld)",
+                       dst->name, (long long) c0, (long long) c1);
+        }
+    }
+    if (ctx.ith == 0) {
+        conv_state_checked_conv.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// Before the regular SILU, which overwrites the SSM_CONV output: what the merged pass makes of it.
+void expect_ssm_conv_state_silu_f32(ggml::spacemit::context & ctx, const ggml_tensor * silu,
+                                    std::vector<float> & expect) {
+    int64_t c0 = 0;
+    int64_t c1 = 0;
+    ssm_conv_state_lane(ctx, ggml_nelements(silu), c0, c1);
+    const float * raw = (const float *) silu->src[0]->data;
+    expect.assign(raw + c0, raw + c1);
+    ssm_conv_state_silu_f32(expect.data(), c1 - c0);
+}
+
+// After the regular SILU.
+void check_ssm_conv_state_silu_f32(ggml::spacemit::context & ctx, const ggml_tensor * silu,
+                                   const std::vector<float> & expect) {
+    int64_t c0 = 0;
+    int64_t c1 = 0;
+    ssm_conv_state_lane(ctx, ggml_nelements(silu), c0, c1);
+    if (expect.size() != (size_t) (c1 - c0) ||
+        memcmp(expect.data(), (const float *) silu->data + c0, expect.size() * sizeof(float)) != 0) {
+        GGML_ABORT("ocr-conv-state-inplace: %s differs from the regular path in channels [%lld, %lld)",
+                   silu->name, (long long) c0, (long long) c1);
+    }
+    if (ctx.ith == 0) {
+        conv_state_checked_silu.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// The in-place path never writes the output of the state gather and of the concat. Filling them with NaN
+// at their graph positions makes a reader that the matcher missed show up in the result.
+void poison_ssm_conv_state_skipped_f32(ggml::spacemit::context & ctx, ggml_tensor * skipped) {
+    if (ctx.ith != 0) {
+        return;
+    }
+    float *       p = (float *) skipped->data;
+    const int64_t n = ggml_nelements(skipped);
+    for (int64_t i = 0; i < n; ++i) {
+        p[i] = NAN;
+    }
+    conv_state_poisoned.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Host only. The running totals are logged when they first become non-zero, then every 4096 events, and
+// once more (final) when a backend is freed.
+void report_conv_state_checks(bool final) {
+    const uint64_t conv     = conv_state_checked_conv.load(std::memory_order_relaxed);
+    const uint64_t silu     = conv_state_checked_silu.load(std::memory_order_relaxed);
+    const uint64_t poisoned = conv_state_poisoned.load(std::memory_order_relaxed);
+    const uint64_t total    = conv + silu + poisoned;
+    const uint64_t reported = conv_state_checks_reported.load(std::memory_order_relaxed);
+    if (total == reported || (!final && reported != 0 && total / 4096 == reported / 4096)) {
+        return;
+    }
+    conv_state_checks_reported.store(total, std::memory_order_relaxed);
+    GGML_LOG_INFO("ocr-conv-state-inplace: diagnostics compared conv=%llu silu=%llu poisoned=%llu\n",
+                  (unsigned long long) conv, (unsigned long long) silu, (unsigned long long) poisoned);
 }
 
 // Decode-only state concat: the three old-state fields and the new QKV field
