@@ -124,8 +124,14 @@ struct common_speculative_deleter {
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
 
+// load the draft model of params (the result of common_base_params_to_speculative); nullptr on failure
+llama_model_ptr common_speculative_load_draft_model(common_params & params);
+
 struct common_speculative_init_result {
-    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    // model_dft: the draft model if it was already loaded with common_speculative_load_draft_model(params),
+    //            nullptr to load it here
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                   llama_model_ptr model_dft = nullptr);
     ~common_speculative_init_result();
 
     llama_model   * model();
@@ -138,4 +144,5 @@ private:
 
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                                                      llama_model_ptr model_dft = nullptr);

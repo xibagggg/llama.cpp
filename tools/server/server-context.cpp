@@ -18,6 +18,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "ocr-draft-preload.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "server-request-spec.h"
@@ -1349,6 +1350,18 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // OCR_DRAFT_PARALLEL_LOAD=1: load the draft model on a second thread while the target model loads here.
+        // The draft context is still created below, after the target context.
+        ocr_draft_preload::loader draft_preload;
+        if (ocr_draft_preload::requested()) {
+            const char * reason = use_multi_asr ? "the server runs in multi-ASR mode" : draft_preload.start(params_base);
+            if (reason == nullptr) {
+                SRV_INF("%s", "loading the draft model in parallel with the target model (OCR_DRAFT_PARALLEL_LOAD=1)\n");
+            } else {
+                SRV_WRN("OCR_DRAFT_PARALLEL_LOAD=1 is ignored: %s\n", reason);
+            }
+        }
+
         // In dedicated multi-ASR mode llama-server owns only the model. The
         // sole llama_context is created and scheduled by multi-ASR below.
         const bool ocr_model_init_timing = std::getenv("OCR_STAGE_TIMING") != nullptr;
@@ -1423,8 +1436,9 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
+                // with a draft model loaded in parallel, this is the wait for the rest of its load and the draft context
                 const int64_t ocr_draft_init_start = ocr_model_init_timing ? ggml_time_us() : 0;
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt, draft_preload.take(params_dft));
                 const int64_t ocr_draft_init_us = ocr_model_init_timing ? ggml_time_us() - ocr_draft_init_start : 0;
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();

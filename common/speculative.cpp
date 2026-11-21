@@ -2604,6 +2604,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
     return result;
 }
 
+llama_model_ptr common_speculative_load_draft_model(common_params & params) {
+    auto mparams = common_model_params_to_llama(params);
+
+    return llama_model_ptr(llama_model_load_from_file(params.speculative.draft.mparams.path.c_str(), mparams));
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -2616,14 +2622,14 @@ struct common_speculative_init_result::impl {
 common_speculative_init_result::common_speculative_init_result(
     common_params & params,
       llama_model * model_tgt,
-    llama_context * ctx_tgt) :
+    llama_context * ctx_tgt,
+    llama_model_ptr model_dft_preloaded) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
-    auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
@@ -2641,15 +2647,20 @@ common_speculative_init_result::common_speculative_init_result(
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
-        LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        if (model_dft_preloaded != nullptr) {
+            LOG_INF("%s: using the preloaded draft model '%s'\n", __func__, model_path.c_str());
+            pimpl->model = std::move(model_dft_preloaded);
+        } else {
+            LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+            pimpl->model = common_speculative_load_draft_model(params);
+        }
+
+        llama_model * model_dft = pimpl->model.get();
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
         }
-
-        pimpl->model.reset(model_dft);
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
@@ -2683,8 +2694,9 @@ llama_context * common_speculative_init_result::context() {
     return pimpl->context.get();
 }
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
-    return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                                                      llama_model_ptr model_dft) {
+    return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt, std::move(model_dft));
 }
 
 common_speculative_output_limits common_speculative_get_output_limits(

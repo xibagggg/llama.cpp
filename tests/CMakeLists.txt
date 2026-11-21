@@ -263,6 +263,8 @@ llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
+# the gate, the parameter comparison and the thread handling of the parallel draft model load
+llama_build_and_test(test-ocr-draft-preload.cpp)
 # the top-1 argmax shortcut of common_sampler against the full candidate list
 llama_build_and_test(test-ocr-top1-argmax.cpp)
 llama_build_and_test(
